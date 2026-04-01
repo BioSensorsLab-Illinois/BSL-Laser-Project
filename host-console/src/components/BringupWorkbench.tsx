@@ -808,6 +808,57 @@ export function BringupWorkbench({
     ].join(' ')
   }
 
+  function buildPdCommandArgs(includeFirmwarePlan = false) {
+    return {
+      ...(includeFirmwarePlan
+        ? { firmware_plan_enabled: form.pdFirmwarePlanEnabled }
+        : {}),
+      programming_only_max_w: parseNumber(
+        form.pdProgrammingOnlyMaxW,
+        snapshot.bringup.tuning.pdProgrammingOnlyMaxW ?? 30,
+      ),
+      reduced_mode_min_w: parseNumber(
+        form.pdReducedModeMinW,
+        snapshot.bringup.tuning.pdReducedModeMinW ?? 30,
+      ),
+      reduced_mode_max_w: parseNumber(
+        form.pdReducedModeMaxW,
+        snapshot.bringup.tuning.pdReducedModeMaxW ?? 35,
+      ),
+      full_mode_min_w: parseNumber(
+        form.pdFullModeMinW,
+        snapshot.bringup.tuning.pdFullModeMinW ?? 35.1,
+      ),
+      pdo1_enabled: form.pdProfiles[0]?.enabled ?? false,
+      pdo1_voltage_v: parseNumber(
+        form.pdProfiles[0]?.voltageV ?? '0',
+        livePdProfiles[0]?.voltageV ?? 0,
+      ),
+      pdo1_current_a: parseNumber(
+        form.pdProfiles[0]?.currentA ?? '0',
+        livePdProfiles[0]?.currentA ?? 0,
+      ),
+      pdo2_enabled: form.pdProfiles[1]?.enabled ?? false,
+      pdo2_voltage_v: parseNumber(
+        form.pdProfiles[1]?.voltageV ?? '0',
+        livePdProfiles[1]?.voltageV ?? 0,
+      ),
+      pdo2_current_a: parseNumber(
+        form.pdProfiles[1]?.currentA ?? '0',
+        livePdProfiles[1]?.currentA ?? 0,
+      ),
+      pdo3_enabled: form.pdProfiles[2]?.enabled ?? false,
+      pdo3_voltage_v: parseNumber(
+        form.pdProfiles[2]?.voltageV ?? '0',
+        livePdProfiles[2]?.voltageV ?? 0,
+      ),
+      pdo3_current_a: parseNumber(
+        form.pdProfiles[2]?.currentA ?? '0',
+        livePdProfiles[2]?.currentA ?? 0,
+      ),
+    }
+  }
+
   function patchForm<K extends keyof BringupFormState>(
     key: K,
     value: BringupFormState[K],
@@ -1769,51 +1820,7 @@ export function BringupWorkbench({
           requireService: true,
           logHistory: true,
           timeoutMs: BRINGUP_PD_APPLY_TIMEOUT_MS,
-          args: {
-            programming_only_max_w: parseNumber(
-              form.pdProgrammingOnlyMaxW,
-              snapshot.bringup.tuning.pdProgrammingOnlyMaxW ?? 30,
-            ),
-            reduced_mode_min_w: parseNumber(
-              form.pdReducedModeMinW,
-              snapshot.bringup.tuning.pdReducedModeMinW ?? 30,
-            ),
-            reduced_mode_max_w: parseNumber(
-              form.pdReducedModeMaxW,
-              snapshot.bringup.tuning.pdReducedModeMaxW ?? 35,
-            ),
-            full_mode_min_w: parseNumber(
-              form.pdFullModeMinW,
-              snapshot.bringup.tuning.pdFullModeMinW ?? 35.1,
-            ),
-            pdo1_enabled: form.pdProfiles[0]?.enabled ?? false,
-            pdo1_voltage_v: parseNumber(
-              form.pdProfiles[0]?.voltageV ?? '0',
-              livePdProfiles[0]?.voltageV ?? 0,
-            ),
-            pdo1_current_a: parseNumber(
-              form.pdProfiles[0]?.currentA ?? '0',
-              livePdProfiles[0]?.currentA ?? 0,
-            ),
-            pdo2_enabled: form.pdProfiles[1]?.enabled ?? false,
-            pdo2_voltage_v: parseNumber(
-              form.pdProfiles[1]?.voltageV ?? '0',
-              livePdProfiles[1]?.voltageV ?? 0,
-            ),
-            pdo2_current_a: parseNumber(
-              form.pdProfiles[1]?.currentA ?? '0',
-              livePdProfiles[1]?.currentA ?? 0,
-            ),
-            pdo3_enabled: form.pdProfiles[2]?.enabled ?? false,
-            pdo3_voltage_v: parseNumber(
-              form.pdProfiles[2]?.voltageV ?? '0',
-              livePdProfiles[2]?.voltageV ?? 0,
-            ),
-            pdo3_current_a: parseNumber(
-              form.pdProfiles[2]?.currentA ?? '0',
-              livePdProfiles[2]?.currentA ?? 0,
-            ),
-          },
+          args: buildPdCommandArgs(),
         },
         {
           detail: 'Refreshing live STUSB contract and PDO readback...',
@@ -1834,16 +1841,17 @@ export function BringupWorkbench({
     setPdNvmConfirmOpen(false)
     await runCommandSequence(
       'Burn PD PDOs to NVM',
-      'STUSB4500 NVM burn command issued.',
+      'STUSB4500 NVM burn verified against raw NVM readback.',
       [
         moduleStateStep('pd', 'Syncing USB-PD module plan...'),
         {
-          detail: 'Writing the current PDO plan into STUSB4500 nonvolatile memory...',
+          detail: 'Validating runtime PDOs, then writing the current PDO plan into STUSB4500 nonvolatile memory...',
           cmd: 'pd_burn_nvm',
           risk: 'service',
-          note: 'Burn the current STUSB4500 PDO configuration into NVM so it becomes the startup default after reset.',
+          note: 'Validate the current runtime PDO plan, burn it into STUSB4500 NVM, and verify the raw NVM readback before reporting success.',
           requireService: true,
           timeoutMs: BRINGUP_PD_NVM_TIMEOUT_MS,
+          args: buildPdCommandArgs(),
         },
         {
           detail: 'Refreshing live STUSB contract and PDO readback after NVM action...',
@@ -1880,52 +1888,7 @@ export function BringupWorkbench({
           requireService: true,
           logHistory: true,
           timeoutMs: BRINGUP_PD_APPLY_TIMEOUT_MS,
-          args: {
-            firmware_plan_enabled: form.pdFirmwarePlanEnabled,
-            programming_only_max_w: parseNumber(
-              form.pdProgrammingOnlyMaxW,
-              snapshot.bringup.tuning.pdProgrammingOnlyMaxW ?? 30,
-            ),
-            reduced_mode_min_w: parseNumber(
-              form.pdReducedModeMinW,
-              snapshot.bringup.tuning.pdReducedModeMinW ?? 30,
-            ),
-            reduced_mode_max_w: parseNumber(
-              form.pdReducedModeMaxW,
-              snapshot.bringup.tuning.pdReducedModeMaxW ?? 35,
-            ),
-            full_mode_min_w: parseNumber(
-              form.pdFullModeMinW,
-              snapshot.bringup.tuning.pdFullModeMinW ?? 35.1,
-            ),
-            pdo1_enabled: form.pdProfiles[0]?.enabled ?? false,
-            pdo1_voltage_v: parseNumber(
-              form.pdProfiles[0]?.voltageV ?? '0',
-              livePdProfiles[0]?.voltageV ?? 0,
-            ),
-            pdo1_current_a: parseNumber(
-              form.pdProfiles[0]?.currentA ?? '0',
-              livePdProfiles[0]?.currentA ?? 0,
-            ),
-            pdo2_enabled: form.pdProfiles[1]?.enabled ?? false,
-            pdo2_voltage_v: parseNumber(
-              form.pdProfiles[1]?.voltageV ?? '0',
-              livePdProfiles[1]?.voltageV ?? 0,
-            ),
-            pdo2_current_a: parseNumber(
-              form.pdProfiles[1]?.currentA ?? '0',
-              livePdProfiles[1]?.currentA ?? 0,
-            ),
-            pdo3_enabled: form.pdProfiles[2]?.enabled ?? false,
-            pdo3_voltage_v: parseNumber(
-              form.pdProfiles[2]?.voltageV ?? '0',
-              livePdProfiles[2]?.voltageV ?? 0,
-            ),
-            pdo3_current_a: parseNumber(
-              form.pdProfiles[2]?.currentA ?? '0',
-              livePdProfiles[2]?.currentA ?? 0,
-            ),
-          },
+          args: buildPdCommandArgs(true),
         },
       ],
       {
@@ -2084,51 +2047,7 @@ export function BringupWorkbench({
           risk: 'service' as const,
           note: 'Apply STUSB4500 runtime PDO settings and update firmware power thresholds.',
           requireService: true,
-          args: {
-            programming_only_max_w: parseNumber(
-              form.pdProgrammingOnlyMaxW,
-              snapshot.bringup.tuning.pdProgrammingOnlyMaxW ?? 30,
-            ),
-            reduced_mode_min_w: parseNumber(
-              form.pdReducedModeMinW,
-              snapshot.bringup.tuning.pdReducedModeMinW ?? 30,
-            ),
-            reduced_mode_max_w: parseNumber(
-              form.pdReducedModeMaxW,
-              snapshot.bringup.tuning.pdReducedModeMaxW ?? 35,
-            ),
-            full_mode_min_w: parseNumber(
-              form.pdFullModeMinW,
-              snapshot.bringup.tuning.pdFullModeMinW ?? 35.1,
-            ),
-            pdo1_enabled: form.pdProfiles[0]?.enabled ?? false,
-            pdo1_voltage_v: parseNumber(
-              form.pdProfiles[0]?.voltageV ?? '0',
-              livePdProfiles[0]?.voltageV ?? 0,
-            ),
-            pdo1_current_a: parseNumber(
-              form.pdProfiles[0]?.currentA ?? '0',
-              livePdProfiles[0]?.currentA ?? 0,
-            ),
-            pdo2_enabled: form.pdProfiles[1]?.enabled ?? false,
-            pdo2_voltage_v: parseNumber(
-              form.pdProfiles[1]?.voltageV ?? '0',
-              livePdProfiles[1]?.voltageV ?? 0,
-            ),
-            pdo2_current_a: parseNumber(
-              form.pdProfiles[1]?.currentA ?? '0',
-              livePdProfiles[1]?.currentA ?? 0,
-            ),
-            pdo3_enabled: form.pdProfiles[2]?.enabled ?? false,
-            pdo3_voltage_v: parseNumber(
-              form.pdProfiles[2]?.voltageV ?? '0',
-              livePdProfiles[2]?.voltageV ?? 0,
-            ),
-            pdo3_current_a: parseNumber(
-              form.pdProfiles[2]?.currentA ?? '0',
-              livePdProfiles[2]?.currentA ?? 0,
-            ),
-          },
+          args: buildPdCommandArgs(),
         },
         {
           detail: 'Applying haptic profile...',
@@ -2417,7 +2336,7 @@ export function BringupWorkbench({
           <div className="bringup-step-list">
             <div className="bringup-step-list__item">
               <strong>1. Connect the board</strong>
-              <p>Use Web Serial for the real unit or Mock rig if you just want to learn the flow.</p>
+              <p>Use Web Serial or Wireless for the real unit, or Mock rig if you just want to learn the flow.</p>
             </div>
             <div className="bringup-step-list__item">
               <strong>2. Choose one module page</strong>
@@ -4779,7 +4698,7 @@ export function BringupWorkbench({
           tone="critical"
           bullets={[
             'NVM endurance is finite. Do not use NVM burn for iterative tuning.',
-            'Validate the runtime PDO plan first with Apply runtime PDOs and live readback.',
+            'This flow validates runtime PDO readback first, then burns NVM, then compares raw NVM readback before reporting success.',
             'A successful burn changes the controller startup defaults after STUSB reset or power cycle.',
           ]}
           onCancel={() => setPdNvmConfirmOpen(false)}

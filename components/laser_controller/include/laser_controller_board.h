@@ -136,6 +136,9 @@ esp_err_t laser_controller_board_i2c_write_read(
 esp_err_t laser_controller_board_configure_pd_debug(
     const laser_controller_service_pd_profile_t *profiles,
     size_t profile_count);
+esp_err_t laser_controller_board_burn_pd_nvm(
+    const laser_controller_service_pd_profile_t *profiles,
+    size_t profile_count);
 void laser_controller_board_force_pd_refresh(void);
 void laser_controller_board_get_shared_i2c_line_levels(
     bool *sda_high,

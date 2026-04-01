@@ -175,6 +175,10 @@ void laser_controller_service_set_pd_firmware_plan_enabled(
     laser_controller_time_ms_t now_ms);
 esp_err_t laser_controller_service_apply_saved_pd_runtime(
     laser_controller_time_ms_t now_ms);
+esp_err_t laser_controller_service_burn_pd_nvm(
+    const laser_controller_service_pd_profile_t *profiles,
+    size_t profile_count,
+    laser_controller_time_ms_t now_ms);
 void laser_controller_service_set_haptic_config(
     uint32_t effect_id,
     laser_controller_service_haptic_mode_t mode,

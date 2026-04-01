@@ -35,6 +35,7 @@ import {
   summarizeSafetyChecks,
   toneFromSystemState,
 } from './lib/presentation'
+import { controllerBenchAp, transportLabel } from './lib/wireless'
 import type {
   FirmwarePackageDescriptor,
   Severity,
@@ -92,6 +93,17 @@ const navItems: Array<{
 ]
 
 function connectStepsForTransport(kind: TransportKind): string[] {
+  if (kind === 'wifi') {
+    return [
+      `Power the controller from USB-PD, then join Wi-Fi SSID ${controllerBenchAp.ssid}.`,
+      `Use password ${controllerBenchAp.password}. Keep this host GUI running locally on the laptop.`,
+      `Choose Wireless and connect to ${controllerBenchAp.wsUrl}.`,
+      'Wireless uses the same controller JSON protocol as USB, including service-mode gating and logs.',
+      'The laptop will usually lose normal internet while joined to the controller AP. That is expected during bench operation.',
+      'Wireless is for monitoring and bench control. Firmware flashing still requires Web Serial.',
+    ]
+  }
+
   if (kind === 'serial') {
     return [
       'Open in Chrome or Edge.',
@@ -130,6 +142,8 @@ function App() {
 
   const {
     transportKind,
+    wifiUrl,
+    setWifiUrl,
     setTransportKind,
     transportStatus,
     transportDetail,
@@ -207,6 +221,13 @@ function App() {
         value: snapshot.pd.sourceIsHostOnly ? 'USB host only' : formatEnumLabel(snapshot.session.powerTier),
         detail: `${formatNumber(snapshot.pd.sourceVoltageV, 1)} V · ${formatNumber(snapshot.pd.sourceCurrentA, 2)} A`,
       },
+      {
+        label: 'Wireless AP',
+        value: snapshot.wireless.apReady ? snapshot.wireless.ssid : 'Offline',
+        detail: snapshot.wireless.apReady
+          ? `${snapshot.wireless.wsUrl} · ${snapshot.wireless.clientCount} client${snapshot.wireless.clientCount === 1 ? '' : 's'}`
+          : 'SoftAP not advertising yet',
+      },
     ],
     [
       snapshot.identity.firmwareVersion,
@@ -219,6 +240,10 @@ function App() {
       snapshot.session.bootReason,
       snapshot.session.powerTier,
       snapshot.session.uptimeSeconds,
+      snapshot.wireless.apReady,
+      snapshot.wireless.clientCount,
+      snapshot.wireless.ssid,
+      snapshot.wireless.wsUrl,
     ],
   )
   const workflowSteps = useMemo(
@@ -230,7 +255,9 @@ function App() {
           transportStatus === 'connected'
             ? transportKind === 'mock'
               ? 'Mock rig active'
-              : 'Web Serial attached'
+              : transportKind === 'wifi'
+                ? 'Wireless controller link active'
+                : 'Web Serial attached'
             : 'Start or connect the selected transport',
       },
       {
@@ -293,7 +320,11 @@ function App() {
   const compactConnectionDetail =
     transportKind === 'mock'
       ? 'Mock rig linked. Use the right rail for transport and service controls.'
-      : 'Web Serial linked. Use the right rail for reconnect, disconnect, and service mode.'
+      : transportKind === 'wifi'
+        ? snapshot.wireless.apReady
+          ? `Wireless link active. Bench AP ${snapshot.wireless.ssid} is up at ${snapshot.wireless.wsUrl} with ${snapshot.wireless.clientCount} client${snapshot.wireless.clientCount === 1 ? '' : 's'}.`
+          : 'Wireless link active. USB can stay dedicated to PD power while the laptop talks over Wi-Fi.'
+        : 'Web Serial linked. Use the right rail for reconnect, disconnect, and service mode.'
 
   async function handleToggleServiceMode() {
     if (transportStatus !== 'connected') {
@@ -444,7 +475,7 @@ function App() {
                 <div className="hero-connect__compact">
                   <div className="hero-connect__status-row">
                     <span className="inline-token">
-                      {transportKind === 'mock' ? 'Mock rig' : 'Web Serial'}
+                      {transportLabel(transportKind)}
                     </span>
                     <span
                       className={
@@ -481,7 +512,33 @@ function App() {
                     >
                       Web Serial
                     </button>
+                    <button
+                      type="button"
+                      className={transportKind === 'wifi' ? 'segmented__button is-active' : 'segmented__button'}
+                      onClick={() => {
+                        void setTransportKind('wifi')
+                      }}
+                    >
+                      Wireless
+                    </button>
                   </div>
+
+                  {transportKind === 'wifi' ? (
+                    <label className="field-block">
+                      <span>Wireless controller URL</span>
+                      <input
+                        type="text"
+                        value={wifiUrl}
+                        onChange={(event) => setWifiUrl(event.target.value)}
+                        placeholder={controllerBenchAp.wsUrl}
+                      />
+                      <small>
+                        Bench AP: <code>{controllerBenchAp.ssid}</code> /
+                        <code>{controllerBenchAp.password}</code>
+                      </small>
+                      <small>Default endpoint: <code>{controllerBenchAp.wsUrl}</code></small>
+                    </label>
+                  ) : null}
 
                   <div className="button-row">
                     <button
@@ -489,7 +546,11 @@ function App() {
                       className="action-button is-inline is-accent"
                       onClick={() => connect()}
                     >
-                      {transportKind === 'mock' ? 'Start mock rig' : 'Connect board'}
+                      {transportKind === 'mock'
+                        ? 'Start mock rig'
+                        : transportKind === 'wifi'
+                          ? 'Connect wireless'
+                          : 'Connect board'}
                     </button>
                     <button
                       type="button"
@@ -810,8 +871,10 @@ function App() {
         transportKind={transportKind}
         transportStatus={transportStatus}
         transportDetail={transportDetail}
+        wifiUrl={wifiUrl}
         firmwareProgress={firmwareProgress}
         onExportSession={exportSession}
+        onSetWifiUrl={setWifiUrl}
         onSetTransportKind={setTransportKind}
         onConnect={connect}
         onDisconnect={disconnect}

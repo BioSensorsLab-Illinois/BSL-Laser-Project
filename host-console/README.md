@@ -13,6 +13,7 @@ Cross-platform host monitoring software for the handheld 785 nm surgical laser c
 - firmware package staging, preflight, and raw app-binary browser flashing over Web Serial
 - mock transport for UI development and protocol shaping
 - Web Serial transport for browser-based USB CDC integration
+- Wireless transport over the ESP32 bench SoftAP and WebSocket bridge
 - session export for bench records and fault review
 
 ## GUI Shape
@@ -53,6 +54,21 @@ Use `Mock rig` for the fully interactive demo.
 
 Use `Web Serial` to connect to a live controller over browser-supported serial.
 
+Use `Wireless` when USB-C is occupied by the PD source and the controller is running the wireless bench image.
+The current bench wireless path is Wi‑Fi SoftAP + WebSocket on purpose; BLE is intentionally not the primary browser link because sustained browser support and telemetry stability are worse.
+The current wireless bench defaults are:
+
+- SSID: `BSL-HTLS-Bench`
+- password: `bslbench2026`
+- WebSocket URL: `ws://192.168.4.1/ws`
+
+Typical wireless bench sequence:
+
+1. Power the controller from the PD source.
+2. Join the laptop to `BSL-HTLS-Bench`.
+3. Keep the host console open on `localhost`.
+4. Choose `Wireless` in the GUI and connect to `ws://192.168.4.1/ws`.
+
 The `Control` tab now includes:
 
 - optical-power setpoint control for the 5 W / 5 A laser model, including optional auto-follow without a separate apply step
@@ -88,10 +104,12 @@ The `Firmware` tab now includes:
 Current live-device expectation:
 
 - the firmware emits newline-delimited JSON envelopes
+- USB CDC and Wireless both carry the same newline-delimited JSON protocol
 - `status_snapshot` events update the main telemetry snapshot
 - `log` events populate the event timeline
 - the current bench firmware accepts the full `Control` and `Bring-up` page command surface, but mutating commands are only honored while service mode is requested or active
 - the live snapshot includes `bench`, `safety`, and `bringup` sections so the UI does not have to infer staged controller state
+- the live snapshot now also includes a `wireless` section so the GUI can show AP readiness and live client count
 - non-JSON boot text and ESP-IDF console output are preserved as `console` events instead of being dropped
 
 For a production bundle:
@@ -103,6 +121,7 @@ npm run build
 ## Current Limits
 
 - Web Serial flashing currently supports raw local app binaries only, requires a valid embedded BSL firmware signature block, and assumes the app image should be written at `0x10000`.
+- Wireless transport does not implement browser flashing. Use it for monitoring and bench control only.
 - Use the ESP-IDF CLI for first-program, bootloader, partition-table, or full-chip recovery work.
 - The current firmware implements both service-only bring-up staging and bench-control staging, but real peripheral transactions are still backed by a mock board layer until hardware drivers land.
 - The mock rig supports firmware-transfer simulation, not real flash programming.

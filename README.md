@@ -13,6 +13,8 @@ This tree is intentionally safe-by-default and intentionally incomplete for pati
 
 Do not treat the current repository as clinically deployable firmware. Treat it as an auditable bootstrap that preserves the right safety shape while real drivers, calibration tooling, bench validation, and reaction-time measurements are added.
 
+The bench image now also includes a Wi‑Fi SoftAP + WebSocket bridge so the host console can stay connected while USB-C is dedicated to the PD power source. That wireless bridge is a bench transport only; it does not change firmware safety ownership and it does not replace USB-based flashing or recovery. Wi‑Fi is intentionally the primary wireless path here; BLE is not the preferred browser transport for this bench because telemetry stability matters more than pairing convenience.
+
 ## Design Priorities
 
 1. Any ambiguity means laser off.

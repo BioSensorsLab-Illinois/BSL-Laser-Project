@@ -56,6 +56,10 @@ Preserve a firmware architecture where the default answer to any ambiguity is:
   Owns host-side session state, transport lifecycle, command history, and session export.
 - [host-console/src/lib/web-serial-transport.ts](/Users/zz4/BSL/BSL-Laser/host-console/src/lib/web-serial-transport.ts)
   Browser transport wrapper for newline-delimited JSON over USB CDC / Web Serial, plus raw app-binary flashing over the ESP ROM bootloader.
+- [components/laser_controller/src/laser_controller_wireless.c](/Users/zz4/BSL/BSL-Laser/components/laser_controller/src/laser_controller_wireless.c)
+  Bench-only Wi-Fi SoftAP + WebSocket bridge that carries the same newline-delimited JSON protocol as USB CDC so the host can stay connected while USB-C is occupied by PD power.
+- [host-console/src/lib/websocket-transport.ts](/Users/zz4/BSL/BSL-Laser/host-console/src/lib/websocket-transport.ts)
+  Browser wireless transport for the controller WebSocket bridge. It must preserve the same protocol semantics and service-mode gating as the USB path.
 - [host-console/src/components/CommandDeck.tsx](/Users/zz4/BSL/BSL-Laser/host-console/src/components/CommandDeck.tsx)
   Guarded maintenance command surface, split I2C/SPI bus lab, decoded register readback, and the host-side multi-PCB provisioning worksheet for Main / ToF / BMS / PD / Button boards. Do not turn this into a direct beam-control panel.
 - [host-console/src/components/ControlWorkbench.tsx](/Users/zz4/BSL/BSL-Laser/host-console/src/components/ControlWorkbench.tsx)
@@ -108,6 +112,8 @@ Preserve a firmware architecture where the default answer to any ambiguity is:
 - That auto-sync must keep retrying until the controller plan actually matches the local host draft. It must not be a one-shot timer that gives up forever just because a background probe happened to be running at the wrong moment.
 - Background bring-up probes should stay paused while local module-plan sync is still outstanding. Otherwise the UI can show `Awaiting probe` for a module that is physically present simply because the controller never received the expected-present flag yet.
 - The Events page now contains a dedicated decoded bus-traffic viewer for all SPI/I2C communication. It is the preferred place to isolate communication for a single module or device before dropping into manual Bus Lab reads.
+- The Tools Bus Lab must show the actual returned transfer string (`lastI2cOp`, `lastSpiOp`, or `lastI2cScan`) as the command result, not just a generic "controller acknowledged command" message.
+- Repeated identical bus reads still need their own comms-log entries. Do not rely only on snapshot-diff events for SPI/I2C history, because the operator may intentionally read the same register value many times in a row.
 - The Events workspace should also surface failed host commands directly from command history, not only from derived transport events. A rejected `dac_debug_config` or similar service write must remain visible even if the inspector rail is collapsed.
 - Service-mode peripheral writes should only succeed when the module is armed for writes through the bring-up plan (`expected_present` or `debug_enabled`). They must not return fake success when the module plan still disallows hardware access.
 - The host Bring-up `Apply ...` actions should sync that module's current plan to firmware before attempting the module-specific write, so a stale unsaved checkbox state cannot make hardware writes look dead.
@@ -118,10 +124,20 @@ Preserve a firmware architecture where the default answer to any ambiguity is:
 - The new `pd_save_firmware_plan` path is MCU-owned persistence, not STUSB4500 NVM. It must validate runtime PDO readback first, then save the verified plan into ESP32 NVS.
 - If MCU-owned PDO auto-reconcile is enabled, firmware must compare the saved plan against live STUSB4500 runtime PDO readback and only write the chip when the live table does not already match.
 - MCU-owned PDO auto-reconcile must stay throttled and conservative so a bad bench setup cannot create a rapid renegotiation/reboot loop.
-- Any future STUSB4500 NVM burn path must stay separate from runtime PDO apply, must remain manufacturing/service only, and must warn explicitly that NVM endurance is finite.
+- STUSB4500 NVM burn must stay separate from runtime PDO apply, must remain manufacturing/service only, and must warn explicitly that NVM endurance is finite.
+- `pd_burn_nvm` now means: validate runtime PDO readback, burn the PDO-related bytes into the raw STUSB4500 NVM map, then compare raw NVM readback before reporting success.
+- STUSB4500 NVM burn must preserve non-PDO bytes. Read the full 5-bank image first and only patch the PDO-related fields before writing it back.
+- The per-PDO NVM LUT current set is: `0.50, 0.75, 1.00, 1.25, 1.50, 1.75, 2.00, 2.25, 2.50, 2.75, 3.00, 3.50, 4.00, 4.50, 5.00 A`. If a custom current is used, it must share the one common flexible-current field.
 - The host-side PDO editor should stay constrained to auditable, selectable voltage/current choices instead of arbitrary free-form numbers, and firmware must still reject invalid combinations.
 - Browser flashing now depends on an embedded `BSLFWS1` firmware signature block inside the ESP-IDF app image. The host must reject images with a missing, malformed, or mismatched signature block.
 - The current signature block is a compatibility and provenance contract for bench flashing, not a tamper-proof PKI release-signing system. Do not describe it as cryptographic release security.
+- The bench image now also brings up a dedicated Wi-Fi SoftAP bridge:
+  - SSID: `BSL-HTLS-Bench`
+  - password: `bslbench2026`
+  - WebSocket URL: `ws://192.168.4.1/ws`
+- Wireless is for monitoring, logs, bring-up, and bench control only. Browser flashing remains USB / Web Serial only.
+- Prefer Wi-Fi SoftAP + WebSocket over BLE for the bench host link. BLE is not the primary transport here because browser compatibility and sustained telemetry stability are weaker.
+- Stability priority for wireless is: one dedicated SoftAP, one protocol, one operator laptop. Do not add a second wireless control surface with different semantics unless it is reviewed explicitly.
 - IMU and ToF invalid or stale conditions currently auto-clear in the bench image, but they still disable NIR immediately and remain logged.
 - The bench IMU snapshot now publishes beam-frame pitch, roll, and a relative gyro-integrated yaw for host rendering. Only pitch is currently part of the safety interlock path; roll and yaw are telemetry only until mechanically validated.
 - Lambda drift and TEC temperature ADC trips currently auto-clear after their configured 2-second default hold windows; they should stay adjustable and auditable.
@@ -180,6 +196,7 @@ That is the correct current state for an unprovisioned, unvalidated codebase.
 - The host verifies the block by scanning the image for the `BSLFWS1` / `BSLEND1` sentinels and recomputing the embedded metadata SHA-256 payload digest.
 - If the image lacks this block, or any field mismatches the expected contract, Web Serial flashing must stay blocked and explain why.
 - If a future production signing chain is added, it must extend this contract instead of bypassing it.
+- Do not extend browser flashing onto the wireless path unless it is separately bench-verified. Right now wireless is intentionally non-flashing.
 4. Add the ToF driver with explicit invalid, saturated, stale, and timeout handling.
 5. Add the two-stage trigger / button runtime path after the missing button-board details are resolved.
 6. Tighten PD supervision into a finished production policy once STUSB4500 communication is stable.

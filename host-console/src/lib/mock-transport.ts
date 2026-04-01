@@ -789,13 +789,13 @@ export class MockTransport implements DeviceTransport {
         break
     }
 
+    this.emit({ kind: 'snapshot', snapshot: this.makeSnapshot() })
     this.emit({
       kind: 'commandAck',
       commandId: command.id,
       ok: true,
       note: 'Accepted by mock controller.',
     })
-    this.emit({ kind: 'snapshot', snapshot: this.makeSnapshot() })
   }
 
   async beginFirmwareTransfer(
@@ -1149,6 +1149,13 @@ export class MockTransport implements DeviceTransport {
         powerTier: this.state.powerTier,
         bootReason: 'power_on_reset',
         connectedAtIso: new Date(Date.now() - this.state.uptimeSeconds * 1000).toISOString(),
+      },
+      wireless: {
+        started: false,
+        apReady: false,
+        clientCount: 0,
+        ssid: 'BSL-HTLS-Bench',
+        wsUrl: 'ws://192.168.4.1/ws',
       },
       pd: {
         contractValid: this.state.powerTier !== 'unknown',

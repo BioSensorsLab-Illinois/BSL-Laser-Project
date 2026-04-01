@@ -1312,6 +1312,42 @@ esp_err_t laser_controller_service_apply_saved_pd_runtime(
     return err;
 }
 
+esp_err_t laser_controller_service_burn_pd_nvm(
+    const laser_controller_service_pd_profile_t *profiles,
+    size_t profile_count,
+    laser_controller_time_ms_t now_ms)
+{
+    laser_controller_service_pd_profile_t
+        normalized_profiles[LASER_CONTROLLER_SERVICE_PD_PROFILE_COUNT];
+    esp_err_t err = ESP_OK;
+
+    if (profiles == NULL ||
+        profile_count != LASER_CONTROLLER_SERVICE_PD_PROFILE_COUNT) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    laser_controller_service_normalize_pd_profiles(profiles, normalized_profiles);
+    err = laser_controller_board_burn_pd_nvm(
+        normalized_profiles,
+        LASER_CONTROLLER_SERVICE_PD_PROFILE_COUNT);
+
+    portENTER_CRITICAL(&s_service_lock);
+    laser_controller_service_write_action_locked(
+        err == ESP_OK ?
+            "STUSB4500 NVM burn completed and raw NVM readback matched the requested PDO bytes." :
+            "STUSB4500 NVM burn failed before raw NVM readback could be verified.",
+        now_ms);
+    laser_controller_service_copy_text(
+        s_service.status.last_i2c_op,
+        sizeof(s_service.status.last_i2c_op),
+        err == ESP_OK ?
+            "STUSB4500 NVM PDO bytes written and verified against raw NVM readback." :
+            "STUSB4500 NVM write failed or raw readback did not match.");
+    portEXIT_CRITICAL(&s_service_lock);
+
+    return err;
+}
+
 void laser_controller_service_set_haptic_config(
     uint32_t effect_id,
     laser_controller_service_haptic_mode_t mode,

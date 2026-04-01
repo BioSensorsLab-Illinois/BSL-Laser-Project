@@ -631,6 +631,40 @@ code {
   margin: 0;
 }
 
+.field-block {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  border-radius: 16px;
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--surface-elevated) 84%, transparent);
+}
+
+.field-block--compact {
+  padding: 10px 12px;
+  gap: 7px;
+}
+
+.field-block > span {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-soft);
+}
+
+.field-block > small {
+  color: var(--text-soft);
+  line-height: 1.45;
+}
+
+.field-block input[type='text'] {
+  min-height: 42px;
+  border-radius: 12px;
+  padding: 0 12px;
+}
+
 .segmented {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

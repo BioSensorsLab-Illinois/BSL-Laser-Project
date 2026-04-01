@@ -17,6 +17,7 @@ import {
 } from '../lib/event-decode'
 import type { UiTone } from '../lib/presentation'
 import { commandTemplates } from '../lib/protocol'
+import { transportLabel } from '../lib/wireless'
 import type { CommandRisk, DeviceSnapshot, TransportKind, TransportStatus } from '../types'
 
 type CommandDeckProps = {
@@ -1175,7 +1176,7 @@ export function CommandDeck({
                   </div>
                   <div className="metric-card">
                     <span>Transport</span>
-                    <strong>{transportKind === 'mock' ? 'mock rig' : 'web serial'}</strong>
+                    <strong>{transportLabel(transportKind).toLowerCase()}</strong>
                     <small>
                       {snapshot.bringup.serviceModeActive
                         ? 'service path open'
@@ -1221,7 +1222,7 @@ export function CommandDeck({
         <div className="command-footer">
           <div className="inline-token">
             <Settings2 size={14} />
-            <span>Live transport: {transportKind === 'mock' ? 'mock rig' : 'web serial'}</span>
+            <span>Live transport: {transportLabel(transportKind).toLowerCase()}</span>
           </div>
           <div className="inline-token">
             <span>Protocol: {snapshot.identity.protocolVersion}</span>

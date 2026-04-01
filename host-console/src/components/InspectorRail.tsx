@@ -7,6 +7,7 @@ import {
   formatEnumLabel,
   summarizeSafetyChecks,
 } from '../lib/presentation'
+import { controllerBenchAp, transportLabel } from '../lib/wireless'
 import type {
   CommandHistoryEntry,
   DeviceSnapshot,
@@ -21,8 +22,10 @@ type InspectorRailProps = {
   transportKind: TransportKind
   transportStatus: TransportStatus
   transportDetail: string
+  wifiUrl: string
   firmwareProgress: FirmwareTransferProgress | null
   onExportSession: () => void
+  onSetWifiUrl: (url: string) => void
   onSetTransportKind: (kind: TransportKind) => Promise<void> | void
   onConnect: () => Promise<void> | void
   onDisconnect: () => Promise<void> | void
@@ -35,8 +38,10 @@ export function InspectorRail({
   transportKind,
   transportStatus,
   transportDetail,
+  wifiUrl,
   firmwareProgress,
   onExportSession,
+  onSetWifiUrl,
   onSetTransportKind,
   onConnect,
   onDisconnect,
@@ -120,7 +125,7 @@ export function InspectorRail({
         </div>
         <div className="inspector-link-summary">
           <div className={`transport-chip is-${transportStatus}`}>
-            <span>{transportKind === 'mock' ? 'mock rig' : 'web serial'}</span>
+            <span>{transportLabel(transportKind).toLowerCase()}</span>
             <strong>{transportStatus}</strong>
           </div>
         </div>
@@ -156,7 +161,33 @@ export function InspectorRail({
           >
             Web Serial
           </button>
+          <button
+            type="button"
+            className={transportKind === 'wifi' ? 'segmented__button is-active' : 'segmented__button'}
+            onClick={() => {
+              void onSetTransportKind('wifi')
+            }}
+          >
+            Wireless
+          </button>
         </div>
+        {transportKind === 'wifi' ? (
+          <label className="field-block field-block--compact">
+            <span>Wireless URL</span>
+            <input
+              type="text"
+              value={wifiUrl}
+              onChange={(event) => onSetWifiUrl(event.target.value)}
+              placeholder={controllerBenchAp.wsUrl}
+            />
+            <small>
+              Join <code>{controllerBenchAp.ssid}</code> with <code>{controllerBenchAp.password}</code>
+            </small>
+            <small>
+              Firmware AP: <code>{snapshot.wireless.ssid}</code> • {snapshot.wireless.apReady ? 'ready' : 'offline'} • {snapshot.wireless.clientCount} client{snapshot.wireless.clientCount === 1 ? '' : 's'}
+            </small>
+          </label>
+        ) : null}
         <div className="button-row inspector-link-actions">
           <button
             type="button"
@@ -165,7 +196,11 @@ export function InspectorRail({
               void onConnect()
             }}
           >
-            {connected ? 'Refresh link' : 'Connect'}
+            {connected
+              ? 'Refresh link'
+              : transportKind === 'wifi'
+                ? 'Connect wireless'
+                : 'Connect'}
           </button>
           <button
             type="button"

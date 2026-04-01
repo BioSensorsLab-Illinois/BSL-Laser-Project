@@ -5,6 +5,7 @@ import { makeDefaultBenchControlStatus } from '../lib/bench-model'
 import { annotateSessionEvent } from '../lib/event-decode'
 import { MockTransport } from '../lib/mock-transport'
 import { WebSerialTransport } from '../lib/web-serial-transport'
+import { WebSocketTransport } from '../lib/websocket-transport'
 import type {
   CommandEnvelope,
   CommandHistoryEntry,
@@ -21,6 +22,8 @@ import type {
 
 const HOST_TRANSPORT_KIND_STORAGE_KEY = 'bsl-host-transport-kind'
 const HOST_SERIAL_RECONNECT_STORAGE_KEY = 'bsl-host-serial-reconnect'
+const HOST_WIFI_URL_STORAGE_KEY = 'bsl-host-wifi-url'
+const DEFAULT_WIFI_WS_URL = 'ws://192.168.4.1/ws'
 const COMMAND_ACK_TIMEOUT_MS = 2600
 
 function makeEventId(suffix: string): string {
@@ -61,6 +64,45 @@ function moduleFromCommand(cmd: string): string {
   }
 
   return 'system'
+}
+
+function noteFromSnapshotForCommand(
+  cmd: string,
+  snapshot: DeviceSnapshot,
+): string | null {
+  if (cmd === 'i2c_scan') {
+    return snapshot.bringup.tools.lastI2cScan.trim().length > 0
+      ? snapshot.bringup.tools.lastI2cScan
+      : null
+  }
+
+  if (cmd === 'i2c_read' || cmd === 'i2c_write') {
+    return snapshot.bringup.tools.lastI2cOp.trim().length > 0
+      ? snapshot.bringup.tools.lastI2cOp
+      : null
+  }
+
+  if (cmd === 'spi_read' || cmd === 'spi_write') {
+    return snapshot.bringup.tools.lastSpiOp.trim().length > 0
+      ? snapshot.bringup.tools.lastSpiOp
+      : null
+  }
+
+  if (cmd === 'refresh_pd_status') {
+    return `PD refresh -> ${snapshot.pd.sourceVoltageV.toFixed(1)} V, ${snapshot.pd.sourceCurrentA.toFixed(2)} A, ${snapshot.pd.negotiatedPowerW.toFixed(1)} W`
+  }
+
+  return null
+}
+
+function isBusCommand(cmd: string): boolean {
+  return (
+    cmd === 'i2c_scan' ||
+    cmd === 'i2c_read' ||
+    cmd === 'i2c_write' ||
+    cmd === 'spi_read' ||
+    cmd === 'spi_write'
+  )
 }
 
 function deriveSnapshotEvents(
@@ -168,7 +210,7 @@ function readStoredTransportKind(): TransportKind {
   }
 
   const stored = window.localStorage.getItem(HOST_TRANSPORT_KIND_STORAGE_KEY)
-  return stored === 'serial' ? 'serial' : 'mock'
+  return stored === 'serial' || stored === 'wifi' ? stored : 'mock'
 }
 
 function readStoredSerialReconnect(): boolean {
@@ -185,6 +227,23 @@ function writeStoredTransportKind(kind: TransportKind): void {
   }
 
   window.localStorage.setItem(HOST_TRANSPORT_KIND_STORAGE_KEY, kind)
+}
+
+function readStoredWifiUrl(): string {
+  if (typeof window === 'undefined') {
+    return DEFAULT_WIFI_WS_URL
+  }
+
+  const stored = window.localStorage.getItem(HOST_WIFI_URL_STORAGE_KEY)
+  return stored !== null && stored.trim().length > 0 ? stored : DEFAULT_WIFI_WS_URL
+}
+
+function writeStoredWifiUrl(url: string): void {
+  if (typeof window === 'undefined') {
+    return
+  }
+
+  window.localStorage.setItem(HOST_WIFI_URL_STORAGE_KEY, url)
 }
 
 function writeStoredSerialReconnect(enabled: boolean): void {
@@ -214,6 +273,13 @@ function makeSeedSnapshot(): DeviceSnapshot {
       powerTier: 'unknown',
       bootReason: 'unknown',
       connectedAtIso: now,
+    },
+    wireless: {
+      started: false,
+      apReady: false,
+      clientCount: 0,
+      ssid: 'BSL-HTLS-Bench',
+      wsUrl: DEFAULT_WIFI_WS_URL,
     },
     pd: {
       contractValid: false,
@@ -380,6 +446,7 @@ function mergeSnapshot(
     ...incoming,
     identity: { ...current.identity, ...incoming.identity },
     session: { ...current.session, ...incoming.session },
+    wireless: { ...current.wireless, ...incoming.wireless },
     pd: { ...current.pd, ...incoming.pd },
     rails: {
       ld: { ...current.rails.ld, ...incoming.rails.ld },
@@ -425,6 +492,7 @@ export function useDeviceSession() {
   )
   const [transportStatus, setTransportStatus] = useState<TransportStatus>('disconnected')
   const [transportDetail, setTransportDetail] = useState('No active device link.')
+  const [wifiUrl, setWifiUrlState] = useState(() => readStoredWifiUrl())
   const [snapshot, setSnapshot] = useState<DeviceSnapshot>(makeSeedSnapshot)
   const [events, setEvents] = useState<SessionEvent[]>([])
   const [commands, setCommands] = useState<CommandHistoryEntry[]>([])
@@ -439,6 +507,7 @@ export function useDeviceSession() {
   const snapshotRef = useRef<DeviceSnapshot>(makeSeedSnapshot())
   const serialReconnectAttemptRef = useRef(false)
   const serialManualDisconnectRef = useRef(false)
+  const wifiManualDisconnectRef = useRef(false)
   const protocolReadyRef = useRef(false)
   const flashRecoveryUntilRef = useRef(0)
   const pendingAcksRef = useRef(new Map<number, PendingCommandAck>())
@@ -448,8 +517,12 @@ export function useDeviceSession() {
       return new WebSerialTransport()
     }
 
+    if (transportKind === 'wifi') {
+      return new WebSocketTransport(wifiUrl)
+    }
+
     return new MockTransport()
-  }, [transportKind])
+  }, [transportKind, wifiUrl])
 
   const appendEvent = useCallback((event: SessionEvent) => {
     setEvents((current) => [annotateSessionEvent(event), ...current].slice(0, 250))
@@ -496,18 +569,27 @@ export function useDeviceSession() {
   const handleMessage = useEffectEvent((message: TransportMessage) => {
     if (message.kind === 'transport') {
       if (
-        transportKind === 'serial' &&
-        serialManualDisconnectRef.current &&
+        (transportKind === 'serial' || transportKind === 'wifi') &&
+        (transportKind === 'serial'
+          ? serialManualDisconnectRef.current
+          : wifiManualDisconnectRef.current) &&
         (message.status === 'connected' || message.status === 'connecting')
       ) {
         void transportRef.current?.disconnect().catch(() => undefined)
         return
       }
 
-      if (message.status === 'connected' && transportKind === 'serial') {
+      if (
+        message.status === 'connected' &&
+        (transportKind === 'serial' || transportKind === 'wifi')
+      ) {
         protocolReadyRef.current = false
         setTransportStatus('connecting')
-        setTransportDetail('Serial port opened. Waiting for controller firmware handshake…')
+        setTransportDetail(
+          transportKind === 'serial'
+            ? 'Serial port opened. Waiting for controller firmware handshake…'
+            : 'Wireless socket open. Waiting for controller firmware handshake…',
+        )
         return
       }
 
@@ -525,7 +607,10 @@ export function useDeviceSession() {
     if (message.kind === 'snapshot') {
       protocolReadyRef.current = true
       flashRecoveryUntilRef.current = 0
-      if (transportKind === 'serial' && transportStatus !== 'connected') {
+      if (
+        (transportKind === 'serial' || transportKind === 'wifi') &&
+        transportStatus !== 'connected'
+      ) {
         setTransportStatus('connected')
         setTransportDetail('Controller protocol active.')
       }
@@ -548,7 +633,10 @@ export function useDeviceSession() {
     if (message.kind === 'commandAck') {
       protocolReadyRef.current = true
       flashRecoveryUntilRef.current = 0
-      if (transportKind === 'serial' && transportStatus !== 'connected') {
+      if (
+        (transportKind === 'serial' || transportKind === 'wifi') &&
+        transportStatus !== 'connected'
+      ) {
         setTransportStatus('connected')
         setTransportDetail('Controller protocol active.')
       }
@@ -618,6 +706,8 @@ export function useDeviceSession() {
       setSerialReconnectEnabled(true)
       setSerialReconnectCycle(0)
       writeStoredSerialReconnect(true)
+    } else if (transportKind === 'wifi') {
+      wifiManualDisconnectRef.current = false
     }
 
     setTransportDetail('Connecting…')
@@ -643,6 +733,30 @@ export function useDeviceSession() {
   }, [connect, transportKind, transportStatus])
 
   useEffect(() => {
+    if (transportKind !== 'wifi' || wifiManualDisconnectRef.current) {
+      return
+    }
+
+    if (firmwareProgress !== null && firmwareProgress.percent < 100) {
+      return
+    }
+
+    if (transportStatus === 'connected' || transportStatus === 'connecting') {
+      return
+    }
+
+    const timerId = window.setTimeout(() => {
+      if (!wifiManualDisconnectRef.current) {
+        void connect()
+      }
+    }, 900)
+
+    return () => {
+      window.clearTimeout(timerId)
+    }
+  }, [connect, firmwareProgress, transportKind, transportStatus, wifiUrl])
+
+  useEffect(() => {
     writeStoredTransportKind(transportKind)
   }, [transportKind])
 
@@ -651,7 +765,11 @@ export function useDeviceSession() {
   }, [serialReconnectEnabled])
 
   useEffect(() => {
-    if (transportKind !== 'serial') {
+    writeStoredWifiUrl(wifiUrl)
+  }, [wifiUrl])
+
+  useEffect(() => {
+    if (transportKind !== 'serial' && transportKind !== 'wifi') {
       return
     }
 
@@ -663,12 +781,14 @@ export function useDeviceSession() {
       if (!protocolReadyRef.current) {
         const recoveringFromFlash = flashRecoveryUntilRef.current > Date.now()
         markTransportUnhealthy(
-          recoveringFromFlash
+          recoveringFromFlash && transportKind === 'serial'
             ? 'Serial port reopened after browser flash, but the controller firmware still has not resumed the host protocol. The board may still be rebooting, sitting in bootloader mode, or have failed to leave the flasher cleanly.'
-            : 'Serial port opened, but the controller firmware did not answer the host protocol. The board may still be rebooting, sitting in bootloader mode, or running incompatible firmware.',
+            : transportKind === 'serial'
+              ? 'Serial port opened, but the controller firmware did not answer the host protocol. The board may still be rebooting, sitting in bootloader mode, or running incompatible firmware.'
+              : 'Wireless link opened, but the controller firmware did not answer the host protocol. Verify the laptop joined the controller AP and the ESP32 is running the wireless bench image.',
         )
       }
-    }, flashRecoveryUntilRef.current > Date.now() ? 7500 : 2200)
+    }, flashRecoveryUntilRef.current > Date.now() && transportKind === 'serial' ? 7500 : 2200)
 
     return () => {
       window.clearTimeout(timerId)
@@ -730,6 +850,8 @@ export function useDeviceSession() {
       setSerialReconnectEnabled(false)
       setSerialReconnectCycle(0)
       writeStoredSerialReconnect(false)
+    } else if (transportKind === 'wifi') {
+      wifiManualDisconnectRef.current = true
     }
 
     if (transportStatus === 'disconnected') {
@@ -772,13 +894,16 @@ export function useDeviceSession() {
       setTransportStatus('disconnected')
       setTransportDetail(
         nextKind === 'serial'
-          ? 'Mock rig disconnected. Web Serial selected.'
-          : 'Web Serial disconnected. Mock rig selected.',
+          ? 'Previous transport disconnected. Web Serial selected.'
+          : nextKind === 'wifi'
+            ? 'Previous transport disconnected. Wireless selected.'
+            : 'Previous transport disconnected. Mock rig selected.',
       )
       const nextSnapshot = makeSeedSnapshot()
       snapshotRef.current = nextSnapshot
       setSnapshot(nextSnapshot)
       serialManualDisconnectRef.current = false
+      wifiManualDisconnectRef.current = false
       setSerialReconnectEnabled(nextKind === 'serial')
       setSerialReconnectCycle(0)
       setTransportKindState(nextKind)
@@ -909,6 +1034,10 @@ export function useDeviceSession() {
         }
 
         const ack = await ackPromise
+        const successNote =
+          ack.ok
+            ? noteFromSnapshotForCommand(cmd, snapshotRef.current) ?? ack.note
+            : ack.note
 
         if (!ack.ok) {
           if (logHistory) {
@@ -939,7 +1068,7 @@ export function useDeviceSession() {
           })
 
           if (
-            transportKind === 'serial' &&
+            (transportKind === 'serial' || transportKind === 'wifi') &&
             ack.note.toLowerCase().includes('timed out')
           ) {
             markTransportUnhealthy(
@@ -949,7 +1078,42 @@ export function useDeviceSession() {
           }
         }
 
-        return ack
+        if (ack.ok && logHistory && successNote !== ack.note) {
+          setCommands((current) =>
+            current.map((entry) =>
+              entry.id === command.id
+                ? {
+                    ...entry,
+                    status: 'ack',
+                    note: successNote,
+                  }
+                : entry,
+            ),
+          )
+        }
+
+        if (ack.ok && isBusCommand(cmd)) {
+          appendEvent({
+            id: makeEventId('bus-command-result'),
+            atIso: new Date().toISOString(),
+            severity: 'info',
+            category: 'bus',
+            title:
+              cmd === 'i2c_scan'
+                ? 'I2C scan completed'
+                : cmd.startsWith('i2c_')
+                  ? 'I2C transaction completed'
+                  : 'SPI transaction completed',
+            detail: successNote,
+            module: 'bus',
+            source: 'host',
+          })
+        }
+
+        return {
+          ok: ack.ok,
+          note: successNote,
+        }
       } catch (error) {
         const message =
           error instanceof Error ? error.message : 'Command transport failed.'
@@ -1077,6 +1241,8 @@ export function useDeviceSession() {
 
   return {
     transportKind,
+    wifiUrl,
+    setWifiUrl: setWifiUrlState,
     setTransportKind,
     transportStatus,
     transportDetail,

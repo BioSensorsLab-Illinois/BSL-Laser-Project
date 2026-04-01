@@ -6,8 +6,8 @@ Define one command and telemetry model that can be carried over:
 
 - USB CDC for development
 - UART for bench debug
-- a future desktop GUI
-- a future wireless wrapper without changing semantics
+- the current desktop GUI
+- Wi-Fi SoftAP + WebSocket without changing semantics
 
 ## Framing
 
@@ -86,7 +86,7 @@ Required fields:
 | `set_runtime_safety` | update runtime safety thresholds, hysteresis, and hold windows | service-only; reject invalid policy values and keep firmware authoritative |
 | `pd_debug_config` | apply STUSB4500 runtime sink PDOs and update firmware power-tier thresholds | service-only; runtime-register write only, not a hidden NVM reprogramming path |
 | `pd_save_firmware_plan` | validate runtime PDO readback, then save the plan into ESP32 firmware NVS for future auto-reconcile | service-only; MCU-owned persistence, separate from STUSB4500 NVM |
-| `pd_burn_nvm` | request a dedicated STUSB4500 NVM burn of the validated PDO startup defaults | service-only; manufacturing-only action with finite endurance, never for iterative tuning |
+| `pd_burn_nvm` | validate runtime PDOs, then burn the requested STUSB4500 PDO startup defaults into NVM and verify raw NVM readback | service-only; manufacturing-only action with finite endurance, never for iterative tuning |
 | `set_target_temp` | stage TEC target temperature | service-only; clamp to safe calibrated range |
 | `set_target_lambda` | stage wavelength target | service-only; reject out-of-range or uncalibrated values |
 | `configure_modulation` | stage PCN high/low current modulation request | service-only; host request only, not direct PWM authority |
@@ -126,7 +126,8 @@ Current bring-up-specific behavior:
 - `pd_save_firmware_plan` first applies the same runtime PDO update, then refreshes live STUSB4500 readback, and only saves the plan into MCU NVS if the live PDO table matches the requested plan.
 - `pd_save_firmware_plan` also stores whether firmware auto-reconcile is enabled. When enabled, the ESP32 compares the saved PDO plan against live STUSB4500 runtime PDO readback when the controller is online and only re-applies it if the chip does not already match.
 - `pd_burn_nvm` is intentionally a separate command from runtime PDO apply so the host can warn about finite NVM endurance and final-provisioning intent.
-- The current bench firmware exposes the `pd_burn_nvm` command surface but returns a clear not-implemented error until a dedicated manufacturing flow is reviewed and landed.
+- `pd_burn_nvm` first applies the requested runtime PDOs, refreshes live STUSB4500 readback, aborts if runtime verification fails, then writes the STUSB4500 raw NVM banks and compares raw NVM readback before reporting success.
+- The current implementation preserves non-PDO NVM bytes by reading the full 5-bank map first and only patching the PDO-related fields before writing the full image back.
 
 ## Minimum Status Payload
 
@@ -142,6 +143,13 @@ Current bring-up-specific behavior:
   "session": {
     "state": "SERVICE_MODE",
     "powerTier": "full"
+  },
+  "wireless": {
+    "started": true,
+    "apReady": true,
+    "clientCount": 1,
+    "ssid": "BSL-HTLS-Bench",
+    "wsUrl": "ws://192.168.4.1/ws"
   },
   "pd": {
     "contractValid": true,
@@ -284,6 +292,15 @@ Current bring-up-specific behavior:
 }
 ```
 
+Wireless transport notes:
+
+- The current bench image brings up a dedicated SoftAP:
+  - SSID: `BSL-HTLS-Bench`
+  - password: `bslbench2026`
+  - WebSocket endpoint: `ws://192.168.4.1/ws`
+- Wireless carries the same newline-delimited JSON protocol as USB CDC.
+- Firmware flashing remains USB / Web Serial only. Wireless is for monitoring, logs, service-mode bring-up, and bench control.
+
 ## Logging and Event Rules
 
 ## Bring-Up Tuning Notes
@@ -312,7 +329,6 @@ Current bring-up-specific behavior:
   - `reduced_mode_max_w`
   - `full_mode_min_w`
   - The bench image writes STUSB4500 runtime PDO registers plus the live firmware power-tier classifier.
-  - It does not claim to rewrite STUSB4500 NVM.
   - PDO1 is normalized to the mandatory 5 V fallback.
   - PDO3 is only kept active when PDO2 is also enabled.
 - `pd_save_firmware_plan` mirrors the same fields plus:

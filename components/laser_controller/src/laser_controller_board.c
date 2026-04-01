@@ -93,6 +93,22 @@
 #define LASER_CONTROLLER_STUSB_DPM_PDO_NUMB    0x70U
 #define LASER_CONTROLLER_STUSB_DPM_PDO1_0      0x85U
 #define LASER_CONTROLLER_STUSB_RDO_STATUS_0    0x91U
+#define LASER_CONTROLLER_STUSB_FTP_KEY_REG     0x95U
+#define LASER_CONTROLLER_STUSB_FTP_CTRL_0_REG  0x96U
+#define LASER_CONTROLLER_STUSB_FTP_CTRL_1_REG  0x97U
+#define LASER_CONTROLLER_STUSB_FTP_RW_BUFFER_REG 0x53U
+#define LASER_CONTROLLER_STUSB_FTP_PASSWORD    0x47U
+#define LASER_CONTROLLER_STUSB_FTP_RST_N_BIT   0x40U
+#define LASER_CONTROLLER_STUSB_FTP_REQ_BIT     0x10U
+#define LASER_CONTROLLER_STUSB_FTP_SECTOR_MASK 0x07U
+#define LASER_CONTROLLER_STUSB_FTP_SER_MASK    0xF8U
+#define LASER_CONTROLLER_STUSB_FTP_OPCODE_MASK 0x07U
+#define LASER_CONTROLLER_STUSB_FTP_OPCODE_READ 0x00U
+#define LASER_CONTROLLER_STUSB_FTP_OPCODE_WRITE_PL 0x01U
+#define LASER_CONTROLLER_STUSB_FTP_OPCODE_WRITE_SER 0x02U
+#define LASER_CONTROLLER_STUSB_FTP_OPCODE_ERASE 0x05U
+#define LASER_CONTROLLER_STUSB_FTP_OPCODE_PROGRAM 0x06U
+#define LASER_CONTROLLER_STUSB_FTP_OPCODE_SOFT_PROGRAM 0x07U
 #define LASER_CONTROLLER_STUSB_TX_HEADER_LOW_REG 0x51U
 #define LASER_CONTROLLER_STUSB_SOFT_RESET_PAYLOAD 0x0DU
 #define LASER_CONTROLLER_STUSB_SEND_COMMAND     0x26U
@@ -112,6 +128,11 @@
 #define LASER_CONTROLLER_DAC_RETRY_MS          500U
 #define LASER_CONTROLLER_DAC_RESET_SETTLE_US   2000U
 #define LASER_CONTROLLER_IMU_RETRY_MS          500U
+#define LASER_CONTROLLER_STUSB_NVM_BANK_COUNT  5U
+#define LASER_CONTROLLER_STUSB_NVM_BANK_SIZE   8U
+#define LASER_CONTROLLER_STUSB_NVM_ALL_BANKS_MASK 0x1FU
+#define LASER_CONTROLLER_STUSB_NVM_COMMAND_TIMEOUT_MS 20U
+#define LASER_CONTROLLER_STUSB_NVM_RESET_DELAY_US 10U
 #define LASER_CONTROLLER_TWO_PI_RAD            6.28318530717958647692f
 #define LASER_CONTROLLER_PI_RAD                3.14159265358979323846f
 #define LASER_CONTROLLER_RAD_PER_DEG           0.01745329251994329577f
@@ -958,6 +979,610 @@ static esp_err_t laser_controller_board_i2c_read_stusb_block(
         1U,
         buffer,
         len);
+}
+
+static esp_err_t laser_controller_board_i2c_write_stusb_block(
+    uint8_t start_reg,
+    const uint8_t *buffer,
+    size_t len)
+{
+    uint8_t tx[1U + LASER_CONTROLLER_STUSB_NVM_BANK_SIZE];
+
+    if (buffer == NULL || len == 0U || len > LASER_CONTROLLER_STUSB_NVM_BANK_SIZE) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    tx[0] = start_reg;
+    memcpy(&tx[1], buffer, len);
+    return laser_controller_board_i2c_write(
+        LASER_CONTROLLER_STUSB4500_ADDR,
+        tx,
+        len + 1U);
+}
+
+static esp_err_t laser_controller_board_stusb_nvm_wait_ready(
+    laser_controller_time_ms_t timeout_ms)
+{
+    const laser_controller_time_ms_t start_ms =
+        laser_controller_board_uptime_ms();
+    uint8_t ctrl0 = 0U;
+    esp_err_t err;
+
+    do {
+        err = laser_controller_board_i2c_read_reg_u8(
+            LASER_CONTROLLER_STUSB4500_ADDR,
+            LASER_CONTROLLER_STUSB_FTP_CTRL_0_REG,
+            &ctrl0);
+        if (err != ESP_OK) {
+            return err;
+        }
+        if ((ctrl0 & LASER_CONTROLLER_STUSB_FTP_REQ_BIT) == 0U) {
+            return ESP_OK;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    } while ((laser_controller_board_uptime_ms() - start_ms) < timeout_ms);
+
+    return ESP_ERR_TIMEOUT;
+}
+
+static esp_err_t laser_controller_board_stusb_nvm_exit_test_mode(void)
+{
+    static const uint8_t kExitSequence[2] = {
+        LASER_CONTROLLER_STUSB_FTP_RST_N_BIT,
+        0x00U,
+    };
+    esp_err_t err;
+
+    err = laser_controller_board_i2c_write_stusb_block(
+        LASER_CONTROLLER_STUSB_FTP_CTRL_0_REG,
+        kExitSequence,
+        sizeof(kExitSequence));
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    return laser_controller_board_i2c_write(
+        LASER_CONTROLLER_STUSB4500_ADDR,
+        (const uint8_t[]){
+            LASER_CONTROLLER_STUSB_FTP_KEY_REG,
+            0x00U,
+        },
+        2U);
+}
+
+static esp_err_t laser_controller_board_stusb_nvm_enter_read_mode(void)
+{
+    esp_err_t err;
+
+    err = laser_controller_board_i2c_write(
+        LASER_CONTROLLER_STUSB4500_ADDR,
+        (const uint8_t[]){
+            LASER_CONTROLLER_STUSB_FTP_KEY_REG,
+            LASER_CONTROLLER_STUSB_FTP_PASSWORD,
+        },
+        2U);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = laser_controller_board_i2c_write(
+        LASER_CONTROLLER_STUSB4500_ADDR,
+        (const uint8_t[]){
+            LASER_CONTROLLER_STUSB_FTP_CTRL_0_REG,
+            LASER_CONTROLLER_STUSB_FTP_RST_N_BIT,
+        },
+        2U);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = laser_controller_board_i2c_write(
+        LASER_CONTROLLER_STUSB4500_ADDR,
+        (const uint8_t[]){
+            LASER_CONTROLLER_STUSB_FTP_CTRL_0_REG,
+            0x00U,
+        },
+        2U);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    esp_rom_delay_us(LASER_CONTROLLER_STUSB_NVM_RESET_DELAY_US);
+
+    return laser_controller_board_i2c_write(
+        LASER_CONTROLLER_STUSB4500_ADDR,
+        (const uint8_t[]){
+            LASER_CONTROLLER_STUSB_FTP_CTRL_0_REG,
+            LASER_CONTROLLER_STUSB_FTP_RST_N_BIT,
+        },
+        2U);
+}
+
+static esp_err_t laser_controller_board_stusb_nvm_read_bank(
+    uint8_t bank_index,
+    uint8_t *bank_data)
+{
+    esp_err_t err;
+
+    if (bank_data == NULL || bank_index >= LASER_CONTROLLER_STUSB_NVM_BANK_COUNT) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    err = laser_controller_board_i2c_write(
+        LASER_CONTROLLER_STUSB4500_ADDR,
+        (const uint8_t[]){
+            LASER_CONTROLLER_STUSB_FTP_CTRL_1_REG,
+            LASER_CONTROLLER_STUSB_FTP_OPCODE_READ,
+        },
+        2U);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = laser_controller_board_i2c_write(
+        LASER_CONTROLLER_STUSB4500_ADDR,
+        (const uint8_t[]){
+            LASER_CONTROLLER_STUSB_FTP_CTRL_0_REG,
+            (uint8_t)(LASER_CONTROLLER_STUSB_FTP_RST_N_BIT |
+                       LASER_CONTROLLER_STUSB_FTP_REQ_BIT |
+                       (bank_index & LASER_CONTROLLER_STUSB_FTP_SECTOR_MASK)),
+        },
+        2U);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = laser_controller_board_stusb_nvm_wait_ready(
+        LASER_CONTROLLER_STUSB_NVM_COMMAND_TIMEOUT_MS);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    return laser_controller_board_i2c_read_stusb_block(
+        LASER_CONTROLLER_STUSB_FTP_RW_BUFFER_REG,
+        bank_data,
+        LASER_CONTROLLER_STUSB_NVM_BANK_SIZE);
+}
+
+static esp_err_t laser_controller_board_stusb_nvm_read_all(
+    uint8_t bank_data[LASER_CONTROLLER_STUSB_NVM_BANK_COUNT]
+                     [LASER_CONTROLLER_STUSB_NVM_BANK_SIZE])
+{
+    esp_err_t err;
+
+    if (bank_data == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    err = laser_controller_board_stusb_nvm_enter_read_mode();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    for (uint8_t bank_index = 0U;
+         bank_index < LASER_CONTROLLER_STUSB_NVM_BANK_COUNT;
+         ++bank_index) {
+        err = laser_controller_board_stusb_nvm_read_bank(
+            bank_index,
+            bank_data[bank_index]);
+        if (err != ESP_OK) {
+            (void)laser_controller_board_stusb_nvm_exit_test_mode();
+            return err;
+        }
+    }
+
+    return laser_controller_board_stusb_nvm_exit_test_mode();
+}
+
+static esp_err_t laser_controller_board_stusb_nvm_enter_write_mode(
+    uint8_t erased_banks_mask)
+{
+    esp_err_t err;
+
+    if ((erased_banks_mask & LASER_CONTROLLER_STUSB_NVM_ALL_BANKS_MASK) == 0U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    err = laser_controller_board_i2c_write(
+        LASER_CONTROLLER_STUSB4500_ADDR,
+        (const uint8_t[]){
+            LASER_CONTROLLER_STUSB_FTP_KEY_REG,
+            LASER_CONTROLLER_STUSB_FTP_PASSWORD,
+        },
+        2U);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = laser_controller_board_i2c_write(
+        LASER_CONTROLLER_STUSB4500_ADDR,
+        (const uint8_t[]){
+            LASER_CONTROLLER_STUSB_FTP_RW_BUFFER_REG,
+            0x00U,
+        },
+        2U);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = laser_controller_board_stusb_nvm_enter_read_mode();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = laser_controller_board_i2c_write(
+        LASER_CONTROLLER_STUSB4500_ADDR,
+        (const uint8_t[]){
+            LASER_CONTROLLER_STUSB_FTP_CTRL_1_REG,
+            (uint8_t)(((erased_banks_mask << 3U) &
+                       LASER_CONTROLLER_STUSB_FTP_SER_MASK) |
+                      LASER_CONTROLLER_STUSB_FTP_OPCODE_WRITE_SER),
+        },
+        2U);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = laser_controller_board_i2c_write(
+        LASER_CONTROLLER_STUSB4500_ADDR,
+        (const uint8_t[]){
+            LASER_CONTROLLER_STUSB_FTP_CTRL_0_REG,
+            (uint8_t)(LASER_CONTROLLER_STUSB_FTP_RST_N_BIT |
+                       LASER_CONTROLLER_STUSB_FTP_REQ_BIT),
+        },
+        2U);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = laser_controller_board_stusb_nvm_wait_ready(
+        LASER_CONTROLLER_STUSB_NVM_COMMAND_TIMEOUT_MS);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = laser_controller_board_i2c_write(
+        LASER_CONTROLLER_STUSB4500_ADDR,
+        (const uint8_t[]){
+            LASER_CONTROLLER_STUSB_FTP_CTRL_1_REG,
+            LASER_CONTROLLER_STUSB_FTP_OPCODE_SOFT_PROGRAM,
+        },
+        2U);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = laser_controller_board_i2c_write(
+        LASER_CONTROLLER_STUSB4500_ADDR,
+        (const uint8_t[]){
+            LASER_CONTROLLER_STUSB_FTP_CTRL_0_REG,
+            (uint8_t)(LASER_CONTROLLER_STUSB_FTP_RST_N_BIT |
+                       LASER_CONTROLLER_STUSB_FTP_REQ_BIT),
+        },
+        2U);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = laser_controller_board_stusb_nvm_wait_ready(
+        LASER_CONTROLLER_STUSB_NVM_COMMAND_TIMEOUT_MS);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = laser_controller_board_i2c_write(
+        LASER_CONTROLLER_STUSB4500_ADDR,
+        (const uint8_t[]){
+            LASER_CONTROLLER_STUSB_FTP_CTRL_1_REG,
+            LASER_CONTROLLER_STUSB_FTP_OPCODE_ERASE,
+        },
+        2U);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = laser_controller_board_i2c_write(
+        LASER_CONTROLLER_STUSB4500_ADDR,
+        (const uint8_t[]){
+            LASER_CONTROLLER_STUSB_FTP_CTRL_0_REG,
+            (uint8_t)(LASER_CONTROLLER_STUSB_FTP_RST_N_BIT |
+                       LASER_CONTROLLER_STUSB_FTP_REQ_BIT),
+        },
+        2U);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    return laser_controller_board_stusb_nvm_wait_ready(
+        LASER_CONTROLLER_STUSB_NVM_COMMAND_TIMEOUT_MS);
+}
+
+static esp_err_t laser_controller_board_stusb_nvm_write_bank(
+    uint8_t bank_index,
+    const uint8_t *bank_data)
+{
+    esp_err_t err;
+
+    if (bank_data == NULL || bank_index >= LASER_CONTROLLER_STUSB_NVM_BANK_COUNT) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    err = laser_controller_board_i2c_write_stusb_block(
+        LASER_CONTROLLER_STUSB_FTP_RW_BUFFER_REG,
+        bank_data,
+        LASER_CONTROLLER_STUSB_NVM_BANK_SIZE);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = laser_controller_board_i2c_write(
+        LASER_CONTROLLER_STUSB4500_ADDR,
+        (const uint8_t[]){
+            LASER_CONTROLLER_STUSB_FTP_CTRL_1_REG,
+            LASER_CONTROLLER_STUSB_FTP_OPCODE_WRITE_PL,
+        },
+        2U);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = laser_controller_board_i2c_write(
+        LASER_CONTROLLER_STUSB4500_ADDR,
+        (const uint8_t[]){
+            LASER_CONTROLLER_STUSB_FTP_CTRL_0_REG,
+            (uint8_t)(LASER_CONTROLLER_STUSB_FTP_RST_N_BIT |
+                       LASER_CONTROLLER_STUSB_FTP_REQ_BIT),
+        },
+        2U);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = laser_controller_board_stusb_nvm_wait_ready(
+        LASER_CONTROLLER_STUSB_NVM_COMMAND_TIMEOUT_MS);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = laser_controller_board_i2c_write(
+        LASER_CONTROLLER_STUSB4500_ADDR,
+        (const uint8_t[]){
+            LASER_CONTROLLER_STUSB_FTP_CTRL_1_REG,
+            LASER_CONTROLLER_STUSB_FTP_OPCODE_PROGRAM,
+        },
+        2U);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = laser_controller_board_i2c_write(
+        LASER_CONTROLLER_STUSB4500_ADDR,
+        (const uint8_t[]){
+            LASER_CONTROLLER_STUSB_FTP_CTRL_0_REG,
+            (uint8_t)(LASER_CONTROLLER_STUSB_FTP_RST_N_BIT |
+                       LASER_CONTROLLER_STUSB_FTP_REQ_BIT |
+                       (bank_index & LASER_CONTROLLER_STUSB_FTP_SECTOR_MASK)),
+        },
+        2U);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    return laser_controller_board_stusb_nvm_wait_ready(
+        LASER_CONTROLLER_STUSB_NVM_COMMAND_TIMEOUT_MS);
+}
+
+static bool laser_controller_board_pd_current_to_nvm_code(
+    float current_a,
+    uint8_t *lut_code,
+    bool *uses_flex)
+{
+    static const struct {
+        float current_a;
+        uint8_t code;
+    } kCurrentLut[] = {
+        { 0.50f, 0x01U },
+        { 0.75f, 0x02U },
+        { 1.00f, 0x03U },
+        { 1.25f, 0x04U },
+        { 1.50f, 0x05U },
+        { 1.75f, 0x06U },
+        { 2.00f, 0x07U },
+        { 2.25f, 0x08U },
+        { 2.50f, 0x09U },
+        { 2.75f, 0x0AU },
+        { 3.00f, 0x0BU },
+        { 3.50f, 0x0CU },
+        { 4.00f, 0x0DU },
+        { 4.50f, 0x0EU },
+        { 5.00f, 0x0FU },
+    };
+
+    if (lut_code == NULL || uses_flex == NULL) {
+        return false;
+    }
+
+    for (size_t index = 0U; index < sizeof(kCurrentLut) / sizeof(kCurrentLut[0]); ++index) {
+        if (fabsf(current_a - kCurrentLut[index].current_a) <= 0.01f) {
+            *lut_code = kCurrentLut[index].code;
+            *uses_flex = false;
+            return true;
+        }
+    }
+
+    if (current_a < 0.01f || current_a > 5.0f) {
+        return false;
+    }
+
+    *lut_code = 0x00U;
+    *uses_flex = true;
+    return true;
+}
+
+static bool laser_controller_board_voltage_to_nvm_steps(
+    float voltage_v,
+    uint16_t *steps)
+{
+    const float clamped_v =
+        laser_controller_board_clamp_float(voltage_v, 5.0f, 20.0f);
+    const uint16_t encoded_steps =
+        (uint16_t)lroundf(clamped_v / 0.05f);
+
+    if (steps == NULL) {
+        return false;
+    }
+
+    if (fabsf(clamped_v - ((float)encoded_steps * 0.05f)) > 0.01f) {
+        return false;
+    }
+
+    *steps = encoded_steps;
+    return true;
+}
+
+static bool laser_controller_board_current_to_nvm_steps(
+    float current_a,
+    uint16_t *steps)
+{
+    const float clamped_a =
+        laser_controller_board_clamp_float(current_a, 0.01f, 5.0f);
+    const uint16_t encoded_steps =
+        (uint16_t)lroundf(clamped_a / 0.01f);
+
+    if (steps == NULL) {
+        return false;
+    }
+
+    if (fabsf(clamped_a - ((float)encoded_steps * 0.01f)) > 0.005f) {
+        return false;
+    }
+
+    *steps = encoded_steps;
+    return true;
+}
+
+static bool laser_controller_board_prepare_pd_nvm_map(
+    const laser_controller_service_pd_profile_t *profiles,
+    size_t profile_count,
+    const uint8_t current_map[LASER_CONTROLLER_STUSB_NVM_BANK_COUNT]
+                             [LASER_CONTROLLER_STUSB_NVM_BANK_SIZE],
+    uint8_t target_map[LASER_CONTROLLER_STUSB_NVM_BANK_COUNT]
+                      [LASER_CONTROLLER_STUSB_NVM_BANK_SIZE])
+{
+    laser_controller_service_pd_profile_t
+        normalized_profiles[LASER_CONTROLLER_SERVICE_PD_PROFILE_COUNT];
+    uint8_t profile_count_encoded = 1U;
+    uint8_t lut_codes[LASER_CONTROLLER_SERVICE_PD_PROFILE_COUNT] = { 0 };
+    bool uses_flex[LASER_CONTROLLER_SERVICE_PD_PROFILE_COUNT] = { 0 };
+    bool flex_current_set = false;
+    uint16_t flex_current_steps = 0U;
+
+    if (profiles == NULL ||
+        current_map == NULL ||
+        target_map == NULL ||
+        profile_count != LASER_CONTROLLER_SERVICE_PD_PROFILE_COUNT) {
+        return false;
+    }
+
+    memcpy(
+        target_map,
+        current_map,
+        LASER_CONTROLLER_STUSB_NVM_BANK_COUNT *
+            LASER_CONTROLLER_STUSB_NVM_BANK_SIZE);
+
+    laser_controller_board_normalize_pd_profiles(
+        profiles,
+        normalized_profiles,
+        &profile_count_encoded);
+
+    for (size_t index = 0U;
+         index < LASER_CONTROLLER_SERVICE_PD_PROFILE_COUNT;
+         ++index) {
+        if (index > 0U && !normalized_profiles[index].enabled) {
+            lut_codes[index] =
+                index == 1U ?
+                    (uint8_t)(target_map[3][4] & 0x0FU) :
+                    (uint8_t)((target_map[3][5] >> 4U) & 0x0FU);
+            uses_flex[index] = false;
+            continue;
+        }
+
+        if (!laser_controller_board_pd_current_to_nvm_code(
+                normalized_profiles[index].current_a,
+                &lut_codes[index],
+                &uses_flex[index])) {
+            return false;
+        }
+
+        if (uses_flex[index]) {
+            uint16_t current_steps = 0U;
+
+            if (!laser_controller_board_current_to_nvm_steps(
+                    normalized_profiles[index].current_a,
+                    &current_steps)) {
+                return false;
+            }
+
+            if (!flex_current_set) {
+                flex_current_steps = current_steps;
+                flex_current_set = true;
+            } else if (flex_current_steps != current_steps) {
+                return false;
+            }
+        }
+    }
+
+    target_map[3][2] =
+        (uint8_t)((target_map[3][2] & 0x0FU) | (lut_codes[0] << 4U));
+    target_map[3][2] =
+        (uint8_t)((target_map[3][2] & (uint8_t)~0x06U) |
+                  (profile_count_encoded <= 1U ? 0x00U :
+                   profile_count_encoded == 2U ? 0x04U : 0x06U));
+    target_map[3][4] =
+        (uint8_t)((target_map[3][4] & 0xF0U) | lut_codes[1]);
+    target_map[3][5] =
+        (uint8_t)((target_map[3][5] & 0x0FU) | (lut_codes[2] << 4U));
+
+    if (profile_count_encoded >= 2U) {
+        uint16_t voltage_steps = 0U;
+
+        if (!laser_controller_board_voltage_to_nvm_steps(
+                normalized_profiles[1].voltage_v,
+                &voltage_steps)) {
+            return false;
+        }
+
+        target_map[4][0] =
+            (uint8_t)((target_map[4][0] & 0x3FU) |
+                      ((uint8_t)(voltage_steps & 0x03U) << 6U));
+        target_map[4][1] = (uint8_t)((voltage_steps >> 2U) & 0xFFU);
+    }
+
+    if (profile_count_encoded >= 3U) {
+        uint16_t voltage_steps = 0U;
+
+        if (!laser_controller_board_voltage_to_nvm_steps(
+                normalized_profiles[2].voltage_v,
+                &voltage_steps)) {
+            return false;
+        }
+
+        target_map[4][2] = (uint8_t)(voltage_steps & 0xFFU);
+        target_map[4][3] =
+            (uint8_t)((target_map[4][3] & 0xFCU) |
+                      ((voltage_steps >> 8U) & 0x03U));
+    }
+
+    if (flex_current_set) {
+        target_map[4][3] =
+            (uint8_t)((target_map[4][3] & 0x03U) |
+                      ((uint8_t)(flex_current_steps & 0x3FU) << 2U));
+        target_map[4][4] =
+            (uint8_t)((target_map[4][4] & 0xF0U) |
+                      ((flex_current_steps >> 6U) & 0x0FU));
+    }
+
+    return true;
 }
 
 static esp_err_t laser_controller_board_dac_write_command(uint8_t command, uint16_t value)
@@ -3072,6 +3697,109 @@ esp_err_t laser_controller_board_configure_pd_debug(
     }
 
     return err;
+}
+
+esp_err_t laser_controller_board_burn_pd_nvm(
+    const laser_controller_service_pd_profile_t *profiles,
+    size_t profile_count)
+{
+    uint8_t current_map[LASER_CONTROLLER_STUSB_NVM_BANK_COUNT]
+                       [LASER_CONTROLLER_STUSB_NVM_BANK_SIZE] = { { 0 } };
+    uint8_t target_map[LASER_CONTROLLER_STUSB_NVM_BANK_COUNT]
+                      [LASER_CONTROLLER_STUSB_NVM_BANK_SIZE] = { { 0 } };
+    uint8_t verify_map[LASER_CONTROLLER_STUSB_NVM_BANK_COUNT]
+                      [LASER_CONTROLLER_STUSB_NVM_BANK_SIZE] = { { 0 } };
+    esp_err_t err;
+
+    if (profiles == NULL ||
+        profile_count != LASER_CONTROLLER_SERVICE_PD_PROFILE_COUNT) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!laser_controller_service_module_write_enabled(LASER_CONTROLLER_MODULE_PD)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    err = laser_controller_board_i2c_probe(LASER_CONTROLLER_STUSB4500_ADDR);
+    if (err != ESP_OK) {
+        laser_controller_board_service_report_probe(
+            LASER_CONTROLLER_MODULE_PD,
+            false,
+            false);
+        return err;
+    }
+
+    err = laser_controller_board_stusb_nvm_read_all(current_map);
+    if (err != ESP_OK) {
+        laser_controller_board_service_report_probe(
+            LASER_CONTROLLER_MODULE_PD,
+            true,
+            false);
+        return err;
+    }
+
+    if (!laser_controller_board_prepare_pd_nvm_map(
+            profiles,
+            profile_count,
+            current_map,
+            target_map)) {
+        laser_controller_board_service_report_probe(
+            LASER_CONTROLLER_MODULE_PD,
+            true,
+            false);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    err = laser_controller_board_stusb_nvm_enter_write_mode(
+        LASER_CONTROLLER_STUSB_NVM_ALL_BANKS_MASK);
+    if (err != ESP_OK) {
+        laser_controller_board_service_report_probe(
+            LASER_CONTROLLER_MODULE_PD,
+            true,
+            false);
+        return err;
+    }
+
+    for (uint8_t bank_index = 0U;
+         err == ESP_OK && bank_index < LASER_CONTROLLER_STUSB_NVM_BANK_COUNT;
+         ++bank_index) {
+        err = laser_controller_board_stusb_nvm_write_bank(
+            bank_index,
+            target_map[bank_index]);
+    }
+
+    (void)laser_controller_board_stusb_nvm_exit_test_mode();
+
+    if (err != ESP_OK) {
+        laser_controller_board_service_report_probe(
+            LASER_CONTROLLER_MODULE_PD,
+            true,
+            false);
+        return err;
+    }
+
+    err = laser_controller_board_stusb_nvm_read_all(verify_map);
+    if (err != ESP_OK) {
+        laser_controller_board_service_report_probe(
+            LASER_CONTROLLER_MODULE_PD,
+            true,
+            false);
+        return err;
+    }
+
+    if (memcmp(target_map, verify_map, sizeof(target_map)) != 0) {
+        laser_controller_board_service_report_probe(
+            LASER_CONTROLLER_MODULE_PD,
+            true,
+            false);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    laser_controller_board_service_report_probe(
+        LASER_CONTROLLER_MODULE_PD,
+        true,
+        true);
+    return ESP_OK;
 }
 
 void laser_controller_board_force_pd_refresh(void)

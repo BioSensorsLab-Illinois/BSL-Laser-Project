@@ -25,7 +25,7 @@ export type ThemeMode = 'dark' | 'light'
 export type EventSource = 'firmware' | 'host' | 'derived'
 export type EventBus = 'i2c' | 'spi'
 
-export type TransportKind = 'mock' | 'serial'
+export type TransportKind = 'mock' | 'serial' | 'wifi'
 
 export type TransportStatus = 'disconnected' | 'connecting' | 'connected' | 'error'
 
@@ -68,6 +68,14 @@ export interface PdStatus {
   sinkProfileCount: number
   sinkProfiles: PdSinkProfile[]
   sourceIsHostOnly: boolean
+}
+
+export interface WirelessStatus {
+  started: boolean
+  apReady: boolean
+  clientCount: number
+  ssid: string
+  wsUrl: string
 }
 
 export interface ImuStatus {
@@ -318,6 +326,7 @@ export interface DeviceSnapshot {
     bootReason: string
     connectedAtIso: string
   }
+  wireless: WirelessStatus
   pd: PdStatus
   rails: {
     ld: RailState

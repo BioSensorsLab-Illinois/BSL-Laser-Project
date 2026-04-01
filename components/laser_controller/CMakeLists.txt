@@ -32,6 +32,7 @@ idf_component_register(
         "src/laser_controller_safety.c"
         "src/laser_controller_service.c"
         "src/laser_controller_state.c"
+        "src/laser_controller_wireless.c"
         "${BSL_SIGNATURE_SOURCE}"
     INCLUDE_DIRS "include"
     REQUIRES
@@ -44,6 +45,10 @@ idf_component_register(
         esp_driver_ledc
         esp_adc
         esp_driver_usb_serial_jtag
+        esp_event
+        esp_http_server
+        esp_netif
+        esp_wifi
         nvs_flash
 )
 

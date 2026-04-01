@@ -200,13 +200,16 @@ export const pdVoltageOptions = [
 
 export const pdCurrentOptions = [
   { value: 0.5, label: '0.50 A' },
+  { value: 0.75, label: '0.75 A' },
   { value: 1.0, label: '1.00 A' },
+  { value: 1.25, label: '1.25 A' },
   { value: 1.5, label: '1.50 A' },
+  { value: 1.75, label: '1.75 A' },
   { value: 2.0, label: '2.00 A' },
   { value: 2.25, label: '2.25 A' },
   { value: 2.5, label: '2.50 A' },
+  { value: 2.75, label: '2.75 A' },
   { value: 3.0, label: '3.00 A' },
-  { value: 3.25, label: '3.25 A' },
   { value: 3.5, label: '3.50 A' },
   { value: 4.0, label: '4.00 A' },
   { value: 4.5, label: '4.50 A' },
