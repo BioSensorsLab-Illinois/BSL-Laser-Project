@@ -1,0 +1,1 @@
+host-console/src-tauri/target/** filter=lfs diff=lfs merge=lfs -text
