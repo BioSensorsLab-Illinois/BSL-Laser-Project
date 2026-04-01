@@ -1,0 +1,1329 @@
+import { makeDefaultBringupStatus } from './bringup'
+import {
+  currentFromOpticalPowerW,
+  makeDefaultBenchControlStatus,
+} from './bench-model'
+import {
+  clampTecTempC,
+  clampTecWavelengthNm,
+  estimateTecVoltageFromTempC,
+  estimateTempFromWavelengthNm,
+  estimateWavelengthFromTempC,
+} from './tec-calibration'
+import type {
+  BenchTargetMode,
+  CommandEnvelope,
+  DacReferenceMode,
+  DacSyncMode,
+  DeviceSnapshot,
+  DeviceTransport,
+  FirmwarePackageDescriptor,
+  FirmwareTransferProgress,
+  HapticActuator,
+  HapticMode,
+  ModuleKey,
+  SessionEvent,
+  TransportMessage,
+} from '../types'
+
+type MockState = {
+  connected: boolean
+  uptimeSeconds: number
+  powerTier: DeviceSnapshot['session']['powerTier']
+  systemState: DeviceSnapshot['session']['state']
+  alignmentRequested: boolean
+  laserRequested: boolean
+  serviceMode: boolean
+  tecSettlingTicks: number
+  targetTempC: number
+  targetLambdaNm: number
+  targetMode: BenchTargetMode
+  firmwareVersion: string
+  activeFault: string
+  faultLatched: boolean
+  faultCount: number
+  tripCounter: number
+  lastFaultAtIso: string | null
+  pdPowerW: number
+  beamPitchDeg: number
+  beamRollDeg: number
+  beamYawDeg: number
+  distanceM: number
+  modulationEnabled: boolean
+  modulationFrequencyHz: number
+  modulationDutyCyclePct: number
+  lowStateCurrentA: number
+  laserHighCurrentA: number
+  safety: DeviceSnapshot['safety']
+  bringup: DeviceSnapshot['bringup']
+}
+
+const MOCK_TICK_MS = 100
+
+function nowIso(): string {
+  return new Date().toISOString()
+}
+
+function clamp(value: number, min: number, max: number): number {
+  if (value < min) {
+    return min
+  }
+
+  if (value > max) {
+    return max
+  }
+
+  return value
+}
+
+function classifyPdPowerTier(
+  negotiatedPowerW: number,
+  hostOnly: boolean,
+  tuning: DeviceSnapshot['bringup']['tuning'],
+): DeviceSnapshot['session']['powerTier'] {
+  const operationalMinW = Math.max(
+    tuning.pdProgrammingOnlyMaxW,
+    tuning.pdReducedModeMinW,
+  )
+
+  if (hostOnly) {
+    return 'programming_only'
+  }
+
+  if (negotiatedPowerW < operationalMinW) {
+    return 'insufficient'
+  }
+
+  if (negotiatedPowerW <= tuning.pdReducedModeMaxW) {
+    return 'reduced'
+  }
+
+  if (negotiatedPowerW >= tuning.pdFullModeMinW) {
+    return 'full'
+  }
+
+  return 'reduced'
+}
+
+function activeMockPdProfiles(
+  tuning: DeviceSnapshot['bringup']['tuning'],
+): DeviceSnapshot['pd']['sinkProfiles'] {
+  return tuning.pdProfiles.map((profile, index) => {
+    if (index === 0) {
+      return {
+        enabled: true,
+        voltageV: 5,
+        currentA: Math.max(profile.currentA || 0, 0.5),
+      }
+    }
+
+    if (!profile.enabled) {
+      return {
+        enabled: false,
+        voltageV: 0,
+        currentA: 0,
+      }
+    }
+
+    return {
+      enabled: true,
+      voltageV: profile.voltageV,
+      currentA: profile.currentA,
+    }
+  })
+}
+
+function selectMockPdContract(
+  negotiatedPowerW: number,
+  hostOnly: boolean,
+  tuning: DeviceSnapshot['bringup']['tuning'],
+) {
+  const sinkProfiles = activeMockPdProfiles(tuning)
+
+  if (hostOnly) {
+    return {
+      sourceVoltageV: 5,
+      sourceCurrentA: negotiatedPowerW > 0 ? negotiatedPowerW / 5 : 0.5,
+      operatingCurrentA: negotiatedPowerW > 0 ? negotiatedPowerW / 5 : 0.5,
+      contractObjectPosition: 0,
+      sinkProfileCount: 1,
+      sinkProfiles,
+    }
+  }
+
+  for (let index = sinkProfiles.length - 1; index >= 0; index -= 1) {
+    const profile = sinkProfiles[index]
+
+    if (!profile.enabled) {
+      continue
+    }
+
+    const requestedPowerW = profile.voltageV * profile.currentA
+    if (requestedPowerW <= negotiatedPowerW + 0.01) {
+      return {
+        sourceVoltageV: profile.voltageV,
+        sourceCurrentA: profile.currentA,
+        operatingCurrentA: profile.currentA,
+        contractObjectPosition: index + 1,
+        sinkProfileCount: index + 1,
+        sinkProfiles,
+      }
+    }
+  }
+
+  return {
+    sourceVoltageV: 5,
+    sourceCurrentA: Math.min(3, negotiatedPowerW > 0 ? negotiatedPowerW / 5 : 0),
+    operatingCurrentA: Math.min(3, negotiatedPowerW > 0 ? negotiatedPowerW / 5 : 0),
+    contractObjectPosition: 1,
+    sinkProfileCount: 1,
+    sinkProfiles,
+  }
+}
+
+export class MockTransport implements DeviceTransport {
+  readonly kind = 'mock'
+
+  readonly label = 'Mock bench rig'
+
+  readonly supportsFirmwareTransfer = true
+
+  private listeners = new Set<(message: TransportMessage) => void>()
+
+  private timer: number | null = null
+
+  private state: MockState = {
+    connected: false,
+    uptimeSeconds: 0,
+    powerTier: 'full',
+    systemState: 'READY_NIR',
+    alignmentRequested: false,
+    laserRequested: false,
+    serviceMode: false,
+    tecSettlingTicks: 0,
+    targetTempC: 58.7,
+    targetLambdaNm: 786.1,
+    targetMode: 'lambda',
+    firmwareVersion: 'laser-fw-0.2.0-bench',
+    activeFault: 'none',
+    faultLatched: false,
+    faultCount: 0,
+    tripCounter: 2,
+    lastFaultAtIso: null,
+    pdPowerW: 45,
+    beamPitchDeg: -14.2,
+    beamRollDeg: 3.8,
+    beamYawDeg: 18,
+    distanceM: 0.42,
+    modulationEnabled: false,
+    modulationFrequencyHz: 2000,
+    modulationDutyCyclePct: 50,
+    lowStateCurrentA: 0,
+    laserHighCurrentA: currentFromOpticalPowerW(2.8),
+    safety: {
+      allowAlignment: true,
+      allowNir: true,
+      horizonBlocked: false,
+      distanceBlocked: false,
+      lambdaDriftBlocked: false,
+      tecTempAdcBlocked: false,
+      horizonThresholdDeg: 0,
+      horizonHysteresisDeg: 3,
+      tofMinRangeM: 0.2,
+      tofMaxRangeM: 1,
+      tofHysteresisM: 0.02,
+      imuStaleMs: 50,
+      tofStaleMs: 100,
+      railGoodTimeoutMs: 250,
+      lambdaDriftLimitNm: 5,
+      lambdaDriftHysteresisNm: 0.5,
+      lambdaDriftHoldMs: 2000,
+      ldOvertempLimitC: 55,
+      tecTempAdcTripV: 2.45,
+      tecTempAdcHysteresisV: 0.05,
+      tecTempAdcHoldMs: 2000,
+      tecMinCommandC: 15,
+      tecMaxCommandC: 35,
+      tecReadyToleranceC: 0.25,
+      maxLaserCurrentA: 5,
+      actualLambdaNm: 786.1,
+      targetLambdaNm: 786.1,
+      lambdaDriftNm: 0,
+      tempAdcVoltageV: 2.182,
+    },
+    bringup: makeDefaultBringupStatus(),
+  }
+
+  subscribe(listener: (message: TransportMessage) => void): () => void {
+    this.listeners.add(listener)
+    return () => {
+      this.listeners.delete(listener)
+    }
+  }
+
+  async connect(): Promise<void> {
+    if (this.state.connected) {
+      this.emit({ kind: 'transport', status: 'connected', detail: this.label })
+      this.emit({ kind: 'snapshot', snapshot: this.makeSnapshot() })
+      return
+    }
+
+    this.emit({ kind: 'transport', status: 'connecting', detail: 'Booting mock bench rig…' })
+
+    this.state.connected = true
+
+    this.timer = window.setInterval(() => {
+      this.tick(MOCK_TICK_MS / 1000)
+    }, MOCK_TICK_MS)
+
+    this.emit({
+      kind: 'event',
+      event: this.makeEvent(
+        'info',
+        'transport',
+        'Mock transport online',
+        'Host console is attached to a deterministic simulation rig with writable bench controls.',
+      ),
+    })
+    this.emit({ kind: 'transport', status: 'connected', detail: this.label })
+    this.emit({ kind: 'snapshot', snapshot: this.makeSnapshot() })
+  }
+
+  async disconnect(): Promise<void> {
+    if (!this.state.connected) {
+      this.emit({ kind: 'transport', status: 'disconnected', detail: 'Mock rig detached.' })
+      return
+    }
+
+    if (this.timer !== null) {
+      window.clearInterval(this.timer)
+      this.timer = null
+    }
+
+    this.state.connected = false
+    this.emit({ kind: 'transport', status: 'disconnected', detail: 'Mock rig detached.' })
+  }
+
+  async sendCommand(command: CommandEnvelope): Promise<void> {
+    if (!this.state.connected) {
+      throw new Error('Mock transport is not connected.')
+    }
+
+    this.emit({
+      kind: 'event',
+      event: this.makeEvent(
+        'info',
+        'command',
+        `Command sent: ${command.cmd}`,
+        'The mock transport accepted the host request for bench evaluation.',
+      ),
+    })
+
+    switch (command.cmd) {
+      case 'get_status':
+      case 'get_faults':
+        break
+      case 'clear_faults':
+        this.state.activeFault = 'none'
+        this.state.faultLatched = false
+        this.emit({
+          kind: 'event',
+          event: this.makeEvent(
+            'ok',
+            'fault',
+            'Mock fault latch cleared',
+            'The simulated controller returned to a non-latched state.',
+          ),
+        })
+        break
+      case 'enable_alignment':
+        this.state.alignmentRequested = true
+        this.state.laserRequested = false
+        break
+      case 'disable_alignment':
+        this.state.alignmentRequested = false
+        break
+      case 'set_target_temp':
+        if (typeof command.args?.temp_c === 'number') {
+          this.state.targetTempC = clampTecTempC(command.args.temp_c)
+          this.state.targetLambdaNm = estimateWavelengthFromTempC(this.state.targetTempC)
+          this.state.targetMode = 'temp'
+          this.state.tecSettlingTicks = 8
+        }
+        break
+      case 'set_target_lambda':
+        if (typeof command.args?.lambda_nm === 'number') {
+          this.state.targetLambdaNm = clampTecWavelengthNm(command.args.lambda_nm)
+          this.state.targetTempC = estimateTempFromWavelengthNm(this.state.targetLambdaNm)
+          this.state.targetMode = 'lambda'
+          this.state.tecSettlingTicks = 10
+        }
+        break
+      case 'set_laser_power':
+        if (typeof command.args?.optical_power_w === 'number') {
+          this.state.laserHighCurrentA = clamp(
+            currentFromOpticalPowerW(command.args.optical_power_w),
+            0,
+            this.state.safety.maxLaserCurrentA,
+          )
+        } else if (typeof command.args?.current_a === 'number') {
+          this.state.laserHighCurrentA = clamp(
+            command.args.current_a,
+            0,
+            this.state.safety.maxLaserCurrentA,
+          )
+        }
+        break
+      case 'set_runtime_safety':
+        if (typeof command.args?.horizon_threshold_deg === 'number') {
+          this.state.safety.horizonThresholdDeg = command.args.horizon_threshold_deg
+        }
+        if (typeof command.args?.horizon_hysteresis_deg === 'number') {
+          this.state.safety.horizonHysteresisDeg = command.args.horizon_hysteresis_deg
+        }
+        if (typeof command.args?.tof_min_range_m === 'number') {
+          this.state.safety.tofMinRangeM = command.args.tof_min_range_m
+        }
+        if (typeof command.args?.tof_max_range_m === 'number') {
+          this.state.safety.tofMaxRangeM = command.args.tof_max_range_m
+        }
+        if (typeof command.args?.tof_hysteresis_m === 'number') {
+          this.state.safety.tofHysteresisM = command.args.tof_hysteresis_m
+        }
+        if (typeof command.args?.imu_stale_ms === 'number') {
+          this.state.safety.imuStaleMs = command.args.imu_stale_ms
+        }
+        if (typeof command.args?.tof_stale_ms === 'number') {
+          this.state.safety.tofStaleMs = command.args.tof_stale_ms
+        }
+        if (typeof command.args?.rail_good_timeout_ms === 'number') {
+          this.state.safety.railGoodTimeoutMs = command.args.rail_good_timeout_ms
+        }
+        if (typeof command.args?.lambda_drift_limit_nm === 'number') {
+          this.state.safety.lambdaDriftLimitNm = command.args.lambda_drift_limit_nm
+        }
+        if (typeof command.args?.lambda_drift_hysteresis_nm === 'number') {
+          this.state.safety.lambdaDriftHysteresisNm = command.args.lambda_drift_hysteresis_nm
+        }
+        if (typeof command.args?.lambda_drift_hold_ms === 'number') {
+          this.state.safety.lambdaDriftHoldMs = command.args.lambda_drift_hold_ms
+        }
+        if (typeof command.args?.ld_overtemp_limit_c === 'number') {
+          this.state.safety.ldOvertempLimitC = command.args.ld_overtemp_limit_c
+        }
+        if (typeof command.args?.tec_temp_adc_trip_v === 'number') {
+          this.state.safety.tecTempAdcTripV = command.args.tec_temp_adc_trip_v
+        }
+        if (typeof command.args?.tec_temp_adc_hysteresis_v === 'number') {
+          this.state.safety.tecTempAdcHysteresisV = command.args.tec_temp_adc_hysteresis_v
+        }
+        if (typeof command.args?.tec_temp_adc_hold_ms === 'number') {
+          this.state.safety.tecTempAdcHoldMs = command.args.tec_temp_adc_hold_ms
+        }
+        if (typeof command.args?.tec_min_command_c === 'number') {
+          this.state.safety.tecMinCommandC = command.args.tec_min_command_c
+        }
+        if (typeof command.args?.tec_max_command_c === 'number') {
+          this.state.safety.tecMaxCommandC = command.args.tec_max_command_c
+        }
+        if (typeof command.args?.tec_ready_tolerance_c === 'number') {
+          this.state.safety.tecReadyToleranceC = command.args.tec_ready_tolerance_c
+        }
+        if (typeof command.args?.max_laser_current_a === 'number') {
+          this.state.safety.maxLaserCurrentA = command.args.max_laser_current_a
+          this.state.laserHighCurrentA = clamp(
+            this.state.laserHighCurrentA,
+            0,
+            this.state.safety.maxLaserCurrentA,
+          )
+          this.state.lowStateCurrentA = clamp(
+            this.state.lowStateCurrentA,
+            0,
+            this.state.laserHighCurrentA,
+          )
+        }
+        break
+      case 'pd_debug_config':
+        if (typeof command.args?.programming_only_max_w === 'number') {
+          this.state.bringup.tuning.pdProgrammingOnlyMaxW =
+            command.args.programming_only_max_w
+        }
+        if (typeof command.args?.reduced_mode_min_w === 'number') {
+          this.state.bringup.tuning.pdReducedModeMinW =
+            command.args.reduced_mode_min_w
+        }
+        if (typeof command.args?.reduced_mode_max_w === 'number') {
+          this.state.bringup.tuning.pdReducedModeMaxW =
+            command.args.reduced_mode_max_w
+        }
+        if (typeof command.args?.full_mode_min_w === 'number') {
+          this.state.bringup.tuning.pdFullModeMinW = command.args.full_mode_min_w
+        }
+
+        this.state.bringup.tuning.pdProfiles = this.state.bringup.tuning.pdProfiles.map(
+          (profile, index) => {
+            const slot = index + 1
+            const enabled = command.args?.[`pdo${slot}_enabled`]
+            const voltage = command.args?.[`pdo${slot}_voltage_v`]
+            const current = command.args?.[`pdo${slot}_current_a`]
+
+            return {
+              enabled: typeof enabled === 'boolean' ? enabled : profile.enabled,
+              voltageV: typeof voltage === 'number' ? voltage : profile.voltageV,
+              currentA: typeof current === 'number' ? current : profile.currentA,
+            }
+          },
+        )
+        this.state.bringup.tuning.pdProfiles = this.state.bringup.tuning.pdProfiles.map(
+          (profile, index, profiles) => {
+            if (index === 0) {
+              return {
+                enabled: true,
+                voltageV: 5,
+                currentA: clamp(profile.currentA, 0.5, 5),
+              }
+            }
+
+            if (index === 2 && !profiles[1].enabled) {
+              return {
+                ...profile,
+                enabled: false,
+              }
+            }
+
+            return {
+              ...profile,
+              currentA: clamp(profile.currentA, 0.5, 5),
+              voltageV: clamp(profile.voltageV, 5, 20),
+            }
+          },
+        )
+        this.state.powerTier = classifyPdPowerTier(
+          this.state.pdPowerW,
+          this.state.pdPowerW <= 5.1,
+          this.state.bringup.tuning,
+        )
+        this.bumpBringupRevision('USB-PD sink planning updated.')
+        break
+      case 'pd_burn_nvm':
+        this.state.bringup.tools.lastAction =
+          'Mock STUSB4500 NVM burn simulated. The current PDO plan would become the startup default after reset.'
+        this.emit({
+          kind: 'event',
+          event: this.makeEvent(
+            'warn',
+            'service',
+            'Mock PD NVM burn',
+            'Mock STUSB4500 NVM burn accepted. Real hardware endurance is finite, so this should only be used for final provisioning.',
+          ),
+        })
+        break
+      case 'pd_save_firmware_plan':
+        if (typeof command.args?.programming_only_max_w === 'number') {
+          this.state.bringup.tuning.pdProgrammingOnlyMaxW =
+            command.args.programming_only_max_w
+        }
+        if (typeof command.args?.reduced_mode_min_w === 'number') {
+          this.state.bringup.tuning.pdReducedModeMinW =
+            command.args.reduced_mode_min_w
+        }
+        if (typeof command.args?.reduced_mode_max_w === 'number') {
+          this.state.bringup.tuning.pdReducedModeMaxW =
+            command.args.reduced_mode_max_w
+        }
+        if (typeof command.args?.full_mode_min_w === 'number') {
+          this.state.bringup.tuning.pdFullModeMinW = command.args.full_mode_min_w
+        }
+        if (typeof command.args?.firmware_plan_enabled === 'boolean') {
+          this.state.bringup.tuning.pdFirmwarePlanEnabled =
+            command.args.firmware_plan_enabled
+        }
+        this.state.bringup.tuning.pdProfiles = this.state.bringup.tuning.pdProfiles.map(
+          (profile, index) => {
+            const slot = index + 1
+            const enabled = command.args?.[`pdo${slot}_enabled`]
+            const voltage = command.args?.[`pdo${slot}_voltage_v`]
+            const current = command.args?.[`pdo${slot}_current_a`]
+
+            return {
+              enabled: typeof enabled === 'boolean' ? enabled : profile.enabled,
+              voltageV: typeof voltage === 'number' ? voltage : profile.voltageV,
+              currentA: typeof current === 'number' ? current : profile.currentA,
+            }
+          },
+        )
+        this.state.bringup.tuning.pdProfiles = this.state.bringup.tuning.pdProfiles.map(
+          (profile, index, profiles) => {
+            if (index === 0) {
+              return {
+                enabled: true,
+                voltageV: 5,
+                currentA: clamp(profile.currentA, 0.5, 5),
+              }
+            }
+
+            if (index === 2 && !profiles[1].enabled) {
+              return {
+                ...profile,
+                enabled: false,
+              }
+            }
+
+            return {
+              ...profile,
+              currentA: clamp(profile.currentA, 0.5, 5),
+              voltageV: clamp(profile.voltageV, 5, 20),
+            }
+          },
+        )
+        this.state.bringup.tools.lastAction = this.state.bringup.tuning.pdFirmwarePlanEnabled
+          ? 'Mock controller firmware saved the PDO plan and would auto-reconcile it into STUSB runtime state on mismatch.'
+          : 'Mock controller firmware saved the PDO plan with auto-reconcile disabled.'
+        this.bumpBringupRevision('Firmware PDO plan updated.')
+        break
+      case 'laser_output_enable':
+        this.state.laserRequested = true
+        this.state.alignmentRequested = false
+        break
+      case 'laser_output_disable':
+        this.state.laserRequested = false
+        break
+      case 'configure_modulation':
+        this.state.modulationEnabled = Boolean(command.args?.enabled)
+        if (typeof command.args?.frequency_hz === 'number') {
+          this.state.modulationFrequencyHz = clamp(command.args.frequency_hz, 10, 50000)
+        }
+        if (typeof command.args?.duty_cycle_pct === 'number') {
+          this.state.modulationDutyCyclePct = clamp(command.args.duty_cycle_pct, 1, 99)
+        }
+        if (typeof command.args?.low_current_a === 'number') {
+          this.state.lowStateCurrentA = clamp(command.args.low_current_a, 0, this.state.laserHighCurrentA)
+        }
+        break
+      case 'reboot':
+        this.state.systemState = 'BOOT_INIT'
+        this.state.alignmentRequested = false
+        this.state.laserRequested = false
+        this.state.tecSettlingTicks = 3
+        this.state.bringup.serviceModeActive = false
+        this.state.bringup.serviceModeRequested = false
+        this.emit({
+          kind: 'event',
+          event: this.makeEvent(
+            'warn',
+            'boot',
+            'Controller reboot requested',
+            'Outputs were dropped safe before the reboot sequence.',
+          ),
+        })
+        break
+      case 'enter_service_mode':
+        this.state.serviceMode = true
+        this.state.bringup.serviceModeRequested = true
+        this.state.bringup.serviceModeActive = true
+        this.state.systemState = 'SERVICE_MODE'
+        break
+      case 'exit_service_mode':
+        this.state.serviceMode = false
+        this.state.bringup.serviceModeRequested = false
+        this.state.bringup.serviceModeActive = false
+        this.state.systemState = 'SAFE_IDLE'
+        this.state.laserRequested = false
+        this.state.alignmentRequested = false
+        break
+      case 'apply_bringup_preset':
+        if (typeof command.args?.preset === 'string') {
+          this.applyBringupPreset(command.args.preset)
+        }
+        break
+      case 'set_profile_name':
+        if (typeof command.args?.name === 'string' && command.args.name.length > 0) {
+          this.state.bringup.profileName = command.args.name.slice(0, 24)
+          this.bumpBringupRevision('Bring-up profile renamed from the host console.')
+        }
+        break
+      case 'set_module_state':
+        if (typeof command.args?.module === 'string') {
+          const module =
+            command.args.module === 'laser_driver'
+              ? 'laserDriver'
+              : (command.args.module as ModuleKey)
+          const moduleStatus = this.state.bringup.modules[module]
+
+          if (moduleStatus !== undefined) {
+            moduleStatus.expectedPresent = Boolean(command.args.expected_present)
+            moduleStatus.debugEnabled = Boolean(command.args.debug_enabled)
+            if (!moduleStatus.expectedPresent) {
+              this.resetModuleProbeState(module)
+            }
+            this.bumpBringupRevision(`Module ${module} expectations updated.`)
+          }
+        }
+        break
+      case 'save_bringup_profile':
+        this.state.bringup.lastSaveOk = false
+        this.state.bringup.persistenceDirty = true
+        this.state.bringup.tools.lastAction =
+          'Device-side save unavailable in mock parity mode. Use the host-local library instead.'
+        break
+      case 'dac_debug_set':
+        if (typeof command.args?.channel === 'string' && typeof command.args?.voltage_v === 'number') {
+          if (command.args.channel === 'tec') {
+            this.state.bringup.tuning.dacTecChannelV = command.args.voltage_v
+          } else {
+            this.state.bringup.tuning.dacLdChannelV = command.args.voltage_v
+          }
+          this.bumpBringupRevision(`DAC ${command.args.channel} channel shadow updated.`)
+        }
+        break
+      case 'dac_debug_config':
+        if (
+          typeof command.args?.reference_mode === 'string' &&
+          typeof command.args?.gain_2x === 'boolean' &&
+          typeof command.args?.ref_div === 'boolean' &&
+          typeof command.args?.sync_mode === 'string'
+        ) {
+          this.state.bringup.tuning.dacReferenceMode =
+            command.args.reference_mode as DacReferenceMode
+          this.state.bringup.tuning.dacGain2x = command.args.gain_2x
+          this.state.bringup.tuning.dacRefDiv = command.args.ref_div
+          this.state.bringup.tuning.dacSyncMode =
+            command.args.sync_mode as DacSyncMode
+          this.bumpBringupRevision('DAC reference and update policy updated.')
+        }
+        break
+      case 'imu_debug_config':
+        if (
+          typeof command.args?.odr_hz === 'number' &&
+          typeof command.args?.accel_range_g === 'number' &&
+          typeof command.args?.gyro_range_dps === 'number' &&
+          typeof command.args?.gyro_enabled === 'boolean' &&
+          typeof command.args?.lpf2_enabled === 'boolean' &&
+          typeof command.args?.timestamp_enabled === 'boolean' &&
+          typeof command.args?.bdu_enabled === 'boolean' &&
+          typeof command.args?.if_inc_enabled === 'boolean' &&
+          typeof command.args?.i2c_disabled === 'boolean'
+        ) {
+          this.state.bringup.tuning.imuOdrHz = command.args.odr_hz
+          this.state.bringup.tuning.imuAccelRangeG = command.args.accel_range_g
+          this.state.bringup.tuning.imuGyroRangeDps = command.args.gyro_range_dps
+          this.state.bringup.tuning.imuGyroEnabled = command.args.gyro_enabled
+          this.state.bringup.tuning.imuLpf2Enabled = command.args.lpf2_enabled
+          this.state.bringup.tuning.imuTimestampEnabled = command.args.timestamp_enabled
+          this.state.bringup.tuning.imuBduEnabled = command.args.bdu_enabled
+          this.state.bringup.tuning.imuIfIncEnabled = command.args.if_inc_enabled
+          this.state.bringup.tuning.imuI2cDisabled = command.args.i2c_disabled
+          this.bumpBringupRevision('IMU bring-up tuning updated.')
+        }
+        break
+      case 'tof_debug_config':
+        if (
+          typeof command.args?.min_range_m === 'number' &&
+          typeof command.args?.max_range_m === 'number' &&
+          typeof command.args?.stale_timeout_ms === 'number'
+        ) {
+          this.state.bringup.tuning.tofMinRangeM = command.args.min_range_m
+          this.state.bringup.tuning.tofMaxRangeM = command.args.max_range_m
+          this.state.bringup.tuning.tofStaleTimeoutMs = command.args.stale_timeout_ms
+          this.bumpBringupRevision('ToF debug thresholds updated.')
+        }
+        break
+      case 'haptic_debug_config':
+        if (
+          typeof command.args?.effect_id === 'number' &&
+          typeof command.args?.mode === 'string' &&
+          typeof command.args?.library === 'number' &&
+          typeof command.args?.actuator === 'string' &&
+          typeof command.args?.rtp_level === 'number'
+        ) {
+          this.state.bringup.tuning.hapticEffectId = command.args.effect_id
+          this.state.bringup.tuning.hapticMode = command.args.mode as HapticMode
+          this.state.bringup.tuning.hapticLibrary = command.args.library
+          this.state.bringup.tuning.hapticActuator =
+            command.args.actuator as HapticActuator
+          this.state.bringup.tuning.hapticRtpLevel = command.args.rtp_level
+          this.bumpBringupRevision('Haptic debug effect changed.')
+        }
+        break
+      case 'haptic_debug_fire':
+        this.state.bringup.tools.lastI2cOp = 'DRV2605 GO pulse simulated in the mock rig.'
+        this.state.bringup.tools.lastAction = 'Haptic test pattern fired.'
+        break
+      case 'i2c_scan':
+        this.state.bringup.tools.lastI2cScan = this.deriveI2cScan()
+        this.state.bringup.tools.lastAction = 'I2C scan completed.'
+        break
+      case 'i2c_read':
+        this.state.bringup.tools.lastI2cOp = this.describeI2cTransfer(command, false)
+        this.state.bringup.tools.lastAction = 'I2C read captured in the service log.'
+        break
+      case 'i2c_write':
+        this.state.bringup.tools.lastI2cOp = this.describeI2cTransfer(command, true)
+        this.bumpBringupRevision('I2C register write simulated.')
+        break
+      case 'spi_read':
+        this.state.bringup.tools.lastSpiOp = this.describeSpiTransfer(command, false)
+        this.state.bringup.tools.lastAction = 'SPI read captured in the service log.'
+        break
+      case 'spi_write':
+        this.state.bringup.tools.lastSpiOp = this.describeSpiTransfer(command, true)
+        this.bumpBringupRevision('SPI register write simulated.')
+        break
+      case 'simulate_horizon_trip':
+        this.raiseFault('horizon_crossed')
+        this.state.beamPitchDeg = 7.8
+        break
+      case 'simulate_distance_trip':
+        this.raiseFault('tof_out_of_range')
+        this.state.distanceM = 1.3
+        break
+      case 'simulate_pd_drop':
+        this.raiseFault('pd_lost')
+        this.state.powerTier = 'programming_only'
+        this.state.pdPowerW = 5
+        this.state.systemState = 'PROGRAMMING_ONLY'
+        this.state.alignmentRequested = false
+        this.state.laserRequested = false
+        break
+      default:
+        break
+    }
+
+    this.emit({
+      kind: 'commandAck',
+      commandId: command.id,
+      ok: true,
+      note: 'Accepted by mock controller.',
+    })
+    this.emit({ kind: 'snapshot', snapshot: this.makeSnapshot() })
+  }
+
+  async beginFirmwareTransfer(
+    pkg: FirmwarePackageDescriptor,
+    onProgress: (progress: FirmwareTransferProgress) => void,
+  ): Promise<void> {
+    if (!this.state.connected) {
+      throw new Error('Mock transport is not connected.')
+    }
+
+    const phases: FirmwareTransferProgress[] = [
+      {
+        phase: 'validate',
+        percent: 10,
+        detail: 'Package hash and board target accepted.',
+      },
+      {
+        phase: 'prepare',
+        percent: 24,
+        detail: 'Controller moved into update-safe service flow.',
+      },
+      {
+        phase: 'erase',
+        percent: 43,
+        detail: 'Mock flash erase in progress.',
+      },
+      {
+        phase: 'write',
+        percent: 76,
+        detail: 'Streaming firmware payload segments.',
+      },
+      {
+        phase: 'verify',
+        percent: 92,
+        detail: 'Post-write verification passed.',
+      },
+      {
+        phase: 'reboot',
+        percent: 100,
+        detail: 'Controller rebooted into the new image.',
+      },
+    ]
+
+    for (const phase of phases) {
+      onProgress(phase)
+      await new Promise((resolve) => window.setTimeout(resolve, 640))
+    }
+
+    this.state.firmwareVersion = pkg.version
+    this.state.systemState = 'PROGRAMMING_ONLY'
+    this.state.serviceMode = false
+    this.state.bringup.serviceModeActive = false
+    this.state.bringup.serviceModeRequested = false
+    this.state.alignmentRequested = false
+    this.state.laserRequested = false
+
+    this.emit({
+      kind: 'event',
+      event: this.makeEvent(
+        'ok',
+        'firmware',
+        'Firmware transfer complete',
+        `Mock rig rebooted into ${pkg.packageName} ${pkg.version}.`,
+      ),
+    })
+    this.emit({ kind: 'snapshot', snapshot: this.makeSnapshot() })
+  }
+
+  private tick(deltaSeconds: number): void {
+    const previousUptimeSeconds = this.state.uptimeSeconds
+    this.state.uptimeSeconds += deltaSeconds
+
+    if (this.state.systemState === 'BOOT_INIT') {
+      if (this.state.tecSettlingTicks > 0) {
+        this.state.tecSettlingTicks = Math.max(0, this.state.tecSettlingTicks - deltaSeconds)
+      } else {
+        this.state.systemState = this.state.serviceMode ? 'SERVICE_MODE' : 'READY_ALIGNMENT'
+      }
+    }
+
+    if (this.state.tecSettlingTicks > 0 && this.state.systemState !== 'BOOT_INIT') {
+      this.state.tecSettlingTicks = Math.max(0, this.state.tecSettlingTicks - deltaSeconds)
+    }
+
+    const tecReady = this.state.tecSettlingTicks <= 0.01
+    const nirAllowed =
+      !this.state.faultLatched &&
+      this.state.powerTier === 'full' &&
+      tecReady
+
+    if (this.state.serviceMode) {
+      this.state.systemState = 'SERVICE_MODE'
+    } else if (this.state.faultLatched) {
+      this.state.systemState = 'FAULT_LATCHED'
+    } else if (this.state.powerTier === 'programming_only') {
+      this.state.systemState = 'PROGRAMMING_ONLY'
+    } else if (!tecReady) {
+      this.state.systemState = 'TEC_SETTLING'
+    } else if (this.state.laserRequested && nirAllowed) {
+      this.state.systemState = 'NIR_ACTIVE'
+    } else if (this.state.alignmentRequested) {
+      this.state.systemState = 'ALIGNMENT_ACTIVE'
+    } else if (nirAllowed) {
+      this.state.systemState = 'READY_NIR'
+    } else {
+      this.state.systemState = 'READY_ALIGNMENT'
+    }
+
+    const uptime = this.state.uptimeSeconds
+    this.state.beamPitchDeg =
+      this.state.activeFault === 'horizon_crossed'
+        ? 7.8
+        : -14 + Math.sin(uptime / 8) * 1.7
+    this.state.beamRollDeg = Math.sin(uptime / 6.5) * 11
+    this.state.beamYawDeg = ((Math.sin(uptime / 9) * 42) + (uptime * 3.5)) % 360
+    if (this.state.beamYawDeg > 180) {
+      this.state.beamYawDeg -= 360
+    }
+    this.state.distanceM =
+      this.state.activeFault === 'tof_out_of_range'
+        ? 1.3
+        : 0.41 + Math.cos(uptime / 9) * 0.06
+
+    if (Math.floor(previousUptimeSeconds / 20) !== Math.floor(uptime / 20)) {
+      this.emit({
+        kind: 'event',
+        event: this.makeEvent(
+          'info',
+          'telemetry',
+          'Power contract revalidated',
+          `${this.state.pdPowerW.toFixed(1)} W sink budget remains available.`,
+        ),
+      })
+    }
+
+    this.emit({ kind: 'snapshot', snapshot: this.makeSnapshot() })
+  }
+
+  private raiseFault(code: string): void {
+    this.state.activeFault = code
+    this.state.faultLatched = !['horizon_crossed', 'tof_out_of_range', 'imu_stale', 'imu_invalid', 'tof_stale', 'tof_invalid', 'lambda_drift', 'tec_temp_adc_high'].includes(code)
+    this.state.faultCount += 1
+    this.state.tripCounter += 1
+    this.state.lastFaultAtIso = nowIso()
+    this.state.alignmentRequested = false
+    this.state.laserRequested = false
+    this.emit({
+      kind: 'event',
+      event: this.makeEvent(
+        'critical',
+        'fault',
+        `Fault latched: ${code}`,
+        'The simulated controller forced the beam path off and recorded a latch.',
+      ),
+    })
+  }
+
+  private bumpBringupRevision(action: string): void {
+    this.state.bringup.profileRevision += 1
+    this.state.bringup.persistenceDirty = true
+    this.state.bringup.lastSaveOk = false
+    this.state.bringup.tools.lastAction = action
+  }
+
+  private resetModuleProbeState(module: ModuleKey): void {
+    this.state.bringup.modules[module].detected = false
+    this.state.bringup.modules[module].healthy = false
+  }
+
+  private markModuleProbeSuccess(module: ModuleKey): void {
+    this.state.bringup.modules[module].detected = true
+    this.state.bringup.modules[module].healthy = true
+  }
+
+  private applyBringupPreset(preset: string): void {
+    const bringup = makeDefaultBringupStatus()
+
+    if (preset === 'add_haptic') {
+      bringup.profileName = 'imu-dac-haptic'
+      bringup.modules.haptic = {
+        expectedPresent: true,
+        debugEnabled: true,
+        detected: false,
+        healthy: false,
+      }
+    } else if (preset === 'add_tof') {
+      bringup.profileName = 'imu-dac-tof'
+      bringup.modules.tof = {
+        expectedPresent: true,
+        debugEnabled: true,
+        detected: false,
+        healthy: false,
+      }
+    } else if (preset === 'full_stack') {
+      bringup.profileName = 'full-stack'
+      for (const key of Object.keys(bringup.modules) as ModuleKey[]) {
+        bringup.modules[key] = {
+          expectedPresent: true,
+          debugEnabled: true,
+          detected: false,
+          healthy: false,
+        }
+      }
+    }
+
+    this.state.bringup = bringup
+    this.bumpBringupRevision(`Bring-up preset applied: ${preset}.`)
+  }
+
+  private deriveI2cScan(): string {
+    const addresses: string[] = []
+
+    if (this.state.bringup.modules.pd.expectedPresent) {
+      this.state.bringup.modules.pd.detected = true
+      addresses.push('0x28')
+    }
+    if (this.state.bringup.modules.dac.expectedPresent) {
+      this.state.bringup.modules.dac.detected = true
+      addresses.push('0x48')
+    }
+    if (this.state.bringup.modules.haptic.expectedPresent) {
+      this.state.bringup.modules.haptic.detected = true
+      addresses.push('0x5A')
+    }
+
+    return addresses.length > 0
+      ? addresses.join(' ')
+      : 'No I2C targets declared in the bring-up profile.'
+  }
+
+  private describeI2cTransfer(command: CommandEnvelope, write: boolean): string {
+    const address = typeof command.args?.address === 'number' ? command.args.address : 0
+    const reg = typeof command.args?.reg === 'number' ? command.args.reg : 0
+    const value = typeof command.args?.value === 'number' ? command.args.value : 0
+    const supported = [0x28, 0x48, 0x5a].includes(address)
+
+    if (!supported) {
+      return `${write ? 'write' : 'read'} 0x${address.toString(16)} reg 0x${reg.toString(16)} -> no-ack`
+    }
+
+    if (address === 0x28) {
+      this.markModuleProbeSuccess('pd')
+    } else if (address === 0x48) {
+      this.markModuleProbeSuccess('dac')
+    } else if (address === 0x5a) {
+      this.markModuleProbeSuccess('haptic')
+    }
+
+    if (write) {
+      return `write 0x${address.toString(16)} reg 0x${reg.toString(16)} <- 0x${value.toString(16)}`
+    }
+
+    return `read 0x${address.toString(16)} reg 0x${reg.toString(16)} -> 0x5a`
+  }
+
+  private describeSpiTransfer(command: CommandEnvelope, write: boolean): string {
+    const device = typeof command.args?.device === 'string' ? command.args.device : 'unknown'
+    const reg = typeof command.args?.reg === 'number' ? command.args.reg : 0
+    const value = typeof command.args?.value === 'number' ? command.args.value : 0
+
+    if (device !== 'imu' || !this.state.bringup.modules.imu.expectedPresent) {
+      return `${device} reg 0x${reg.toString(16)} -> unavailable`
+    }
+
+    this.markModuleProbeSuccess('imu')
+
+    if (write) {
+      return `${device} reg 0x${reg.toString(16)} <- 0x${value.toString(16)}`
+    }
+
+    return `${device} reg 0x${reg.toString(16)} -> 0x6c`
+  }
+
+  private makeSnapshot(): DeviceSnapshot {
+    const tecReady = this.state.tecSettlingTicks <= 0.01
+    const tecActualTemp =
+      this.state.targetTempC -
+      this.state.tecSettlingTicks * 0.28 +
+      Math.sin(this.state.uptimeSeconds / 13) * 0.04
+    const alignmentEnabled =
+      this.state.alignmentRequested &&
+      !this.state.faultLatched &&
+      !this.state.laserRequested &&
+      this.state.powerTier !== 'programming_only'
+    const nirEnabled =
+      this.state.laserRequested &&
+      !this.state.faultLatched &&
+      this.state.powerTier === 'full' &&
+      tecReady
+    const dutyFraction =
+      nirEnabled && this.state.modulationEnabled
+        ? this.state.modulationDutyCyclePct / 100
+        : nirEnabled
+          ? 1
+          : 0
+    const measuredCurrentA = nirEnabled
+      ? dutyFraction * this.state.laserHighCurrentA +
+        (1 - dutyFraction) * this.state.lowStateCurrentA +
+        Math.sin(this.state.uptimeSeconds / 6) * 0.02
+      : 0
+    const hostOnly = this.state.powerTier === 'programming_only' && this.state.pdPowerW <= 5.1
+    const pdContract = selectMockPdContract(
+      this.state.pdPowerW,
+      hostOnly,
+      this.state.bringup.tuning,
+    )
+    const tecCurrentA =
+      this.state.tecSettlingTicks > 0
+        ? 1.8 + this.state.laserHighCurrentA * 0.15
+        : 0.55 + (nirEnabled ? 0.35 : 0)
+    const tecVoltageV =
+      this.state.tecSettlingTicks > 0
+        ? 3.2
+        : 1.35 + (nirEnabled ? 0.24 : 0)
+    const actualLambdaNm = estimateWavelengthFromTempC(tecActualTemp)
+    const tempAdcVoltageV = estimateTecVoltageFromTempC(tecActualTemp)
+    const horizonBlocked = this.state.beamPitchDeg > this.state.safety.horizonThresholdDeg
+    const distanceBlocked =
+      this.state.distanceM < this.state.safety.tofMinRangeM ||
+      this.state.distanceM > this.state.safety.tofMaxRangeM
+    const lambdaDriftNm = Math.abs(actualLambdaNm - this.state.targetLambdaNm)
+    const lambdaDriftBlocked = lambdaDriftNm > this.state.safety.lambdaDriftLimitNm
+    const tecTempAdcBlocked = tempAdcVoltageV > this.state.safety.tecTempAdcTripV
+    const activeFaultCode =
+      this.state.faultLatched
+        ? this.state.activeFault
+        : this.state.activeFault !== 'none'
+          ? this.state.activeFault
+          : horizonBlocked
+            ? 'horizon_crossed'
+            : distanceBlocked
+              ? 'tof_out_of_range'
+              : lambdaDriftBlocked
+                ? 'lambda_drift'
+                : tecTempAdcBlocked
+                  ? 'tec_temp_adc_high'
+                  : 'none'
+    const benchDefaults = makeDefaultBenchControlStatus()
+
+    return {
+      identity: {
+        label: 'BSL-HTLS Gen2',
+        firmwareVersion: this.state.firmwareVersion,
+        hardwareRevision: 'rev-A',
+        serialNumber: 'BSL-HTLS2-00017',
+        protocolVersion: 'host-v1',
+      },
+      session: {
+        uptimeSeconds: this.state.uptimeSeconds,
+        state: this.state.systemState,
+        powerTier: this.state.powerTier,
+        bootReason: 'power_on_reset',
+        connectedAtIso: new Date(Date.now() - this.state.uptimeSeconds * 1000).toISOString(),
+      },
+      pd: {
+        contractValid: this.state.powerTier !== 'unknown',
+        negotiatedPowerW: this.state.pdPowerW,
+        sourceVoltageV: pdContract.sourceVoltageV,
+        sourceCurrentA: pdContract.sourceCurrentA,
+        operatingCurrentA: pdContract.operatingCurrentA,
+        contractObjectPosition: pdContract.contractObjectPosition,
+        sinkProfileCount: pdContract.sinkProfileCount,
+        sinkProfiles: pdContract.sinkProfiles,
+        sourceIsHostOnly: hostOnly,
+      },
+      rails: {
+        ld: {
+          enabled: this.state.powerTier === 'full' && tecReady && !this.state.faultLatched,
+          pgood: this.state.powerTier === 'full' && tecReady && !this.state.faultLatched,
+        },
+        tec: {
+          enabled: this.state.powerTier === 'full',
+          pgood: this.state.powerTier === 'full',
+        },
+      },
+      imu: {
+        valid: true,
+        fresh: true,
+        beamPitchDeg: this.state.beamPitchDeg,
+        beamRollDeg: this.state.beamRollDeg,
+        beamYawDeg: this.state.beamYawDeg,
+        beamYawRelative: true,
+        beamPitchLimitDeg: 0,
+      },
+      tof: {
+        valid: true,
+        fresh: true,
+        distanceM: this.state.distanceM,
+        minRangeM: 0.2,
+        maxRangeM: 1,
+      },
+      laser: {
+        alignmentEnabled,
+        nirEnabled,
+        driverStandby: !nirEnabled,
+        measuredCurrentA,
+        commandedCurrentA: this.state.laserHighCurrentA,
+        loopGood: !this.state.faultLatched,
+        driverTempC: 29.4 + measuredCurrentA * 2.6 + Math.sin(this.state.uptimeSeconds / 11) * 0.8,
+      },
+      tec: {
+        targetTempC: this.state.targetTempC,
+        targetLambdaNm: this.state.targetLambdaNm,
+        actualLambdaNm,
+        tempGood: tecReady,
+        tempC: tecActualTemp,
+        tempAdcVoltageV,
+        currentA: tecCurrentA,
+        voltageV: tecVoltageV,
+        settlingSecondsRemaining: Math.max(0, Math.ceil(this.state.tecSettlingTicks)),
+      },
+      peripherals: {
+        dac: {
+          reachable: this.state.bringup.modules.dac.expectedPresent,
+          configured: this.state.bringup.modules.dac.expectedPresent,
+          refAlarm: false,
+          syncReg: this.state.bringup.tuning.dacSyncMode === 'sync' ? 0x0303 : 0x0300,
+          configReg: this.state.bringup.tuning.dacReferenceMode === 'external' ? 0x0001 : 0x0000,
+          gainReg:
+            (this.state.bringup.tuning.dacRefDiv ? 0x0100 : 0) |
+            (this.state.bringup.tuning.dacGain2x ? 0x0003 : 0),
+          statusReg: 0x0000,
+          dataAReg: Math.round((Math.max(0, Math.min(2.5, this.state.bringup.tuning.dacLdChannelV)) / 2.5) * 65535),
+          dataBReg: Math.round((Math.max(0, Math.min(2.5, this.state.bringup.tuning.dacTecChannelV)) / 2.5) * 65535),
+          lastErrorCode: 0,
+          lastError: 'ESP_OK',
+        },
+        pd: {
+          reachable: this.state.bringup.modules.pd.expectedPresent,
+          attached: !hostOnly,
+          ccStatusReg: hostOnly ? 0x01 : 0x13,
+          pdoCountReg: pdContract.sinkProfileCount,
+          rdoStatusRaw:
+            ((pdContract.contractObjectPosition & 0x07) << 28) |
+            ((Math.round(pdContract.operatingCurrentA * 100) & 0x3ff) << 10) |
+            (Math.round(pdContract.sourceCurrentA * 100) & 0x3ff),
+        },
+        imu: {
+          reachable: this.state.bringup.modules.imu.expectedPresent,
+          configured: this.state.bringup.modules.imu.expectedPresent,
+          whoAmI: 0x6c,
+          statusReg: 0x03,
+          ctrl1XlReg: 0x58,
+          ctrl2GReg: 0x54,
+          ctrl3CReg: 0x44,
+          ctrl4CReg: 0x04,
+          ctrl10CReg: this.state.bringup.tuning.imuTimestampEnabled ? 0x20 : 0x00,
+          lastErrorCode: 0,
+          lastError: 'ESP_OK',
+        },
+        haptic: {
+          reachable: this.state.bringup.modules.haptic.expectedPresent,
+          modeReg: 0x00,
+          libraryReg: 0x01,
+          goReg: 0x00,
+          feedbackReg: this.state.bringup.tuning.hapticActuator === 'lra' ? 0x80 : 0x00,
+          lastErrorCode: 0,
+          lastError: 'ESP_OK',
+        },
+      },
+      bench: {
+        ...benchDefaults,
+        targetMode: this.state.targetMode,
+        requestedNirEnabled: this.state.laserRequested,
+        modulationEnabled: this.state.modulationEnabled,
+        modulationFrequencyHz: this.state.modulationFrequencyHz,
+        modulationDutyCyclePct: this.state.modulationDutyCyclePct,
+        lowStateCurrentA: this.state.lowStateCurrentA,
+      },
+      safety: {
+        ...this.state.safety,
+        allowAlignment: !this.state.faultLatched && !horizonBlocked && !distanceBlocked,
+        allowNir:
+          !this.state.faultLatched &&
+          !horizonBlocked &&
+          !distanceBlocked &&
+          !lambdaDriftBlocked &&
+          !tecTempAdcBlocked &&
+          this.state.powerTier === 'full' &&
+          tecReady,
+        horizonBlocked,
+        distanceBlocked,
+        lambdaDriftBlocked,
+        tecTempAdcBlocked,
+        actualLambdaNm,
+        targetLambdaNm: this.state.targetLambdaNm,
+        lambdaDriftNm,
+        tempAdcVoltageV,
+      },
+      bringup: {
+        ...this.state.bringup,
+        serviceModeRequested: this.state.serviceMode,
+        serviceModeActive: this.state.serviceMode,
+      },
+      fault: {
+        latched: this.state.faultLatched,
+        activeCode: activeFaultCode,
+        activeCount: this.state.faultCount,
+        tripCounter: this.state.tripCounter,
+        lastFaultAtIso: this.state.lastFaultAtIso,
+      },
+      counters: {
+        commsTimeouts: 0,
+        watchdogTrips: 0,
+        brownouts: 0,
+      },
+    }
+  }
+
+  private makeEvent(
+    severity: SessionEvent['severity'],
+    category: string,
+    title: string,
+    detail: string,
+  ): SessionEvent {
+    return {
+      id: `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+      atIso: nowIso(),
+      severity,
+      category,
+      title,
+      detail,
+    }
+  }
+
+  private emit(message: TransportMessage): void {
+    for (const listener of this.listeners) {
+      listener(message)
+    }
+  }
+}

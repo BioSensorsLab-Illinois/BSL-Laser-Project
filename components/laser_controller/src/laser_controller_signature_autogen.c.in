@@ -1,0 +1,23 @@
+#include "laser_controller_signature.h"
+
+const laser_controller_firmware_signature_t g_laser_controller_firmware_signature
+    __attribute__((used, section(".rodata.bsl_fw_signature"))) = {
+        .magic = LASER_CONTROLLER_FIRMWARE_SIGNATURE_MAGIC,
+        .schema_version = LASER_CONTROLLER_FIRMWARE_SIGNATURE_SCHEMA_V1,
+        .struct_size = sizeof(laser_controller_firmware_signature_t),
+        .product_name = "@BSL_SIGNATURE_PRODUCT_NAME@",
+        .project_name = "@BSL_SIGNATURE_PROJECT_NAME@",
+        .board_name = "@BSL_SIGNATURE_BOARD_NAME@",
+        .protocol_version = "@BSL_SIGNATURE_PROTOCOL_VERSION@",
+        .hardware_scope = "@BSL_SIGNATURE_HARDWARE_SCOPE@",
+        .firmware_version = "@BSL_SIGNATURE_FIRMWARE_VERSION@",
+        .build_utc = "@BSL_SIGNATURE_BUILD_UTC@",
+        .payload_sha256_hex = "@BSL_SIGNATURE_PAYLOAD_SHA256@",
+        .end_magic = LASER_CONTROLLER_FIRMWARE_SIGNATURE_END_MAGIC,
+        .reserved = {0U, 0U, 0U},
+    };
+
+const laser_controller_firmware_signature_t *laser_controller_signature_get(void)
+{
+    return &g_laser_controller_firmware_signature;
+}

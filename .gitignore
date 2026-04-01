@@ -1,0 +1,12 @@
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+.DS_Store
+.vscode/
+host-console/node_modules/
+host-console/dist/
+host-console/.vite/
+host-console/.DS_Store
+host-console/*.tsbuildinfo
+*.log

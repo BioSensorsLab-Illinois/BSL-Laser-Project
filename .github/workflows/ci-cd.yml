@@ -1,0 +1,119 @@
+name: Build Firmware And Host
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host-console:
+    name: Host Console
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: host-console
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: host-console/package-lock.json
+
+      - name: Install host dependencies
+        run: npm ci
+
+      - name: Lint host app
+        run: npm run lint
+
+      - name: Build host app
+        run: npm run build
+
+      - name: Upload host app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: host-console-dist
+          path: host-console/dist
+          if-no-files-found: error
+          retention-days: 14
+
+  esp32-firmware:
+    name: ESP32 Firmware
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v6.0
+
+    env:
+      IDF_PATH: /opt/esp/idf
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Allow git in container workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Build ESP32-S3 firmware
+        shell: bash
+        run: |
+          . "$IDF_PATH/export.sh"
+          idf.py build
+
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32-firmware
+          path: |
+            build/bsl_laser_controller.bin
+            build/bootloader/bootloader.bin
+            build/partition_table/partition-table.bin
+            build/flasher_args.json
+            sdkconfig
+          if-no-files-found: error
+          retention-days: 14
+
+  release-artifacts:
+    name: Publish Release Artifacts
+    runs-on: ubuntu-latest
+    needs:
+      - host-console
+      - esp32-firmware
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download host artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: host-console-dist
+          path: release/host-console-dist
+
+      - name: Download firmware artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: esp32-firmware
+          path: release/esp32-firmware
+
+      - name: Package host artifact
+        working-directory: release
+        run: zip -r host-console-dist.zip host-console-dist
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/host-console-dist.zip
+            release/esp32-firmware/bsl_laser_controller.bin
+            release/esp32-firmware/bootloader.bin
+            release/esp32-firmware/partition-table.bin
+            release/esp32-firmware/flasher_args.json

@@ -1,0 +1,2732 @@
+#include "laser_controller_board.h"
+
+#include <math.h>
+#include <string.h>
+
+#include "driver/gpio.h"
+#include "driver/i2c_master.h"
+#include "driver/ledc.h"
+#include "driver/spi_master.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_err.h"
+#include "esp_rom_sys.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
+#include "laser_controller_service.h"
+
+#define LASER_CONTROLLER_STUSB4500_ADDR        0x28U
+#define LASER_CONTROLLER_DAC80502_ADDR         0x48U
+#define LASER_CONTROLLER_DRV2605_ADDR          0x5AU
+#define LASER_CONTROLLER_I2C_SPEED_HZ          100000U
+#define LASER_CONTROLLER_I2C_TIMEOUT_MS        50
+#define LASER_CONTROLLER_PD_POLL_MS            100U
+#define LASER_CONTROLLER_SPI_HOST              SPI2_HOST
+#define LASER_CONTROLLER_IMU_SPI_HZ            1000000
+#define LASER_CONTROLLER_DAC_SYNC_REG          0x02U
+#define LASER_CONTROLLER_DAC_CONFIG_REG        0x03U
+#define LASER_CONTROLLER_DAC_GAIN_REG          0x04U
+#define LASER_CONTROLLER_DAC_TRIGGER_REG       0x05U
+#define LASER_CONTROLLER_DAC_STATUS_REG        0x07U
+#define LASER_CONTROLLER_DAC_DATA_A_REG        0x08U
+#define LASER_CONTROLLER_DAC_DATA_B_REG        0x09U
+#define LASER_CONTROLLER_DAC_SOFT_RESET_CODE   0x000AU
+#define LASER_CONTROLLER_DAC_ZERO_SCALE_CODE   0x0000U
+#define LASER_CONTROLLER_DAC_GAIN_DEFAULT      0x0103U
+#define LASER_CONTROLLER_DAC_SYNC_DEFAULT      0x0300U
+#define LASER_CONTROLLER_DAC_CONFIG_DEFAULT    0x0000U
+#define LASER_CONTROLLER_DAC_REF_V             2.5f
+#define LASER_CONTROLLER_DAC_FULL_SCALE_V      2.5f
+#define LASER_CONTROLLER_DAC_CODE_MAX          65535U
+#define LASER_CONTROLLER_DAC_STATUS_REFALARM_BIT 0x0001U
+#define LASER_CONTROLLER_LSM6DSO_WHOAMI_REG    0x0FU
+#define LASER_CONTROLLER_LSM6DSO_WHOAMI_VALUE  0x6CU
+#define LASER_CONTROLLER_LSM6DSO_CTRL1_XL_REG   0x10U
+#define LASER_CONTROLLER_LSM6DSO_CTRL2_G_REG    0x11U
+#define LASER_CONTROLLER_LSM6DSO_CTRL3_C_REG    0x12U
+#define LASER_CONTROLLER_LSM6DSO_CTRL4_C_REG    0x13U
+#define LASER_CONTROLLER_LSM6DSO_CTRL10_C_REG   0x19U
+#define LASER_CONTROLLER_LSM6DSO_STATUS_REG     0x1EU
+#define LASER_CONTROLLER_LSM6DSO_OUTX_L_G_REG   0x22U
+#define LASER_CONTROLLER_LSM6DSO_OUTX_L_A_REG   0x28U
+#define LASER_CONTROLLER_LSM6DSO_RESET_BIT      0x01U
+#define LASER_CONTROLLER_LSM6DSO_IF_INC_BIT     0x04U
+#define LASER_CONTROLLER_LSM6DSO_BDU_BIT        0x40U
+#define LASER_CONTROLLER_LSM6DSO_I2C_DISABLE_BIT 0x04U
+#define LASER_CONTROLLER_LSM6DSO_TIMESTAMP_BIT  0x20U
+#define LASER_CONTROLLER_LSM6DSO_GDA_BIT        0x02U
+#define LASER_CONTROLLER_LSM6DSO_XLDA_BIT       0x01U
+#define LASER_CONTROLLER_STUSB_CC_STATUS_REG   0x11U
+#define LASER_CONTROLLER_STUSB_PD_COMMAND_CTRL_REG 0x1AU
+#define LASER_CONTROLLER_STUSB_DPM_PDO_NUMB    0x70U
+#define LASER_CONTROLLER_STUSB_DPM_PDO1_0      0x85U
+#define LASER_CONTROLLER_STUSB_RDO_STATUS_0    0x91U
+#define LASER_CONTROLLER_STUSB_TX_HEADER_LOW_REG 0x51U
+#define LASER_CONTROLLER_STUSB_SOFT_RESET_PAYLOAD 0x0DU
+#define LASER_CONTROLLER_STUSB_SEND_COMMAND     0x26U
+#define LASER_CONTROLLER_DRV2605_MODE_REG      0x01U
+#define LASER_CONTROLLER_DRV2605_RTP_REG       0x02U
+#define LASER_CONTROLLER_DRV2605_LIBRARY_REG   0x03U
+#define LASER_CONTROLLER_DRV2605_WAVESEQ1_REG  0x04U
+#define LASER_CONTROLLER_DRV2605_GO_REG        0x0CU
+#define LASER_CONTROLLER_DRV2605_FEEDBACK_REG  0x1AU
+#define LASER_CONTROLLER_DRV2605_STANDBY_BIT   0x40U
+#define LASER_CONTROLLER_DRV2605_RESET_BIT     0x80U
+#define LASER_CONTROLLER_PCN_PWM_SPEED_MODE    LEDC_LOW_SPEED_MODE
+#define LASER_CONTROLLER_PCN_PWM_TIMER         LEDC_TIMER_0
+#define LASER_CONTROLLER_PCN_PWM_CHANNEL       LEDC_CHANNEL_0
+#define LASER_CONTROLLER_PCN_PWM_RESOLUTION    LEDC_TIMER_8_BIT
+#define LASER_CONTROLLER_PCN_PWM_DUTY_MAX      ((1U << 8U) - 1U)
+#define LASER_CONTROLLER_DAC_RETRY_MS          500U
+#define LASER_CONTROLLER_DAC_RESET_SETTLE_US   2000U
+#define LASER_CONTROLLER_IMU_RETRY_MS          500U
+#define LASER_CONTROLLER_TWO_PI_RAD            6.28318530717958647692f
+#define LASER_CONTROLLER_PI_RAD                3.14159265358979323846f
+#define LASER_CONTROLLER_RAD_PER_DEG           0.01745329251994329577f
+
+typedef struct {
+    bool attached;
+    bool host_only;
+    bool contract_valid;
+    float negotiated_power_w;
+    float source_voltage_v;
+    float source_current_a;
+    float operating_current_a;
+    uint8_t contract_object_position;
+    uint8_t sink_profile_count;
+    laser_controller_service_pd_profile_t
+        sink_profiles[LASER_CONTROLLER_SERVICE_PD_PROFILE_COUNT];
+    laser_controller_time_ms_t updated_ms;
+} laser_controller_pd_snapshot_t;
+
+typedef struct {
+    float voltage_v;
+    float current_a;
+} laser_controller_pd_pdo_t;
+
+typedef struct {
+    uint32_t odr_hz;
+    uint32_t accel_range_g;
+    uint32_t gyro_range_dps;
+    bool gyro_enabled;
+    bool lpf2_enabled;
+    bool timestamp_enabled;
+    bool bdu_enabled;
+    bool if_inc_enabled;
+    bool i2c_disabled;
+} laser_controller_board_imu_config_t;
+
+typedef struct {
+    bool identified;
+    bool configured;
+    esp_err_t last_error;
+    laser_controller_time_ms_t last_attempt_ms;
+    laser_controller_time_ms_t last_sample_ms;
+    laser_controller_time_ms_t last_orientation_ms;
+    float accel_g[3];
+    float gyro_dps[3];
+    laser_controller_radians_t beam_pitch_rad;
+    laser_controller_radians_t beam_roll_rad;
+    laser_controller_radians_t beam_yaw_rad;
+    laser_controller_board_imu_config_t config;
+} laser_controller_board_imu_runtime_t;
+
+static const laser_controller_board_outputs_t kSafeOutputs = {
+    .enable_ld_vin = false,
+    .enable_tec_vin = false,
+    .enable_alignment_laser = false,
+    .assert_driver_standby = true,
+    .select_driver_low_current = true,
+};
+
+static const struct {
+    float voltage_v;
+    float temp_c;
+} kTecTempCalibration[] = {
+    { 0.180f, 6.0f },
+    { 0.221f, 7.5f },
+    { 0.316f, 10.7f },
+    { 0.473f, 15.5f },
+    { 0.606f, 20.0f },
+    { 0.630f, 20.5f },
+    { 0.957f, 28.2f },
+    { 0.985f, 29.0f },
+    { 1.345f, 37.4f },
+    { 1.640f, 44.7f },
+    { 1.700f, 46.1f },
+    { 2.030f, 54.5f },
+    { 2.182f, 58.7f },
+    { 2.429f, 65.0f },
+};
+
+static bool s_mock_override_enabled;
+static laser_controller_board_inputs_t s_mock_inputs;
+static laser_controller_board_outputs_t s_last_outputs = {
+    .enable_ld_vin = false,
+    .enable_tec_vin = false,
+    .enable_alignment_laser = false,
+    .assert_driver_standby = true,
+    .select_driver_low_current = true,
+};
+static adc_oneshot_unit_handle_t s_adc_handle;
+static bool s_adc_ready;
+static i2c_master_bus_handle_t s_i2c_bus;
+static bool s_i2c_ready;
+static spi_device_handle_t s_imu_spi;
+static bool s_spi_ready;
+static bool s_dac_ready;
+static esp_err_t s_dac_last_error;
+static laser_controller_time_ms_t s_dac_last_attempt_ms;
+static bool s_gpio_ready;
+static bool s_pwm_active;
+static laser_controller_pd_snapshot_t s_pd_snapshot;
+static float s_last_ld_voltage_v = -1.0f;
+static float s_last_tec_voltage_v = -1.0f;
+static laser_controller_board_imu_runtime_t s_imu_runtime;
+static laser_controller_board_dac_readback_t s_dac_readback;
+static laser_controller_board_pd_readback_t s_pd_readback;
+static laser_controller_board_imu_readback_t s_imu_readback;
+static laser_controller_board_haptic_readback_t s_haptic_readback;
+static SemaphoreHandle_t s_bus_mutex;
+static StaticSemaphore_t s_bus_mutex_buffer;
+
+static void laser_controller_board_lock_bus(void)
+{
+    if (s_bus_mutex != NULL) {
+        (void)xSemaphoreTake(s_bus_mutex, portMAX_DELAY);
+    }
+}
+
+static void laser_controller_board_unlock_bus(void)
+{
+    if (s_bus_mutex != NULL) {
+        (void)xSemaphoreGive(s_bus_mutex);
+    }
+}
+
+static float laser_controller_board_clamp_float(float value, float minimum, float maximum)
+{
+    if (value < minimum) {
+        return minimum;
+    }
+
+    if (value > maximum) {
+        return maximum;
+    }
+
+    return value;
+}
+
+static uint32_t laser_controller_board_clamp_u32(
+    uint32_t value,
+    uint32_t minimum,
+    uint32_t maximum)
+{
+    if (value < minimum) {
+        return minimum;
+    }
+
+    if (value > maximum) {
+        return maximum;
+    }
+
+    return value;
+}
+
+static void laser_controller_board_load_default_imu_config(
+    laser_controller_board_imu_config_t *config)
+{
+    if (config == NULL) {
+        return;
+    }
+
+    config->odr_hz = 208U;
+    config->accel_range_g = 4U;
+    config->gyro_range_dps = 500U;
+    config->gyro_enabled = true;
+    config->lpf2_enabled = false;
+    config->timestamp_enabled = true;
+    config->bdu_enabled = true;
+    config->if_inc_enabled = true;
+    config->i2c_disabled = true;
+}
+
+static uint8_t laser_controller_board_imu_odr_bits(uint32_t odr_hz)
+{
+    switch (odr_hz) {
+        case 12U:
+        case 13U:
+            return 0x01U;
+        case 26U:
+            return 0x02U;
+        case 52U:
+            return 0x03U;
+        case 104U:
+            return 0x04U;
+        case 208U:
+            return 0x05U;
+        case 416U:
+            return 0x06U;
+        case 833U:
+            return 0x07U;
+        case 1660U:
+            return 0x08U;
+        case 3330U:
+            return 0x09U;
+        case 6660U:
+            return 0x0AU;
+        default:
+            return 0x05U;
+    }
+}
+
+static uint8_t laser_controller_board_imu_accel_fs_bits(uint32_t accel_range_g)
+{
+    switch (accel_range_g) {
+        case 2U:
+            return 0x00U;
+        case 16U:
+            return 0x01U;
+        case 4U:
+            return 0x02U;
+        case 8U:
+            return 0x03U;
+        default:
+            return 0x02U;
+    }
+}
+
+static float laser_controller_board_imu_accel_g_per_lsb(uint32_t accel_range_g)
+{
+    switch (accel_range_g) {
+        case 2U:
+            return 0.000061f;
+        case 4U:
+            return 0.000122f;
+        case 8U:
+            return 0.000244f;
+        case 16U:
+            return 0.000488f;
+        default:
+            return 0.000122f;
+    }
+}
+
+static float laser_controller_board_imu_gyro_dps_per_lsb(uint32_t gyro_range_dps)
+{
+    switch (gyro_range_dps) {
+        case 125U:
+            return 0.004375f;
+        case 250U:
+            return 0.008750f;
+        case 500U:
+            return 0.017500f;
+        case 1000U:
+            return 0.035000f;
+        case 2000U:
+            return 0.070000f;
+        default:
+            return 0.017500f;
+    }
+}
+
+static uint8_t laser_controller_board_imu_gyro_ctrl2_value(
+    uint32_t odr_hz,
+    uint32_t gyro_range_dps,
+    bool gyro_enabled)
+{
+    uint8_t value = 0U;
+
+    if (!gyro_enabled) {
+        return value;
+    }
+
+    value = (uint8_t)(laser_controller_board_imu_odr_bits(odr_hz) << 4U);
+    switch (gyro_range_dps) {
+        case 125U:
+            value |= 0x02U;
+            break;
+        case 250U:
+            value |= (0x00U << 2U);
+            break;
+        case 500U:
+            value |= (0x01U << 2U);
+            break;
+        case 1000U:
+            value |= (0x02U << 2U);
+            break;
+        case 2000U:
+            value |= (0x03U << 2U);
+            break;
+        default:
+            value |= (0x01U << 2U);
+            break;
+    }
+
+    return value;
+}
+
+static void laser_controller_board_service_report_probe(
+    laser_controller_module_t module,
+    bool detected,
+    bool healthy)
+{
+    laser_controller_service_report_module_probe(module, detected, healthy);
+}
+
+static void laser_controller_board_drive_safe_gpio_levels(
+    const laser_controller_board_outputs_t *outputs)
+{
+    const laser_controller_board_outputs_t effective =
+        outputs != NULL ? *outputs : kSafeOutputs;
+
+    (void)gpio_set_level(
+        LASER_CONTROLLER_GPIO_PWR_TEC_EN,
+        effective.enable_tec_vin ? 1 : 0);
+    (void)gpio_set_level(
+        LASER_CONTROLLER_GPIO_PWR_LD_EN,
+        effective.enable_ld_vin ? 1 : 0);
+    (void)gpio_set_level(
+        LASER_CONTROLLER_GPIO_LD_SBDN,
+        effective.assert_driver_standby ? 0 : 1);
+    (void)gpio_set_level(
+        LASER_CONTROLLER_GPIO_LD_PCN,
+        effective.select_driver_low_current ? 0 : 1);
+    (void)gpio_set_level(
+        LASER_CONTROLLER_GPIO_ERM_TRIG_GN_LD_EN,
+        effective.enable_alignment_laser ? 1 : 0);
+    (void)gpio_set_level(LASER_CONTROLLER_GPIO_ERM_EN, 0);
+}
+
+static esp_err_t laser_controller_board_ensure_gpio_ready(void)
+{
+    const uint64_t output_mask =
+        (1ULL << LASER_CONTROLLER_GPIO_PWR_TEC_EN) |
+        (1ULL << LASER_CONTROLLER_GPIO_PWR_LD_EN) |
+        (1ULL << LASER_CONTROLLER_GPIO_LD_SBDN) |
+        (1ULL << LASER_CONTROLLER_GPIO_LD_PCN) |
+        (1ULL << LASER_CONTROLLER_GPIO_ERM_EN) |
+        (1ULL << LASER_CONTROLLER_GPIO_ERM_TRIG_GN_LD_EN);
+    const uint64_t input_mask =
+        (1ULL << LASER_CONTROLLER_GPIO_PWR_TEC_PGOOD) |
+        (1ULL << LASER_CONTROLLER_GPIO_PWR_LD_PGOOD) |
+        (1ULL << LASER_CONTROLLER_GPIO_LD_LPGD) |
+        (1ULL << LASER_CONTROLLER_GPIO_TEC_TEMPGD) |
+        (1ULL << LASER_CONTROLLER_GPIO_IMU_INT2);
+    gpio_config_t config = { 0 };
+    esp_err_t err;
+
+    if (s_gpio_ready) {
+        return ESP_OK;
+    }
+
+    config.pin_bit_mask = output_mask;
+    config.mode = GPIO_MODE_OUTPUT;
+    config.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    config.pull_up_en = GPIO_PULLUP_DISABLE;
+    config.intr_type = GPIO_INTR_DISABLE;
+    err = gpio_config(&config);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    config.pin_bit_mask = input_mask;
+    config.mode = GPIO_MODE_INPUT;
+    config.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    config.pull_up_en = GPIO_PULLUP_DISABLE;
+    config.intr_type = GPIO_INTR_DISABLE;
+    err = gpio_config(&config);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    s_gpio_ready = true;
+    laser_controller_board_drive_safe_gpio_levels(&kSafeOutputs);
+    return ESP_OK;
+}
+
+static esp_err_t laser_controller_board_ensure_adc_ready(void)
+{
+    adc_oneshot_unit_init_cfg_t unit_config = {
+        .unit_id = ADC_UNIT_1,
+        .clk_src = 0,
+        .ulp_mode = ADC_ULP_MODE_DISABLE,
+    };
+    adc_oneshot_chan_cfg_t channel_config = {
+        .atten = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_12,
+    };
+    static const adc_channel_t kChannels[] = {
+        ADC_CHANNEL_0,
+        ADC_CHANNEL_1,
+        ADC_CHANNEL_7,
+        ADC_CHANNEL_8,
+        ADC_CHANNEL_9,
+    };
+    esp_err_t err;
+
+    if (s_adc_ready) {
+        return ESP_OK;
+    }
+
+    err = adc_oneshot_new_unit(&unit_config, &s_adc_handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    for (size_t index = 0U; index < sizeof(kChannels) / sizeof(kChannels[0]); ++index) {
+        err = adc_oneshot_config_channel(s_adc_handle, kChannels[index], &channel_config);
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
+
+    s_adc_ready = true;
+    return ESP_OK;
+}
+
+static esp_err_t laser_controller_board_ensure_i2c_ready(void)
+{
+    i2c_master_bus_config_t config = {
+        .i2c_port = -1,
+        .sda_io_num = LASER_CONTROLLER_GPIO_SHARED_I2C_SDA,
+        .scl_io_num = LASER_CONTROLLER_GPIO_SHARED_I2C_SCL,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .intr_priority = 0,
+        .trans_queue_depth = 0,
+        .flags = {
+            .enable_internal_pullup = 1,
+            .allow_pd = 0,
+        },
+    };
+    esp_err_t err;
+
+    if (s_i2c_ready) {
+        return ESP_OK;
+    }
+
+    err = i2c_new_master_bus(&config, &s_i2c_bus);
+    if (err == ESP_OK) {
+        s_i2c_ready = true;
+    }
+
+    return err;
+}
+
+static void laser_controller_board_get_shared_i2c_levels_internal(
+    bool *sda_high,
+    bool *scl_high)
+{
+    if (sda_high != NULL) {
+        *sda_high = gpio_get_level(LASER_CONTROLLER_GPIO_SHARED_I2C_SDA) != 0;
+    }
+
+    if (scl_high != NULL) {
+        *scl_high = gpio_get_level(LASER_CONTROLLER_GPIO_SHARED_I2C_SCL) != 0;
+    }
+}
+
+static void laser_controller_board_recover_shared_i2c_bus(void)
+{
+    gpio_config_t config = { 0 };
+
+    if (s_i2c_ready && s_i2c_bus != NULL) {
+        (void)i2c_master_bus_wait_all_done(
+            s_i2c_bus,
+            LASER_CONTROLLER_I2C_TIMEOUT_MS);
+        (void)i2c_master_bus_reset(s_i2c_bus);
+        (void)i2c_del_master_bus(s_i2c_bus);
+        s_i2c_bus = NULL;
+        s_i2c_ready = false;
+    }
+
+    config.pin_bit_mask =
+        (1ULL << LASER_CONTROLLER_GPIO_SHARED_I2C_SDA) |
+        (1ULL << LASER_CONTROLLER_GPIO_SHARED_I2C_SCL);
+    config.mode = GPIO_MODE_INPUT_OUTPUT_OD;
+    config.pull_up_en = GPIO_PULLUP_ENABLE;
+    config.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    config.intr_type = GPIO_INTR_DISABLE;
+    (void)gpio_config(&config);
+
+    (void)gpio_set_level(LASER_CONTROLLER_GPIO_SHARED_I2C_SDA, 1);
+    (void)gpio_set_level(LASER_CONTROLLER_GPIO_SHARED_I2C_SCL, 1);
+    esp_rom_delay_us(5U);
+
+    for (uint32_t pulse = 0U; pulse < 9U; ++pulse) {
+        (void)gpio_set_level(LASER_CONTROLLER_GPIO_SHARED_I2C_SCL, 0);
+        esp_rom_delay_us(5U);
+        (void)gpio_set_level(LASER_CONTROLLER_GPIO_SHARED_I2C_SCL, 1);
+        esp_rom_delay_us(5U);
+    }
+
+    /* Generate a best-effort STOP condition before handing the bus back. */
+    (void)gpio_set_level(LASER_CONTROLLER_GPIO_SHARED_I2C_SDA, 0);
+    esp_rom_delay_us(5U);
+    (void)gpio_set_level(LASER_CONTROLLER_GPIO_SHARED_I2C_SCL, 1);
+    esp_rom_delay_us(5U);
+    (void)gpio_set_level(LASER_CONTROLLER_GPIO_SHARED_I2C_SDA, 1);
+    esp_rom_delay_us(5U);
+}
+
+static bool laser_controller_board_i2c_error_needs_recovery(esp_err_t err)
+{
+    return err == ESP_ERR_TIMEOUT ||
+           err == ESP_FAIL ||
+           err == ESP_ERR_INVALID_STATE;
+}
+
+static esp_err_t laser_controller_board_ensure_spi_ready(void)
+{
+    spi_bus_config_t bus_config = {
+        .mosi_io_num = LASER_CONTROLLER_GPIO_IMU_SDI,
+        .miso_io_num = LASER_CONTROLLER_GPIO_IMU_SDO,
+        .sclk_io_num = LASER_CONTROLLER_GPIO_IMU_SCLK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .data4_io_num = -1,
+        .data5_io_num = -1,
+        .data6_io_num = -1,
+        .data7_io_num = -1,
+        .max_transfer_sz = 16,
+        .flags = SPICOMMON_BUSFLAG_MASTER |
+                 SPICOMMON_BUSFLAG_MOSI |
+                 SPICOMMON_BUSFLAG_MISO |
+                 SPICOMMON_BUSFLAG_SCLK,
+        .isr_cpu_id = ESP_INTR_CPU_AFFINITY_AUTO,
+        .intr_flags = 0,
+    };
+    spi_device_interface_config_t device_config = {
+        .command_bits = 0,
+        .address_bits = 0,
+        .dummy_bits = 0,
+        .mode = 3,
+        .clock_source = SPI_CLK_SRC_DEFAULT,
+        .duty_cycle_pos = 128,
+        .cs_ena_pretrans = 0,
+        .cs_ena_posttrans = 0,
+        .clock_speed_hz = LASER_CONTROLLER_IMU_SPI_HZ,
+        .input_delay_ns = 0,
+        .sample_point = SPI_SAMPLING_POINT_PHASE_0,
+        .spics_io_num = LASER_CONTROLLER_GPIO_IMU_CS,
+        .flags = 0,
+        .queue_size = 1,
+        .pre_cb = NULL,
+        .post_cb = NULL,
+    };
+    esp_err_t err;
+
+    if (s_spi_ready) {
+        return ESP_OK;
+    }
+
+    err = spi_bus_initialize(
+        LASER_CONTROLLER_SPI_HOST,
+        &bus_config,
+        SPI_DMA_DISABLED);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        return err;
+    }
+
+    err = spi_bus_add_device(
+        LASER_CONTROLLER_SPI_HOST,
+        &device_config,
+        &s_imu_spi);
+    if (err == ESP_OK) {
+        s_spi_ready = true;
+    }
+
+    return err;
+}
+
+static esp_err_t laser_controller_board_i2c_tx(
+    uint32_t address,
+    const uint8_t *tx_data,
+    size_t tx_len)
+{
+    esp_err_t err = ESP_OK;
+
+    if (tx_data == NULL || tx_len == 0U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    for (uint32_t attempt = 0U; attempt < 2U; ++attempt) {
+        i2c_master_dev_handle_t device = NULL;
+        i2c_device_config_t config = {
+            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+            .device_address = (uint16_t)(address & 0x7FU),
+            .scl_speed_hz = LASER_CONTROLLER_I2C_SPEED_HZ,
+            .scl_wait_us = 0U,
+            .flags = {
+                .disable_ack_check = 0,
+            },
+        };
+
+        err = laser_controller_board_ensure_i2c_ready();
+        if (err != ESP_OK) {
+            if (attempt == 0U && laser_controller_board_i2c_error_needs_recovery(err)) {
+                laser_controller_board_recover_shared_i2c_bus();
+                continue;
+            }
+            return err;
+        }
+
+        laser_controller_board_lock_bus();
+        err = i2c_master_bus_add_device(s_i2c_bus, &config, &device);
+        if (err == ESP_OK) {
+            err = i2c_master_transmit(
+                device,
+                tx_data,
+                tx_len,
+                LASER_CONTROLLER_I2C_TIMEOUT_MS);
+            (void)i2c_master_bus_rm_device(device);
+        }
+        laser_controller_board_unlock_bus();
+
+        if (err == ESP_OK || !laser_controller_board_i2c_error_needs_recovery(err) ||
+            attempt > 0U) {
+            return err;
+        }
+
+        laser_controller_board_recover_shared_i2c_bus();
+    }
+
+    return err;
+}
+
+static esp_err_t laser_controller_board_i2c_txrx(
+    uint32_t address,
+    const uint8_t *tx_data,
+    size_t tx_len,
+    uint8_t *rx_data,
+    size_t rx_len)
+{
+    esp_err_t err = ESP_OK;
+
+    if (tx_data == NULL || tx_len == 0U || rx_data == NULL || rx_len == 0U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    for (uint32_t attempt = 0U; attempt < 2U; ++attempt) {
+        i2c_master_dev_handle_t device = NULL;
+        i2c_device_config_t config = {
+            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+            .device_address = (uint16_t)(address & 0x7FU),
+            .scl_speed_hz = LASER_CONTROLLER_I2C_SPEED_HZ,
+            .scl_wait_us = 0U,
+            .flags = {
+                .disable_ack_check = 0,
+            },
+        };
+
+        err = laser_controller_board_ensure_i2c_ready();
+        if (err != ESP_OK) {
+            if (attempt == 0U && laser_controller_board_i2c_error_needs_recovery(err)) {
+                laser_controller_board_recover_shared_i2c_bus();
+                continue;
+            }
+            return err;
+        }
+
+        laser_controller_board_lock_bus();
+        err = i2c_master_bus_add_device(s_i2c_bus, &config, &device);
+        if (err == ESP_OK) {
+            err = i2c_master_transmit_receive(
+                device,
+                tx_data,
+                tx_len,
+                rx_data,
+                rx_len,
+                LASER_CONTROLLER_I2C_TIMEOUT_MS);
+            (void)i2c_master_bus_rm_device(device);
+        }
+        laser_controller_board_unlock_bus();
+
+        if (err == ESP_OK || !laser_controller_board_i2c_error_needs_recovery(err) ||
+            attempt > 0U) {
+            return err;
+        }
+
+        laser_controller_board_recover_shared_i2c_bus();
+    }
+
+    return err;
+}
+
+static esp_err_t laser_controller_board_i2c_read_reg_u8(
+    uint32_t address,
+    uint8_t reg,
+    uint8_t *value)
+{
+    return laser_controller_board_i2c_txrx(address, &reg, 1U, value, 1U);
+}
+
+static esp_err_t laser_controller_board_i2c_read_stusb_block(
+    uint8_t start_reg,
+    uint8_t *buffer,
+    size_t len)
+{
+    return laser_controller_board_i2c_txrx(
+        LASER_CONTROLLER_STUSB4500_ADDR,
+        &start_reg,
+        1U,
+        buffer,
+        len);
+}
+
+static esp_err_t laser_controller_board_dac_write_command(uint8_t command, uint16_t value)
+{
+    uint8_t payload[3];
+
+    payload[0] = command;
+    payload[1] = (uint8_t)((value >> 8U) & 0xFFU);
+    payload[2] = (uint8_t)(value & 0xFFU);
+
+    return laser_controller_board_i2c_tx(
+        LASER_CONTROLLER_DAC80502_ADDR,
+        payload,
+        sizeof(payload));
+}
+
+static esp_err_t laser_controller_board_dac_read_command(uint8_t command, uint16_t *value)
+{
+    uint8_t rx[2] = { 0 };
+    esp_err_t err;
+
+    if (value == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    err = laser_controller_board_i2c_txrx(
+        LASER_CONTROLLER_DAC80502_ADDR,
+        &command,
+        1U,
+        rx,
+        sizeof(rx));
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    *value = (uint16_t)(((uint16_t)rx[0] << 8U) | rx[1]);
+    return ESP_OK;
+}
+
+static void laser_controller_board_clear_dac_readback(void)
+{
+    memset(&s_dac_readback, 0, sizeof(s_dac_readback));
+    s_dac_readback.last_error = ESP_OK;
+}
+
+static void laser_controller_board_clear_pd_readback(void)
+{
+    memset(&s_pd_readback, 0, sizeof(s_pd_readback));
+}
+
+static void laser_controller_board_clear_imu_readback(void)
+{
+    memset(&s_imu_readback, 0, sizeof(s_imu_readback));
+    s_imu_readback.last_error = ESP_OK;
+}
+
+static void laser_controller_board_clear_haptic_readback(void)
+{
+    memset(&s_haptic_readback, 0, sizeof(s_haptic_readback));
+    s_haptic_readback.last_error = ESP_OK;
+}
+
+static void laser_controller_board_capture_dac_readback(bool configured)
+{
+    uint16_t value = 0U;
+    esp_err_t err;
+
+    laser_controller_board_clear_dac_readback();
+    s_dac_readback.configured = configured;
+
+    err = laser_controller_board_i2c_probe(LASER_CONTROLLER_DAC80502_ADDR);
+    if (err != ESP_OK) {
+        s_dac_readback.last_error = (int32_t)err;
+        return;
+    }
+
+    s_dac_readback.reachable = true;
+
+    err = laser_controller_board_dac_read_command(
+        LASER_CONTROLLER_DAC_SYNC_REG,
+        &value);
+    if (err != ESP_OK) {
+        s_dac_readback.last_error = (int32_t)err;
+        return;
+    }
+    s_dac_readback.sync_reg = value;
+
+    err = laser_controller_board_dac_read_command(
+        LASER_CONTROLLER_DAC_CONFIG_REG,
+        &value);
+    if (err != ESP_OK) {
+        s_dac_readback.last_error = (int32_t)err;
+        return;
+    }
+    s_dac_readback.config_reg = value;
+
+    err = laser_controller_board_dac_read_command(
+        LASER_CONTROLLER_DAC_GAIN_REG,
+        &value);
+    if (err != ESP_OK) {
+        s_dac_readback.last_error = (int32_t)err;
+        return;
+    }
+    s_dac_readback.gain_reg = value;
+
+    err = laser_controller_board_dac_read_command(
+        LASER_CONTROLLER_DAC_STATUS_REG,
+        &value);
+    if (err != ESP_OK) {
+        s_dac_readback.last_error = (int32_t)err;
+        return;
+    }
+    s_dac_readback.status_reg = value;
+    s_dac_readback.ref_alarm =
+        (value & LASER_CONTROLLER_DAC_STATUS_REFALARM_BIT) != 0U;
+
+    err = laser_controller_board_dac_read_command(
+        LASER_CONTROLLER_DAC_DATA_A_REG,
+        &value);
+    if (err != ESP_OK) {
+        s_dac_readback.last_error = (int32_t)err;
+        return;
+    }
+    s_dac_readback.data_a_reg = value;
+
+    err = laser_controller_board_dac_read_command(
+        LASER_CONTROLLER_DAC_DATA_B_REG,
+        &value);
+    if (err != ESP_OK) {
+        s_dac_readback.last_error = (int32_t)err;
+        return;
+    }
+    s_dac_readback.data_b_reg = value;
+    s_dac_readback.last_error = ESP_OK;
+}
+
+static void laser_controller_board_capture_haptic_readback(void)
+{
+    uint8_t value = 0U;
+    esp_err_t err;
+
+    laser_controller_board_clear_haptic_readback();
+
+    if (!laser_controller_service_module_expected(LASER_CONTROLLER_MODULE_HAPTIC)) {
+        return;
+    }
+
+    err = laser_controller_board_i2c_probe(LASER_CONTROLLER_DRV2605_ADDR);
+    if (err != ESP_OK) {
+        s_haptic_readback.last_error = (int32_t)err;
+        return;
+    }
+
+    s_haptic_readback.reachable = true;
+
+    err = laser_controller_board_i2c_read_reg_u8(
+        LASER_CONTROLLER_DRV2605_ADDR,
+        LASER_CONTROLLER_DRV2605_MODE_REG,
+        &value);
+    if (err != ESP_OK) {
+        s_haptic_readback.last_error = (int32_t)err;
+        return;
+    }
+    s_haptic_readback.mode_reg = value;
+
+    err = laser_controller_board_i2c_read_reg_u8(
+        LASER_CONTROLLER_DRV2605_ADDR,
+        LASER_CONTROLLER_DRV2605_LIBRARY_REG,
+        &value);
+    if (err != ESP_OK) {
+        s_haptic_readback.last_error = (int32_t)err;
+        return;
+    }
+    s_haptic_readback.library_reg = value;
+
+    err = laser_controller_board_i2c_read_reg_u8(
+        LASER_CONTROLLER_DRV2605_ADDR,
+        LASER_CONTROLLER_DRV2605_GO_REG,
+        &value);
+    if (err != ESP_OK) {
+        s_haptic_readback.last_error = (int32_t)err;
+        return;
+    }
+    s_haptic_readback.go_reg = value;
+
+    err = laser_controller_board_i2c_read_reg_u8(
+        LASER_CONTROLLER_DRV2605_ADDR,
+        LASER_CONTROLLER_DRV2605_FEEDBACK_REG,
+        &value);
+    if (err != ESP_OK) {
+        s_haptic_readback.last_error = (int32_t)err;
+        return;
+    }
+    s_haptic_readback.feedback_reg = value;
+    s_haptic_readback.last_error = ESP_OK;
+}
+
+static bool laser_controller_board_dac_config_is_safe(
+    laser_controller_service_dac_reference_t reference,
+    bool gain_2x,
+    bool ref_div)
+{
+    /*
+     * On this board the DAC runs from 3.3 V and the default bring-up path uses
+     * the internal 2.5 V reference. Internal reference + gain x2 requires
+     * REF-DIV=1; otherwise the DAC trips REF-ALARM and forces both outputs to 0 V.
+     */
+    if (reference == LASER_CONTROLLER_SERVICE_DAC_REFERENCE_INTERNAL &&
+        gain_2x &&
+        !ref_div) {
+        return false;
+    }
+
+    return true;
+}
+
+static esp_err_t laser_controller_board_dac_check_status(void)
+{
+    uint16_t status_reg = 0U;
+    esp_err_t err =
+        laser_controller_board_dac_read_command(
+            LASER_CONTROLLER_DAC_STATUS_REG,
+            &status_reg);
+
+    if (err != ESP_OK) {
+        s_dac_readback.last_error = (int32_t)err;
+        return err;
+    }
+
+    s_dac_readback.status_reg = status_reg;
+    s_dac_readback.ref_alarm =
+        (status_reg & LASER_CONTROLLER_DAC_STATUS_REFALARM_BIT) != 0U;
+
+    if ((status_reg & LASER_CONTROLLER_DAC_STATUS_REFALARM_BIT) != 0U) {
+        s_dac_readback.last_error = ESP_ERR_INVALID_STATE;
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    s_dac_readback.last_error = ESP_OK;
+    return ESP_OK;
+}
+
+static esp_err_t laser_controller_board_dac_init_safe(void)
+{
+    esp_err_t err;
+    const laser_controller_time_ms_t now_ms = laser_controller_board_uptime_ms();
+
+    if (s_dac_ready) {
+        return ESP_OK;
+    }
+
+    if (s_dac_last_error != ESP_OK &&
+        (now_ms - s_dac_last_attempt_ms) < LASER_CONTROLLER_DAC_RETRY_MS) {
+        return s_dac_last_error;
+    }
+
+    s_dac_last_attempt_ms = now_ms;
+
+    err = laser_controller_board_i2c_probe(LASER_CONTROLLER_DAC80502_ADDR);
+    if (err != ESP_OK) {
+        s_dac_last_error = err;
+        laser_controller_board_clear_dac_readback();
+        s_dac_readback.last_error = (int32_t)err;
+        laser_controller_board_service_report_probe(
+            LASER_CONTROLLER_MODULE_DAC,
+            false,
+            false);
+        return err;
+    }
+
+    err = laser_controller_board_dac_write_command(
+        LASER_CONTROLLER_DAC_TRIGGER_REG,
+        LASER_CONTROLLER_DAC_SOFT_RESET_CODE);
+    if (err != ESP_OK) {
+        s_dac_last_error = err;
+        return err;
+    }
+
+    esp_rom_delay_us(LASER_CONTROLLER_DAC_RESET_SETTLE_US);
+
+    err = laser_controller_board_i2c_probe(LASER_CONTROLLER_DAC80502_ADDR);
+    if (err != ESP_OK) {
+        s_dac_last_error = err;
+        laser_controller_board_clear_dac_readback();
+        s_dac_readback.last_error = (int32_t)err;
+        laser_controller_board_service_report_probe(
+            LASER_CONTROLLER_MODULE_DAC,
+            false,
+            false);
+        return err;
+    }
+
+    err = laser_controller_board_dac_write_command(
+        LASER_CONTROLLER_DAC_SYNC_REG,
+        LASER_CONTROLLER_DAC_SYNC_DEFAULT);
+    if (err != ESP_OK) {
+        s_dac_last_error = err;
+        return err;
+    }
+
+    err = laser_controller_board_dac_write_command(
+        LASER_CONTROLLER_DAC_CONFIG_REG,
+        LASER_CONTROLLER_DAC_CONFIG_DEFAULT);
+    if (err != ESP_OK) {
+        s_dac_last_error = err;
+        return err;
+    }
+
+    err = laser_controller_board_dac_write_command(
+        LASER_CONTROLLER_DAC_GAIN_REG,
+        LASER_CONTROLLER_DAC_GAIN_DEFAULT);
+    if (err != ESP_OK) {
+        s_dac_last_error = err;
+        return err;
+    }
+
+    err = laser_controller_board_dac_write_command(
+        LASER_CONTROLLER_DAC_DATA_A_REG,
+        LASER_CONTROLLER_DAC_ZERO_SCALE_CODE);
+    if (err != ESP_OK) {
+        s_dac_last_error = err;
+        return err;
+    }
+
+    err = laser_controller_board_dac_write_command(
+        LASER_CONTROLLER_DAC_DATA_B_REG,
+        LASER_CONTROLLER_DAC_ZERO_SCALE_CODE);
+    if (err != ESP_OK) {
+        s_dac_last_error = err;
+        return err;
+    }
+
+    err = laser_controller_board_dac_check_status();
+    if (err != ESP_OK) {
+        s_dac_last_error = err;
+        return err;
+    }
+
+    s_last_ld_voltage_v = 0.0f;
+    s_last_tec_voltage_v = 0.0f;
+    s_dac_ready = true;
+    s_dac_last_error = ESP_OK;
+    laser_controller_board_capture_dac_readback(true);
+    laser_controller_board_service_report_probe(
+        LASER_CONTROLLER_MODULE_DAC,
+        true,
+        true);
+    return ESP_OK;
+}
+
+static uint16_t laser_controller_board_voltage_to_dac_code(float voltage_v)
+{
+    const float clamped =
+        laser_controller_board_clamp_float(
+            voltage_v,
+            0.0f,
+            LASER_CONTROLLER_DAC_FULL_SCALE_V);
+    const float ratio = clamped / LASER_CONTROLLER_DAC_FULL_SCALE_V;
+    const uint32_t code =
+        (uint32_t)lroundf(ratio * (float)LASER_CONTROLLER_DAC_CODE_MAX);
+
+    return (uint16_t)(code > LASER_CONTROLLER_DAC_CODE_MAX ?
+                          LASER_CONTROLLER_DAC_CODE_MAX :
+                          code);
+}
+
+static esp_err_t laser_controller_board_read_adc_voltage(
+    adc_channel_t channel,
+    float *voltage_v)
+{
+    int raw = 0;
+    esp_err_t err;
+
+    if (voltage_v == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    err = laser_controller_board_ensure_adc_ready();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = adc_oneshot_read(s_adc_handle, channel, &raw);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    raw = raw < 0 ? 0 : raw;
+    *voltage_v = ((float)raw / 4095.0f) * 3.3f;
+    return ESP_OK;
+}
+
+static float laser_controller_board_lookup_tec_temp_c(float voltage_v)
+{
+    if (voltage_v <= kTecTempCalibration[0].voltage_v) {
+        return kTecTempCalibration[0].temp_c;
+    }
+
+    for (size_t index = 1U;
+         index < sizeof(kTecTempCalibration) / sizeof(kTecTempCalibration[0]);
+         ++index) {
+        const float low_v = kTecTempCalibration[index - 1U].voltage_v;
+        const float high_v = kTecTempCalibration[index].voltage_v;
+
+        if (voltage_v <= high_v) {
+            const float low_t = kTecTempCalibration[index - 1U].temp_c;
+            const float high_t = kTecTempCalibration[index].temp_c;
+            const float ratio =
+                high_v > low_v ? (voltage_v - low_v) / (high_v - low_v) : 0.0f;
+            return low_t + ((high_t - low_t) * ratio);
+        }
+    }
+
+    return kTecTempCalibration[
+               (sizeof(kTecTempCalibration) / sizeof(kTecTempCalibration[0])) - 1U]
+        .temp_c;
+}
+
+static float laser_controller_board_decode_cc_current_a(uint8_t cc_status)
+{
+    const uint8_t cc1_state = (uint8_t)(cc_status & 0x03U);
+    const uint8_t cc2_state = (uint8_t)((cc_status >> 2U) & 0x03U);
+    const uint8_t active_state = cc1_state > cc2_state ? cc1_state : cc2_state;
+
+    switch (active_state) {
+        case 0x01U:
+            return 0.5f;
+        case 0x02U:
+            return 1.5f;
+        case 0x03U:
+            return 3.0f;
+        default:
+            return 0.0f;
+    }
+}
+
+static bool laser_controller_board_decode_pdo(
+    const uint8_t *bytes,
+    laser_controller_pd_pdo_t *pdo)
+{
+    uint32_t word;
+
+    if (bytes == NULL || pdo == NULL) {
+        return false;
+    }
+
+    word = (uint32_t)bytes[0] |
+           ((uint32_t)bytes[1] << 8U) |
+           ((uint32_t)bytes[2] << 16U) |
+           ((uint32_t)bytes[3] << 24U);
+    pdo->voltage_v = (float)((word >> 10U) & 0x3FFU) * 0.05f;
+    pdo->current_a = (float)(word & 0x3FFU) * 0.01f;
+    return pdo->voltage_v > 0.0f && pdo->current_a > 0.0f;
+}
+
+static uint32_t laser_controller_board_encode_fixed_pdo_word(
+    float voltage_v,
+    float current_a)
+{
+    const uint32_t voltage_steps =
+        (uint32_t)lroundf(
+            laser_controller_board_clamp_float(voltage_v, 0.0f, 20.0f) / 0.05f);
+    const uint32_t current_steps =
+        (uint32_t)lroundf(
+            laser_controller_board_clamp_float(current_a, 0.0f, 5.0f) / 0.01f);
+
+    return ((voltage_steps & 0x3FFU) << 10U) | (current_steps & 0x3FFU);
+}
+
+static void laser_controller_board_encode_fixed_pdo_bytes(
+    float voltage_v,
+    float current_a,
+    uint8_t *bytes)
+{
+    const uint32_t word =
+        laser_controller_board_encode_fixed_pdo_word(voltage_v, current_a);
+
+    if (bytes == NULL) {
+        return;
+    }
+
+    bytes[0] = (uint8_t)(word & 0xFFU);
+    bytes[1] = (uint8_t)((word >> 8U) & 0xFFU);
+    bytes[2] = (uint8_t)((word >> 16U) & 0xFFU);
+    bytes[3] = (uint8_t)((word >> 24U) & 0xFFU);
+}
+
+static void laser_controller_board_normalize_pd_profiles(
+    const laser_controller_service_pd_profile_t *profiles,
+    laser_controller_service_pd_profile_t *normalized_profiles,
+    uint8_t *profile_count)
+{
+    uint8_t normalized_count = 1U;
+
+    if (normalized_profiles == NULL) {
+        return;
+    }
+
+    memset(
+        normalized_profiles,
+        0,
+        sizeof(*normalized_profiles) * LASER_CONTROLLER_SERVICE_PD_PROFILE_COUNT);
+
+    normalized_profiles[0].enabled = true;
+    normalized_profiles[0].voltage_v = 5.0f;
+    normalized_profiles[0].current_a =
+        profiles != NULL && profiles[0].current_a > 0.0f ?
+            laser_controller_board_clamp_float(profiles[0].current_a, 0.5f, 5.0f) :
+            3.0f;
+
+    if (profiles != NULL && profiles[1].enabled) {
+        normalized_profiles[1].enabled = true;
+        normalized_profiles[1].voltage_v =
+            laser_controller_board_clamp_float(profiles[1].voltage_v, 5.0f, 20.0f);
+        normalized_profiles[1].current_a =
+            laser_controller_board_clamp_float(profiles[1].current_a, 0.5f, 5.0f);
+        normalized_count = 2U;
+    }
+
+    if (profiles != NULL && normalized_profiles[1].enabled && profiles[2].enabled) {
+        normalized_profiles[2].enabled = true;
+        normalized_profiles[2].voltage_v =
+            laser_controller_board_clamp_float(profiles[2].voltage_v, 5.0f, 20.0f);
+        normalized_profiles[2].current_a =
+            laser_controller_board_clamp_float(profiles[2].current_a, 0.5f, 5.0f);
+        normalized_count = 3U;
+    }
+
+    if (profile_count != NULL) {
+        *profile_count = normalized_count;
+    }
+}
+
+static esp_err_t laser_controller_board_stusb_send_soft_reset(void)
+{
+    const uint8_t tx_header_payload[2] = {
+        LASER_CONTROLLER_STUSB_TX_HEADER_LOW_REG,
+        LASER_CONTROLLER_STUSB_SOFT_RESET_PAYLOAD,
+    };
+    const uint8_t command_payload[2] = {
+        LASER_CONTROLLER_STUSB_PD_COMMAND_CTRL_REG,
+        LASER_CONTROLLER_STUSB_SEND_COMMAND,
+    };
+    esp_err_t err;
+
+    err = laser_controller_board_i2c_write(
+        LASER_CONTROLLER_STUSB4500_ADDR,
+        tx_header_payload,
+        sizeof(tx_header_payload));
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    return laser_controller_board_i2c_write(
+        LASER_CONTROLLER_STUSB4500_ADDR,
+        command_payload,
+        sizeof(command_payload));
+}
+
+static void laser_controller_board_refresh_pd_snapshot(laser_controller_time_ms_t now_ms)
+{
+    uint8_t cc_status = 0U;
+    uint8_t pdo_count = 0U;
+    uint8_t rdo_bytes[4] = { 0 };
+    uint8_t pdo_bytes[12] = { 0 };
+    laser_controller_pd_pdo_t candidates[LASER_CONTROLLER_SERVICE_PD_PROFILE_COUNT] = { 0 };
+    float cc_current_a = 0.0f;
+    esp_err_t err;
+
+    if ((now_ms - s_pd_snapshot.updated_ms) < LASER_CONTROLLER_PD_POLL_MS) {
+        return;
+    }
+
+    memset(&s_pd_snapshot, 0, sizeof(s_pd_snapshot));
+    laser_controller_board_clear_pd_readback();
+    s_pd_snapshot.updated_ms = now_ms;
+
+    if (!laser_controller_service_module_expected(LASER_CONTROLLER_MODULE_PD)) {
+        return;
+    }
+
+    err = laser_controller_board_i2c_probe(LASER_CONTROLLER_STUSB4500_ADDR);
+    if (err != ESP_OK) {
+        laser_controller_board_service_report_probe(
+            LASER_CONTROLLER_MODULE_PD,
+            false,
+            false);
+        return;
+    }
+    s_pd_readback.reachable = true;
+    laser_controller_board_service_report_probe(
+        LASER_CONTROLLER_MODULE_PD,
+        true,
+        true);
+
+    err = laser_controller_board_i2c_read_reg_u8(
+        LASER_CONTROLLER_STUSB4500_ADDR,
+        LASER_CONTROLLER_STUSB_CC_STATUS_REG,
+        &cc_status);
+    if (err != ESP_OK) {
+        laser_controller_board_service_report_probe(
+            LASER_CONTROLLER_MODULE_PD,
+            true,
+            false);
+        return;
+    }
+    s_pd_readback.cc_status_reg = cc_status;
+
+    cc_current_a = laser_controller_board_decode_cc_current_a(cc_status);
+    s_pd_snapshot.attached = cc_current_a > 0.0f;
+    s_pd_readback.attached = s_pd_snapshot.attached;
+    if (!s_pd_snapshot.attached) {
+        return;
+    }
+
+    err = laser_controller_board_i2c_read_reg_u8(
+        LASER_CONTROLLER_STUSB4500_ADDR,
+        LASER_CONTROLLER_STUSB_DPM_PDO_NUMB,
+        &pdo_count);
+    if (err != ESP_OK) {
+        laser_controller_board_service_report_probe(
+            LASER_CONTROLLER_MODULE_PD,
+            true,
+            false);
+        return;
+    }
+    s_pd_readback.pdo_count_reg = pdo_count;
+
+    s_pd_snapshot.sink_profile_count = (uint8_t)(pdo_count & 0x07U);
+    if (s_pd_snapshot.sink_profile_count > LASER_CONTROLLER_SERVICE_PD_PROFILE_COUNT) {
+        s_pd_snapshot.sink_profile_count = LASER_CONTROLLER_SERVICE_PD_PROFILE_COUNT;
+    }
+
+    if (s_pd_snapshot.sink_profile_count > 0U) {
+        err = laser_controller_board_i2c_read_stusb_block(
+            LASER_CONTROLLER_STUSB_DPM_PDO1_0,
+            pdo_bytes,
+            sizeof(pdo_bytes));
+        if (err != ESP_OK) {
+            laser_controller_board_service_report_probe(
+                LASER_CONTROLLER_MODULE_PD,
+                true,
+                false);
+            return;
+        }
+
+        for (uint8_t index = 0U;
+             index < LASER_CONTROLLER_SERVICE_PD_PROFILE_COUNT;
+             ++index) {
+            const bool valid =
+                index < s_pd_snapshot.sink_profile_count &&
+                laser_controller_board_decode_pdo(
+                    &pdo_bytes[(size_t)index * 4U],
+                    &candidates[index]);
+
+            s_pd_snapshot.sink_profiles[index].enabled = valid;
+            s_pd_snapshot.sink_profiles[index].voltage_v =
+                valid ? candidates[index].voltage_v : 0.0f;
+            s_pd_snapshot.sink_profiles[index].current_a =
+                valid ? candidates[index].current_a : 0.0f;
+        }
+    }
+
+    err = laser_controller_board_i2c_read_stusb_block(
+        LASER_CONTROLLER_STUSB_RDO_STATUS_0,
+        rdo_bytes,
+        sizeof(rdo_bytes));
+    if (err != ESP_OK) {
+        laser_controller_board_service_report_probe(
+            LASER_CONTROLLER_MODULE_PD,
+            true,
+            false);
+        return;
+    }
+
+    {
+        const uint32_t rdo =
+            (uint32_t)rdo_bytes[0] |
+            ((uint32_t)rdo_bytes[1] << 8U) |
+            ((uint32_t)rdo_bytes[2] << 16U) |
+            ((uint32_t)rdo_bytes[3] << 24U);
+        const uint8_t object_position = (uint8_t)((rdo >> 28U) & 0x07U);
+        const float operating_current_a = (float)((rdo >> 10U) & 0x3FFU) * 0.01f;
+        const float max_current_a = (float)(rdo & 0x3FFU) * 0.01f;
+
+        s_pd_readback.rdo_status_raw = rdo;
+        s_pd_snapshot.contract_object_position = object_position;
+        s_pd_snapshot.operating_current_a = operating_current_a;
+        if (object_position == 0U) {
+            s_pd_snapshot.contract_valid = true;
+            s_pd_snapshot.host_only = cc_current_a <= 0.5f;
+            s_pd_snapshot.source_voltage_v = 5.0f;
+            s_pd_snapshot.source_current_a = cc_current_a;
+            s_pd_snapshot.operating_current_a = cc_current_a;
+            s_pd_snapshot.negotiated_power_w = 5.0f * cc_current_a;
+            return;
+        }
+
+        s_pd_snapshot.contract_valid = true;
+        s_pd_snapshot.host_only = false;
+        s_pd_snapshot.source_current_a =
+            max_current_a > 0.0f ? max_current_a : operating_current_a;
+
+        if (object_position <= s_pd_snapshot.sink_profile_count &&
+            candidates[object_position - 1U].voltage_v >= 5.0f) {
+            s_pd_snapshot.source_voltage_v =
+                candidates[object_position - 1U].voltage_v;
+        } else {
+            s_pd_snapshot.source_voltage_v = 5.0f;
+            for (int index = (int)s_pd_snapshot.sink_profile_count - 1;
+                 index >= 0;
+                 --index) {
+                if (candidates[index].voltage_v >= 5.0f &&
+                    candidates[index].current_a + 0.01f >= operating_current_a) {
+                    s_pd_snapshot.source_voltage_v = candidates[index].voltage_v;
+                    break;
+                }
+            }
+        }
+
+        s_pd_snapshot.negotiated_power_w =
+            s_pd_snapshot.source_voltage_v * operating_current_a;
+    }
+}
+
+static esp_err_t laser_controller_board_imu_transfer(
+    uint8_t reg,
+    uint8_t *value,
+    bool write)
+{
+    uint8_t tx_data[2] = { 0 };
+    uint8_t rx_data[2] = { 0 };
+    spi_transaction_t transaction = { 0 };
+    esp_err_t err;
+
+    if (value == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    err = laser_controller_board_ensure_spi_ready();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    tx_data[0] = write ? (uint8_t)(reg & 0x7FU) : (uint8_t)(reg | 0x80U);
+    tx_data[1] = *value;
+
+    transaction.length = 16U;
+    transaction.tx_buffer = tx_data;
+    transaction.rx_buffer = rx_data;
+
+    laser_controller_board_lock_bus();
+    err = spi_device_transmit(s_imu_spi, &transaction);
+    laser_controller_board_unlock_bus();
+
+    if (err == ESP_OK && !write) {
+        *value = rx_data[1];
+    }
+
+    return err;
+}
+
+static esp_err_t laser_controller_board_imu_read_block(
+    uint8_t start_reg,
+    uint8_t *buffer,
+    size_t len)
+{
+    uint8_t tx_data[16] = { 0 };
+    uint8_t rx_data[16] = { 0 };
+    spi_transaction_t transaction = { 0 };
+    esp_err_t err;
+
+    if (buffer == NULL || len == 0U || len > 15U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    err = laser_controller_board_ensure_spi_ready();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    tx_data[0] = (uint8_t)(start_reg | 0x80U);
+    transaction.length = (uint32_t)((len + 1U) * 8U);
+    transaction.tx_buffer = tx_data;
+    transaction.rx_buffer = rx_data;
+
+    laser_controller_board_lock_bus();
+    err = spi_device_transmit(s_imu_spi, &transaction);
+    laser_controller_board_unlock_bus();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    memcpy(buffer, &rx_data[1], len);
+    return ESP_OK;
+}
+
+static void laser_controller_board_apply_axis_transform(
+    const laser_controller_config_t *config,
+    const float imu_vector[3],
+    float beam_vector[3])
+{
+    if (beam_vector == NULL || imu_vector == NULL) {
+        return;
+    }
+
+    if (config == NULL) {
+        beam_vector[0] = imu_vector[0];
+        beam_vector[1] = imu_vector[1];
+        beam_vector[2] = imu_vector[2];
+        return;
+    }
+
+    for (size_t row = 0U; row < 3U; ++row) {
+        beam_vector[row] =
+            (config->axis_transform.beam_from_imu[row][0] * imu_vector[0]) +
+            (config->axis_transform.beam_from_imu[row][1] * imu_vector[1]) +
+            (config->axis_transform.beam_from_imu[row][2] * imu_vector[2]);
+    }
+}
+
+static laser_controller_radians_t laser_controller_board_compute_beam_pitch(
+    const laser_controller_config_t *config,
+    const float accel_g[3])
+{
+    float beam_accel[3] = { 0.0f, 0.0f, 0.0f };
+    float norm;
+    float normalized_forward_gravity;
+
+    laser_controller_board_apply_axis_transform(config, accel_g, beam_accel);
+    norm = sqrtf(
+        (beam_accel[0] * beam_accel[0]) +
+        (beam_accel[1] * beam_accel[1]) +
+        (beam_accel[2] * beam_accel[2]));
+    if (norm < 0.001f) {
+        return 0.0f;
+    }
+
+    normalized_forward_gravity =
+        laser_controller_board_clamp_float(-beam_accel[0] / norm, -1.0f, 1.0f);
+    return asinf(normalized_forward_gravity);
+}
+
+static laser_controller_radians_t laser_controller_board_compute_beam_roll(
+    const laser_controller_config_t *config,
+    const float accel_g[3])
+{
+    float beam_accel[3] = { 0.0f, 0.0f, 0.0f };
+    float norm;
+
+    laser_controller_board_apply_axis_transform(config, accel_g, beam_accel);
+    norm = sqrtf(
+        (beam_accel[0] * beam_accel[0]) +
+        (beam_accel[1] * beam_accel[1]) +
+        (beam_accel[2] * beam_accel[2]));
+    if (norm < 0.001f) {
+        return 0.0f;
+    }
+
+    return atan2f(beam_accel[1], -beam_accel[2]);
+}
+
+static laser_controller_radians_t laser_controller_board_wrap_radians(
+    laser_controller_radians_t angle_rad)
+{
+    while (angle_rad > LASER_CONTROLLER_PI_RAD) {
+        angle_rad -= LASER_CONTROLLER_TWO_PI_RAD;
+    }
+
+    while (angle_rad < -LASER_CONTROLLER_PI_RAD) {
+        angle_rad += LASER_CONTROLLER_TWO_PI_RAD;
+    }
+
+    return angle_rad;
+}
+
+static esp_err_t laser_controller_board_ensure_imu_runtime_ready(void)
+{
+    uint8_t value = 0U;
+    uint8_t ctrl1_xl = 0U;
+    uint8_t ctrl2_g = 0U;
+    uint8_t ctrl3_c = 0U;
+    uint8_t ctrl4_c = 0U;
+    uint8_t ctrl10_c = 0U;
+    const laser_controller_time_ms_t now_ms = laser_controller_board_uptime_ms();
+    esp_err_t err;
+
+    if (s_imu_runtime.config.odr_hz == 0U) {
+        laser_controller_board_load_default_imu_config(&s_imu_runtime.config);
+    }
+
+    if (s_imu_runtime.configured) {
+        s_imu_readback.reachable = true;
+        s_imu_readback.configured = true;
+        return ESP_OK;
+    }
+
+    if (s_imu_runtime.last_error != ESP_OK &&
+        (now_ms - s_imu_runtime.last_attempt_ms) < LASER_CONTROLLER_IMU_RETRY_MS) {
+        return s_imu_runtime.last_error;
+    }
+
+    s_imu_runtime.last_attempt_ms = now_ms;
+    err = laser_controller_board_imu_spi_read(
+        LASER_CONTROLLER_LSM6DSO_WHOAMI_REG,
+        &value);
+    s_imu_readback.who_am_i = value;
+    if (err != ESP_OK || value != LASER_CONTROLLER_LSM6DSO_WHOAMI_VALUE) {
+        s_imu_runtime.last_error =
+            err == ESP_OK ? ESP_ERR_INVALID_RESPONSE : err;
+        s_imu_readback.last_error = (int32_t)s_imu_runtime.last_error;
+        s_imu_runtime.identified = false;
+        laser_controller_board_service_report_probe(
+            LASER_CONTROLLER_MODULE_IMU,
+            false,
+            false);
+        return s_imu_runtime.last_error;
+    }
+
+    s_imu_readback.reachable = true;
+
+    value = LASER_CONTROLLER_LSM6DSO_RESET_BIT;
+    err = laser_controller_board_imu_spi_write(
+        LASER_CONTROLLER_LSM6DSO_CTRL3_C_REG,
+        value);
+    if (err != ESP_OK) {
+        s_imu_runtime.last_error = err;
+        return err;
+    }
+
+    for (uint32_t attempt = 0U; attempt < 20U; ++attempt) {
+        esp_rom_delay_us(1000U);
+        value = 0U;
+        err = laser_controller_board_imu_spi_read(
+            LASER_CONTROLLER_LSM6DSO_CTRL3_C_REG,
+            &value);
+        if (err != ESP_OK) {
+            s_imu_runtime.last_error = err;
+            s_imu_readback.last_error = (int32_t)err;
+            return err;
+        }
+        if ((value & LASER_CONTROLLER_LSM6DSO_RESET_BIT) == 0U) {
+            break;
+        }
+        if (attempt == 19U) {
+            s_imu_runtime.last_error = ESP_ERR_TIMEOUT;
+            return ESP_ERR_TIMEOUT;
+        }
+    }
+
+    ctrl1_xl = (uint8_t)(
+        (laser_controller_board_imu_odr_bits(s_imu_runtime.config.odr_hz) << 4U) |
+        (laser_controller_board_imu_accel_fs_bits(
+             s_imu_runtime.config.accel_range_g) << 2U) |
+        (s_imu_runtime.config.lpf2_enabled ? 0x02U : 0x00U));
+    ctrl2_g = laser_controller_board_imu_gyro_ctrl2_value(
+        s_imu_runtime.config.odr_hz,
+        s_imu_runtime.config.gyro_range_dps,
+        s_imu_runtime.config.gyro_enabled);
+    ctrl3_c = (uint8_t)(
+        (s_imu_runtime.config.bdu_enabled ? LASER_CONTROLLER_LSM6DSO_BDU_BIT : 0U) |
+        (s_imu_runtime.config.if_inc_enabled ? LASER_CONTROLLER_LSM6DSO_IF_INC_BIT : 0U));
+    ctrl4_c = s_imu_runtime.config.i2c_disabled ?
+                  LASER_CONTROLLER_LSM6DSO_I2C_DISABLE_BIT :
+                  0U;
+    ctrl10_c = s_imu_runtime.config.timestamp_enabled ?
+                   LASER_CONTROLLER_LSM6DSO_TIMESTAMP_BIT :
+                   0U;
+
+    err = laser_controller_board_imu_spi_write(
+        LASER_CONTROLLER_LSM6DSO_CTRL3_C_REG,
+        ctrl3_c);
+    if (err == ESP_OK) {
+        err = laser_controller_board_imu_spi_write(
+            LASER_CONTROLLER_LSM6DSO_CTRL4_C_REG,
+            ctrl4_c);
+    }
+    if (err == ESP_OK) {
+        err = laser_controller_board_imu_spi_write(
+            LASER_CONTROLLER_LSM6DSO_CTRL10_C_REG,
+            ctrl10_c);
+    }
+    if (err == ESP_OK) {
+        err = laser_controller_board_imu_spi_write(
+            LASER_CONTROLLER_LSM6DSO_CTRL2_G_REG,
+            ctrl2_g);
+    }
+    if (err == ESP_OK) {
+        err = laser_controller_board_imu_spi_write(
+            LASER_CONTROLLER_LSM6DSO_CTRL1_XL_REG,
+            ctrl1_xl);
+    }
+    if (err != ESP_OK) {
+        s_imu_runtime.last_error = err;
+        s_imu_readback.last_error = (int32_t)err;
+        s_imu_runtime.configured = false;
+        return err;
+    }
+
+    s_imu_runtime.identified = true;
+    s_imu_runtime.configured = true;
+    s_imu_runtime.last_error = ESP_OK;
+    s_imu_readback.configured = true;
+    s_imu_readback.ctrl1_xl_reg = ctrl1_xl;
+    s_imu_readback.ctrl2_g_reg = ctrl2_g;
+    s_imu_readback.ctrl3_c_reg = ctrl3_c;
+    s_imu_readback.ctrl4_c_reg = ctrl4_c;
+    s_imu_readback.ctrl10_c_reg = ctrl10_c;
+    s_imu_readback.last_error = ESP_OK;
+    laser_controller_board_service_report_probe(
+        LASER_CONTROLLER_MODULE_IMU,
+        true,
+        true);
+    return ESP_OK;
+}
+
+static void laser_controller_board_read_imu_inputs(
+    laser_controller_board_inputs_t *inputs,
+    const laser_controller_config_t *config,
+    laser_controller_time_ms_t now_ms)
+{
+    laser_controller_service_status_t service_status;
+    uint8_t status_reg = 0U;
+    uint8_t raw_bytes[12] = { 0 };
+    esp_err_t err;
+
+    if (inputs == NULL) {
+        return;
+    }
+
+    laser_controller_service_copy_status(&service_status);
+    if (s_imu_runtime.config.odr_hz != service_status.imu_odr_hz ||
+        s_imu_runtime.config.accel_range_g != service_status.imu_accel_range_g ||
+        s_imu_runtime.config.gyro_range_dps != service_status.imu_gyro_range_dps ||
+        s_imu_runtime.config.gyro_enabled != service_status.imu_gyro_enabled ||
+        s_imu_runtime.config.lpf2_enabled != service_status.imu_lpf2_enabled ||
+        s_imu_runtime.config.timestamp_enabled !=
+            service_status.imu_timestamp_enabled ||
+        s_imu_runtime.config.bdu_enabled != service_status.imu_bdu_enabled ||
+        s_imu_runtime.config.if_inc_enabled != service_status.imu_if_inc_enabled ||
+        s_imu_runtime.config.i2c_disabled != service_status.imu_i2c_disabled) {
+        s_imu_runtime.config.odr_hz = service_status.imu_odr_hz;
+        s_imu_runtime.config.accel_range_g = service_status.imu_accel_range_g;
+        s_imu_runtime.config.gyro_range_dps = service_status.imu_gyro_range_dps;
+        s_imu_runtime.config.gyro_enabled = service_status.imu_gyro_enabled;
+        s_imu_runtime.config.lpf2_enabled = service_status.imu_lpf2_enabled;
+        s_imu_runtime.config.timestamp_enabled =
+            service_status.imu_timestamp_enabled;
+        s_imu_runtime.config.bdu_enabled = service_status.imu_bdu_enabled;
+        s_imu_runtime.config.if_inc_enabled = service_status.imu_if_inc_enabled;
+        s_imu_runtime.config.i2c_disabled = service_status.imu_i2c_disabled;
+        s_imu_runtime.configured = false;
+        s_imu_runtime.identified = false;
+        s_imu_runtime.last_error = ESP_OK;
+        s_imu_runtime.last_attempt_ms = 0U;
+        s_imu_runtime.last_sample_ms = 0U;
+        s_imu_runtime.last_orientation_ms = 0U;
+        memset(s_imu_runtime.accel_g, 0, sizeof(s_imu_runtime.accel_g));
+        memset(s_imu_runtime.gyro_dps, 0, sizeof(s_imu_runtime.gyro_dps));
+        s_imu_runtime.beam_pitch_rad = 0.0f;
+        s_imu_runtime.beam_roll_rad = 0.0f;
+        s_imu_runtime.beam_yaw_rad = 0.0f;
+    }
+
+    err = laser_controller_board_ensure_imu_runtime_ready();
+    if (err != ESP_OK) {
+        s_imu_readback.last_error = (int32_t)err;
+        inputs->imu_data_valid = false;
+        inputs->imu_data_fresh = false;
+        inputs->beam_pitch_rad = 0.0f;
+        inputs->beam_roll_rad = 0.0f;
+        inputs->beam_yaw_rad = 0.0f;
+        return;
+    }
+
+    err = laser_controller_board_imu_spi_read(
+        LASER_CONTROLLER_LSM6DSO_STATUS_REG,
+        &status_reg);
+    if (err == ESP_OK) {
+        s_imu_readback.status_reg = status_reg;
+        s_imu_readback.last_error = ESP_OK;
+    }
+    if (err == ESP_OK &&
+        (((status_reg & LASER_CONTROLLER_LSM6DSO_XLDA_BIT) != 0U) ||
+         (s_imu_runtime.config.gyro_enabled &&
+          (status_reg & LASER_CONTROLLER_LSM6DSO_GDA_BIT) != 0U) ||
+         s_imu_runtime.last_sample_ms == 0U)) {
+        err = laser_controller_board_imu_read_block(
+            s_imu_runtime.config.gyro_enabled ?
+                LASER_CONTROLLER_LSM6DSO_OUTX_L_G_REG :
+                LASER_CONTROLLER_LSM6DSO_OUTX_L_A_REG,
+            raw_bytes,
+            s_imu_runtime.config.gyro_enabled ? 12U : 6U);
+        if (err == ESP_OK) {
+            const float g_per_lsb =
+                laser_controller_board_imu_accel_g_per_lsb(
+                    s_imu_runtime.config.accel_range_g);
+            const size_t accel_offset =
+                s_imu_runtime.config.gyro_enabled ? 6U : 0U;
+            const int16_t raw_accel_x =
+                (int16_t)(((uint16_t)raw_bytes[accel_offset + 1U] << 8U) |
+                          raw_bytes[accel_offset + 0U]);
+            const int16_t raw_accel_y =
+                (int16_t)(((uint16_t)raw_bytes[accel_offset + 3U] << 8U) |
+                          raw_bytes[accel_offset + 2U]);
+            const int16_t raw_accel_z =
+                (int16_t)(((uint16_t)raw_bytes[accel_offset + 5U] << 8U) |
+                          raw_bytes[accel_offset + 4U]);
+
+            s_imu_runtime.accel_g[0] = (float)raw_accel_x * g_per_lsb;
+            s_imu_runtime.accel_g[1] = (float)raw_accel_y * g_per_lsb;
+            s_imu_runtime.accel_g[2] = (float)raw_accel_z * g_per_lsb;
+
+            if (s_imu_runtime.config.gyro_enabled) {
+                const float dps_per_lsb =
+                    laser_controller_board_imu_gyro_dps_per_lsb(
+                        s_imu_runtime.config.gyro_range_dps);
+                const int16_t raw_gyro_x =
+                    (int16_t)(((uint16_t)raw_bytes[1] << 8U) | raw_bytes[0]);
+                const int16_t raw_gyro_y =
+                    (int16_t)(((uint16_t)raw_bytes[3] << 8U) | raw_bytes[2]);
+                const int16_t raw_gyro_z =
+                    (int16_t)(((uint16_t)raw_bytes[5] << 8U) | raw_bytes[4]);
+                float beam_gyro_dps[3] = { 0.0f, 0.0f, 0.0f };
+
+                s_imu_runtime.gyro_dps[0] = (float)raw_gyro_x * dps_per_lsb;
+                s_imu_runtime.gyro_dps[1] = (float)raw_gyro_y * dps_per_lsb;
+                s_imu_runtime.gyro_dps[2] = (float)raw_gyro_z * dps_per_lsb;
+                laser_controller_board_apply_axis_transform(
+                    config,
+                    s_imu_runtime.gyro_dps,
+                    beam_gyro_dps);
+                if (s_imu_runtime.last_orientation_ms > 0U &&
+                    now_ms > s_imu_runtime.last_orientation_ms) {
+                    const float dt_s =
+                        (float)(now_ms - s_imu_runtime.last_orientation_ms) / 1000.0f;
+                    s_imu_runtime.beam_yaw_rad = laser_controller_board_wrap_radians(
+                        s_imu_runtime.beam_yaw_rad +
+                        (beam_gyro_dps[2] * dt_s * LASER_CONTROLLER_RAD_PER_DEG));
+                }
+            } else {
+                memset(s_imu_runtime.gyro_dps, 0, sizeof(s_imu_runtime.gyro_dps));
+                s_imu_runtime.beam_yaw_rad = 0.0f;
+            }
+
+            s_imu_runtime.beam_pitch_rad = laser_controller_board_compute_beam_pitch(
+                config,
+                s_imu_runtime.accel_g);
+            s_imu_runtime.beam_roll_rad = laser_controller_board_compute_beam_roll(
+                config,
+                s_imu_runtime.accel_g);
+            s_imu_runtime.last_sample_ms = now_ms;
+            s_imu_runtime.last_orientation_ms = now_ms;
+        }
+    }
+
+    if (err != ESP_OK) {
+        s_imu_readback.last_error = (int32_t)err;
+        laser_controller_board_service_report_probe(
+            LASER_CONTROLLER_MODULE_IMU,
+            true,
+            false);
+        inputs->imu_data_valid = false;
+        inputs->imu_data_fresh = false;
+        inputs->beam_pitch_rad = 0.0f;
+        inputs->beam_roll_rad = 0.0f;
+        inputs->beam_yaw_rad = 0.0f;
+        return;
+    }
+
+    if (s_imu_runtime.last_sample_ms > 0U) {
+        const float norm_g = sqrtf(
+            (s_imu_runtime.accel_g[0] * s_imu_runtime.accel_g[0]) +
+            (s_imu_runtime.accel_g[1] * s_imu_runtime.accel_g[1]) +
+            (s_imu_runtime.accel_g[2] * s_imu_runtime.accel_g[2]));
+        const uint32_t stale_ms =
+            config != NULL ? config->timeouts.imu_stale_ms : 50U;
+
+        inputs->imu_data_valid = norm_g > 0.35f && norm_g < 1.65f;
+        inputs->imu_data_fresh =
+            (now_ms - s_imu_runtime.last_sample_ms) <= stale_ms;
+        inputs->beam_pitch_rad =
+            inputs->imu_data_valid ? s_imu_runtime.beam_pitch_rad : 0.0f;
+        inputs->beam_roll_rad =
+            inputs->imu_data_valid ? s_imu_runtime.beam_roll_rad : 0.0f;
+        inputs->beam_yaw_rad =
+            inputs->imu_data_valid && s_imu_runtime.config.gyro_enabled ?
+                s_imu_runtime.beam_yaw_rad :
+                0.0f;
+        laser_controller_board_service_report_probe(
+            LASER_CONTROLLER_MODULE_IMU,
+            true,
+            inputs->imu_data_valid && inputs->imu_data_fresh);
+        return;
+    }
+
+    inputs->imu_data_valid = false;
+    inputs->imu_data_fresh = false;
+    inputs->beam_pitch_rad = 0.0f;
+    inputs->beam_roll_rad = 0.0f;
+    inputs->beam_yaw_rad = 0.0f;
+}
+
+static uint8_t laser_controller_board_haptic_mode_value(
+    laser_controller_service_haptic_mode_t mode)
+{
+    switch (mode) {
+        case LASER_CONTROLLER_SERVICE_HAPTIC_MODE_INTERNAL_TRIGGER:
+            return 0x00U;
+        case LASER_CONTROLLER_SERVICE_HAPTIC_MODE_EXTERNAL_EDGE:
+            return 0x01U;
+        case LASER_CONTROLLER_SERVICE_HAPTIC_MODE_EXTERNAL_LEVEL:
+            return 0x02U;
+        case LASER_CONTROLLER_SERVICE_HAPTIC_MODE_PWM_ANALOG:
+            return 0x03U;
+        case LASER_CONTROLLER_SERVICE_HAPTIC_MODE_AUDIO_TO_VIBE:
+            return 0x04U;
+        case LASER_CONTROLLER_SERVICE_HAPTIC_MODE_RTP:
+            return 0x05U;
+        case LASER_CONTROLLER_SERVICE_HAPTIC_MODE_DIAGNOSTICS:
+            return 0x06U;
+        case LASER_CONTROLLER_SERVICE_HAPTIC_MODE_AUTO_CAL:
+            return 0x07U;
+        default:
+            return 0x00U;
+    }
+}
+
+static esp_err_t laser_controller_board_drv2605_write_reg(uint8_t reg, uint8_t value)
+{
+    uint8_t payload[2] = { reg, value };
+
+    return laser_controller_board_i2c_tx(
+        LASER_CONTROLLER_DRV2605_ADDR,
+        payload,
+        sizeof(payload));
+}
+
+static void laser_controller_board_disable_pcn_pwm_and_drive(bool low_current)
+{
+    if (s_pwm_active) {
+        (void)ledc_stop(
+            LASER_CONTROLLER_PCN_PWM_SPEED_MODE,
+            LASER_CONTROLLER_PCN_PWM_CHANNEL,
+            0U);
+        s_pwm_active = false;
+    }
+
+    (void)gpio_set_direction(LASER_CONTROLLER_GPIO_LD_PCN, GPIO_MODE_OUTPUT);
+    (void)gpio_set_level(
+        LASER_CONTROLLER_GPIO_LD_PCN,
+        low_current ? 0 : 1);
+}
+
+void laser_controller_board_init_safe_defaults(void)
+{
+    (void)memset(&s_mock_inputs, 0, sizeof(s_mock_inputs));
+    (void)memset(&s_imu_runtime, 0, sizeof(s_imu_runtime));
+    s_last_outputs = kSafeOutputs;
+    s_pd_snapshot.updated_ms = 0U;
+    s_last_ld_voltage_v = -1.0f;
+    s_last_tec_voltage_v = -1.0f;
+    s_dac_ready = false;
+    s_dac_last_error = ESP_OK;
+    s_dac_last_attempt_ms = 0U;
+    laser_controller_board_clear_dac_readback();
+    laser_controller_board_clear_pd_readback();
+    laser_controller_board_clear_imu_readback();
+    laser_controller_board_clear_haptic_readback();
+    laser_controller_board_load_default_imu_config(&s_imu_runtime.config);
+
+    if (s_bus_mutex == NULL) {
+        s_bus_mutex = xSemaphoreCreateMutexStatic(&s_bus_mutex_buffer);
+    }
+
+    (void)laser_controller_board_ensure_gpio_ready();
+    (void)laser_controller_board_ensure_adc_ready();
+    (void)laser_controller_board_ensure_i2c_ready();
+    (void)laser_controller_board_ensure_spi_ready();
+    laser_controller_board_disable_pcn_pwm_and_drive(true);
+}
+
+void laser_controller_board_read_inputs(
+    laser_controller_board_inputs_t *inputs,
+    const laser_controller_config_t *config)
+{
+    float voltage_v = 0.0f;
+    const laser_controller_time_ms_t now_ms = laser_controller_board_uptime_ms();
+    const bool laser_driver_expected =
+        laser_controller_service_module_expected(
+            LASER_CONTROLLER_MODULE_LASER_DRIVER);
+    const bool tec_expected =
+        laser_controller_service_module_expected(
+            LASER_CONTROLLER_MODULE_TEC);
+    const bool imu_expected =
+        laser_controller_service_module_expected(
+            LASER_CONTROLLER_MODULE_IMU);
+
+    if (inputs == NULL) {
+        return;
+    }
+
+    if (s_mock_override_enabled) {
+        *inputs = s_mock_inputs;
+        return;
+    }
+
+    memset(inputs, 0, sizeof(*inputs));
+    inputs->comms_alive = true;
+    inputs->watchdog_ok = true;
+    inputs->ld_rail_pgood =
+        gpio_get_level(LASER_CONTROLLER_GPIO_PWR_LD_PGOOD) != 0;
+    inputs->tec_rail_pgood =
+        gpio_get_level(LASER_CONTROLLER_GPIO_PWR_TEC_PGOOD) != 0;
+    inputs->tec_temp_good =
+        gpio_get_level(LASER_CONTROLLER_GPIO_TEC_TEMPGD) != 0;
+
+    if (laser_driver_expected || inputs->ld_rail_pgood) {
+        inputs->driver_loop_good =
+            gpio_get_level(LASER_CONTROLLER_GPIO_LD_LPGD) != 0;
+
+        if (laser_controller_board_read_adc_voltage(ADC_CHANNEL_0, &voltage_v) == ESP_OK) {
+            inputs->laser_driver_temp_c = 192.5576f - (90.1040f * voltage_v);
+        }
+
+        if (laser_controller_board_read_adc_voltage(ADC_CHANNEL_1, &voltage_v) == ESP_OK) {
+            inputs->measured_laser_current_a = 2.4f * voltage_v;
+        }
+    }
+
+    if (laser_controller_service_module_expected(LASER_CONTROLLER_MODULE_DAC)) {
+        laser_controller_board_capture_dac_readback(s_dac_ready);
+    } else {
+        laser_controller_board_clear_dac_readback();
+    }
+
+    if (tec_expected || inputs->tec_rail_pgood) {
+        if (laser_controller_board_read_adc_voltage(ADC_CHANNEL_7, &voltage_v) == ESP_OK) {
+            inputs->tec_temp_adc_voltage_v = voltage_v;
+            inputs->tec_temp_c = laser_controller_board_lookup_tec_temp_c(voltage_v);
+        }
+
+        if (laser_controller_board_read_adc_voltage(ADC_CHANNEL_8, &voltage_v) == ESP_OK) {
+            inputs->tec_current_a = (voltage_v - 1.25f) / 0.285f;
+        }
+
+        if (laser_controller_board_read_adc_voltage(ADC_CHANNEL_9, &voltage_v) == ESP_OK) {
+            inputs->tec_voltage_v = voltage_v * 2.0f;
+        }
+    }
+
+    if (imu_expected) {
+        laser_controller_board_read_imu_inputs(inputs, config, now_ms);
+    } else {
+        inputs->imu_data_valid = false;
+        inputs->imu_data_fresh = false;
+        inputs->beam_pitch_rad = 0.0f;
+        inputs->beam_roll_rad = 0.0f;
+        inputs->beam_yaw_rad = 0.0f;
+        laser_controller_board_clear_imu_readback();
+    }
+    inputs->tof_data_valid = false;
+    inputs->tof_data_fresh = false;
+    inputs->tof_distance_m = 0.0f;
+
+    laser_controller_board_capture_haptic_readback();
+    laser_controller_board_refresh_pd_snapshot(now_ms);
+    inputs->pd_contract_valid = s_pd_snapshot.contract_valid;
+    inputs->pd_source_is_host_only = s_pd_snapshot.host_only;
+    inputs->pd_negotiated_power_w = s_pd_snapshot.negotiated_power_w;
+    inputs->pd_source_voltage_v = s_pd_snapshot.source_voltage_v;
+    inputs->pd_source_current_a = s_pd_snapshot.source_current_a;
+    inputs->pd_operating_current_a = s_pd_snapshot.operating_current_a;
+    inputs->pd_contract_object_position = s_pd_snapshot.contract_object_position;
+    inputs->pd_sink_profile_count = s_pd_snapshot.sink_profile_count;
+    memcpy(
+        inputs->pd_sink_profiles,
+        s_pd_snapshot.sink_profiles,
+        sizeof(inputs->pd_sink_profiles));
+    inputs->dac = s_dac_readback;
+    inputs->pd_readback = s_pd_readback;
+    inputs->imu_readback = s_imu_readback;
+    inputs->haptic_readback = s_haptic_readback;
+}
+
+void laser_controller_board_apply_outputs(const laser_controller_board_outputs_t *outputs)
+{
+    if (outputs == NULL) {
+        return;
+    }
+
+    s_last_outputs = *outputs;
+    laser_controller_board_drive_safe_gpio_levels(outputs);
+}
+
+void laser_controller_board_get_last_outputs(laser_controller_board_outputs_t *outputs)
+{
+    if (outputs == NULL) {
+        return;
+    }
+
+    *outputs = s_last_outputs;
+}
+
+laser_controller_time_ms_t laser_controller_board_uptime_ms(void)
+{
+    return (laser_controller_time_ms_t)(esp_timer_get_time() / 1000LL);
+}
+
+esp_err_t laser_controller_board_i2c_probe(uint32_t address)
+{
+    esp_err_t err = ESP_OK;
+
+    for (uint32_t attempt = 0U; attempt < 2U; ++attempt) {
+        err = laser_controller_board_ensure_i2c_ready();
+        if (err != ESP_OK) {
+            if (attempt == 0U && laser_controller_board_i2c_error_needs_recovery(err)) {
+                laser_controller_board_recover_shared_i2c_bus();
+                continue;
+            }
+            return err;
+        }
+
+        laser_controller_board_lock_bus();
+        err = i2c_master_probe(
+            s_i2c_bus,
+            (uint16_t)(address & 0x7FU),
+            LASER_CONTROLLER_I2C_TIMEOUT_MS);
+        laser_controller_board_unlock_bus();
+
+        if (err == ESP_OK || !laser_controller_board_i2c_error_needs_recovery(err) ||
+            attempt > 0U) {
+            return err;
+        }
+
+        laser_controller_board_recover_shared_i2c_bus();
+    }
+
+    return err;
+}
+
+void laser_controller_board_get_shared_i2c_line_levels(
+    bool *sda_high,
+    bool *scl_high)
+{
+    laser_controller_board_get_shared_i2c_levels_internal(sda_high, scl_high);
+}
+
+esp_err_t laser_controller_board_i2c_write(
+    uint32_t address,
+    const uint8_t *tx_data,
+    size_t tx_len)
+{
+    return laser_controller_board_i2c_tx(address, tx_data, tx_len);
+}
+
+esp_err_t laser_controller_board_i2c_write_read(
+    uint32_t address,
+    const uint8_t *tx_data,
+    size_t tx_len,
+    uint8_t *rx_data,
+    size_t rx_len)
+{
+    return laser_controller_board_i2c_txrx(
+        address,
+        tx_data,
+        tx_len,
+        rx_data,
+        rx_len);
+}
+
+esp_err_t laser_controller_board_configure_pd_debug(
+    const laser_controller_service_pd_profile_t *profiles,
+    size_t profile_count)
+{
+    laser_controller_service_pd_profile_t
+        normalized_profiles[LASER_CONTROLLER_SERVICE_PD_PROFILE_COUNT];
+    uint8_t encoded_profile_count = 1U;
+    uint8_t count_payload[2] = {
+        LASER_CONTROLLER_STUSB_DPM_PDO_NUMB,
+        1U,
+    };
+    uint8_t single_pdo_payload[5] = { 0 };
+    uint8_t verify_count = 0U;
+    uint8_t pdo_payload[1U + (LASER_CONTROLLER_SERVICE_PD_PROFILE_COUNT * 4U)] = {
+        LASER_CONTROLLER_STUSB_DPM_PDO1_0,
+    };
+    uint8_t verify_pdo_payload[LASER_CONTROLLER_SERVICE_PD_PROFILE_COUNT * 4U] = { 0 };
+    esp_err_t err;
+
+    if (profiles == NULL ||
+        profile_count != LASER_CONTROLLER_SERVICE_PD_PROFILE_COUNT) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!laser_controller_service_module_write_enabled(LASER_CONTROLLER_MODULE_PD)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    err = laser_controller_board_i2c_probe(LASER_CONTROLLER_STUSB4500_ADDR);
+    if (err != ESP_OK) {
+        laser_controller_board_service_report_probe(
+            LASER_CONTROLLER_MODULE_PD,
+            false,
+            false);
+        return err;
+    }
+
+    laser_controller_board_normalize_pd_profiles(
+        profiles,
+        normalized_profiles,
+        &encoded_profile_count);
+
+    count_payload[1] = encoded_profile_count;
+    for (uint8_t index = 0U;
+         index < LASER_CONTROLLER_SERVICE_PD_PROFILE_COUNT;
+         ++index) {
+        laser_controller_board_encode_fixed_pdo_bytes(
+            normalized_profiles[index].enabled ?
+                normalized_profiles[index].voltage_v :
+                0.0f,
+            normalized_profiles[index].enabled ?
+                normalized_profiles[index].current_a :
+                0.0f,
+            &pdo_payload[1U + ((size_t)index * 4U)]);
+    }
+
+    for (uint8_t index = 0U;
+         err == ESP_OK && index < LASER_CONTROLLER_SERVICE_PD_PROFILE_COUNT;
+         ++index) {
+        single_pdo_payload[0] =
+            (uint8_t)(LASER_CONTROLLER_STUSB_DPM_PDO1_0 + (index * 4U));
+        memcpy(
+            &single_pdo_payload[1],
+            &pdo_payload[1U + ((size_t)index * 4U)],
+            4U);
+        err = laser_controller_board_i2c_write(
+            LASER_CONTROLLER_STUSB4500_ADDR,
+            single_pdo_payload,
+            sizeof(single_pdo_payload));
+    }
+    if (err == ESP_OK) {
+        err = laser_controller_board_i2c_write(
+            LASER_CONTROLLER_STUSB4500_ADDR,
+            count_payload,
+            sizeof(count_payload));
+    }
+    if (err == ESP_OK) {
+        err = laser_controller_board_i2c_read_reg_u8(
+            LASER_CONTROLLER_STUSB4500_ADDR,
+            LASER_CONTROLLER_STUSB_DPM_PDO_NUMB,
+            &verify_count);
+    }
+    if (err == ESP_OK &&
+        (verify_count & 0x07U) != encoded_profile_count) {
+        err = ESP_ERR_INVALID_RESPONSE;
+    }
+    if (err == ESP_OK) {
+        err = laser_controller_board_i2c_read_stusb_block(
+            LASER_CONTROLLER_STUSB_DPM_PDO1_0,
+            verify_pdo_payload,
+            sizeof(verify_pdo_payload));
+    }
+    if (err == ESP_OK &&
+        memcmp(
+            verify_pdo_payload,
+            &pdo_payload[1],
+            sizeof(verify_pdo_payload)) != 0) {
+        err = ESP_ERR_INVALID_RESPONSE;
+    }
+    if (err == ESP_OK) {
+        err = laser_controller_board_stusb_send_soft_reset();
+    }
+
+    laser_controller_board_service_report_probe(
+        LASER_CONTROLLER_MODULE_PD,
+        true,
+        err == ESP_OK);
+
+    if (err == ESP_OK) {
+        memset(&s_pd_snapshot, 0, sizeof(s_pd_snapshot));
+    }
+
+    return err;
+}
+
+void laser_controller_board_force_pd_refresh(void)
+{
+    s_pd_snapshot.updated_ms = 0U;
+}
+
+esp_err_t laser_controller_board_imu_spi_read(uint8_t reg, uint8_t *value)
+{
+    return laser_controller_board_imu_transfer(reg, value, false);
+}
+
+esp_err_t laser_controller_board_imu_spi_write(uint8_t reg, uint8_t value)
+{
+    return laser_controller_board_imu_transfer(reg, &value, true);
+}
+
+esp_err_t laser_controller_board_configure_dac_debug(
+    laser_controller_service_dac_reference_t reference,
+    bool gain_2x,
+    bool ref_div,
+    laser_controller_service_dac_sync_t sync_mode)
+{
+    uint16_t sync_reg = LASER_CONTROLLER_DAC_SYNC_DEFAULT;
+    uint16_t config_reg = LASER_CONTROLLER_DAC_CONFIG_DEFAULT;
+    uint16_t gain_reg = 0x0000U;
+    esp_err_t err;
+
+    if (!laser_controller_service_module_write_enabled(LASER_CONTROLLER_MODULE_DAC)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (!laser_controller_board_dac_config_is_safe(reference, gain_2x, ref_div)) {
+        laser_controller_board_service_report_probe(
+            LASER_CONTROLLER_MODULE_DAC,
+            true,
+            false);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    err = laser_controller_board_dac_init_safe();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    if (sync_mode == LASER_CONTROLLER_SERVICE_DAC_SYNC_SYNC) {
+        sync_reg = 0x0303U;
+    }
+    if (reference == LASER_CONTROLLER_SERVICE_DAC_REFERENCE_EXTERNAL) {
+        config_reg |= 0x0001U;
+    }
+    if (gain_2x) {
+        gain_reg |= 0x0003U;
+    }
+    if (ref_div) {
+        gain_reg |= 0x0100U;
+    }
+
+    err = laser_controller_board_dac_write_command(
+        LASER_CONTROLLER_DAC_SYNC_REG,
+        sync_reg);
+    if (err == ESP_OK) {
+        err = laser_controller_board_dac_write_command(
+            LASER_CONTROLLER_DAC_CONFIG_REG,
+            config_reg);
+    }
+    if (err == ESP_OK) {
+        err = laser_controller_board_dac_write_command(
+            LASER_CONTROLLER_DAC_GAIN_REG,
+            gain_reg);
+    }
+    if (err == ESP_OK) {
+        err = laser_controller_board_dac_check_status();
+    }
+
+    laser_controller_board_capture_dac_readback(err == ESP_OK);
+
+    laser_controller_board_service_report_probe(
+        LASER_CONTROLLER_MODULE_DAC,
+        err == ESP_OK,
+        err == ESP_OK);
+    return err;
+}
+
+esp_err_t laser_controller_board_set_dac_debug_output(
+    bool tec_channel,
+    float voltage_v)
+{
+    const uint8_t reg =
+        tec_channel ? LASER_CONTROLLER_DAC_DATA_B_REG :
+                      LASER_CONTROLLER_DAC_DATA_A_REG;
+    const float clamped_v =
+        laser_controller_board_clamp_float(
+            voltage_v,
+            0.0f,
+            LASER_CONTROLLER_DAC_FULL_SCALE_V);
+    esp_err_t err;
+
+    if (!laser_controller_service_module_write_enabled(LASER_CONTROLLER_MODULE_DAC)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    err = laser_controller_board_dac_init_safe();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = laser_controller_board_dac_write_command(
+            reg,
+            laser_controller_board_voltage_to_dac_code(clamped_v));
+    if (err != ESP_OK) {
+        laser_controller_board_service_report_probe(
+            LASER_CONTROLLER_MODULE_DAC,
+            true,
+            false);
+        return err;
+    }
+
+    if (tec_channel) {
+        s_last_tec_voltage_v = clamped_v;
+    } else {
+        s_last_ld_voltage_v = clamped_v;
+    }
+
+    laser_controller_board_capture_dac_readback(true);
+
+    laser_controller_board_service_report_probe(
+        LASER_CONTROLLER_MODULE_DAC,
+        true,
+        true);
+    return ESP_OK;
+}
+
+esp_err_t laser_controller_board_configure_imu_runtime(
+    uint32_t odr_hz,
+    uint32_t accel_range_g,
+    uint32_t gyro_range_dps,
+    bool gyro_enabled,
+    bool lpf2_enabled,
+    bool timestamp_enabled,
+    bool bdu_enabled,
+    bool if_inc_enabled,
+    bool i2c_disabled)
+{
+    s_imu_runtime.config.odr_hz = odr_hz;
+    s_imu_runtime.config.accel_range_g = accel_range_g;
+    s_imu_runtime.config.gyro_range_dps = gyro_range_dps;
+    s_imu_runtime.config.gyro_enabled = gyro_enabled;
+    s_imu_runtime.config.lpf2_enabled = lpf2_enabled;
+    s_imu_runtime.config.timestamp_enabled = timestamp_enabled;
+    s_imu_runtime.config.bdu_enabled = bdu_enabled;
+    s_imu_runtime.config.if_inc_enabled = if_inc_enabled;
+    s_imu_runtime.config.i2c_disabled = i2c_disabled;
+    s_imu_runtime.configured = false;
+    s_imu_runtime.identified = false;
+    s_imu_runtime.last_error = ESP_OK;
+    s_imu_runtime.last_attempt_ms = 0U;
+    s_imu_runtime.last_sample_ms = 0U;
+    laser_controller_board_clear_imu_readback();
+
+    if (!laser_controller_service_module_write_enabled(LASER_CONTROLLER_MODULE_IMU)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    return laser_controller_board_ensure_imu_runtime_ready();
+}
+
+esp_err_t laser_controller_board_configure_haptic_debug(
+    uint32_t effect_id,
+    laser_controller_service_haptic_mode_t mode,
+    uint32_t library,
+    laser_controller_service_haptic_actuator_t actuator,
+    uint32_t rtp_level)
+{
+    esp_err_t err;
+    const uint8_t mode_reg = laser_controller_board_haptic_mode_value(mode);
+    const uint8_t feedback_reg =
+        actuator == LASER_CONTROLLER_SERVICE_HAPTIC_ACTUATOR_LRA ? 0x80U : 0x00U;
+
+    if (!laser_controller_service_module_write_enabled(LASER_CONTROLLER_MODULE_HAPTIC)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    laser_controller_board_clear_haptic_readback();
+    err = laser_controller_board_i2c_probe(LASER_CONTROLLER_DRV2605_ADDR);
+    if (err != ESP_OK) {
+        s_haptic_readback.last_error = (int32_t)err;
+        laser_controller_board_service_report_probe(
+            LASER_CONTROLLER_MODULE_HAPTIC,
+            false,
+            false);
+        return err;
+    }
+    s_haptic_readback.reachable = true;
+
+    err = laser_controller_board_drv2605_write_reg(
+        LASER_CONTROLLER_DRV2605_MODE_REG,
+        LASER_CONTROLLER_DRV2605_RESET_BIT | LASER_CONTROLLER_DRV2605_STANDBY_BIT);
+    if (err == ESP_OK) {
+        esp_rom_delay_us(1000U);
+        err = laser_controller_board_drv2605_write_reg(
+            LASER_CONTROLLER_DRV2605_FEEDBACK_REG,
+            feedback_reg);
+    }
+    if (err == ESP_OK) {
+        err = laser_controller_board_drv2605_write_reg(
+            LASER_CONTROLLER_DRV2605_LIBRARY_REG,
+            (uint8_t)(library & 0x07U));
+    }
+    if (err == ESP_OK) {
+        err = laser_controller_board_drv2605_write_reg(
+            LASER_CONTROLLER_DRV2605_RTP_REG,
+            (uint8_t)(rtp_level & 0xFFU));
+    }
+    if (err == ESP_OK) {
+        err = laser_controller_board_drv2605_write_reg(
+            LASER_CONTROLLER_DRV2605_WAVESEQ1_REG,
+            (uint8_t)(effect_id & 0x7FU));
+    }
+    if (err == ESP_OK) {
+        err = laser_controller_board_drv2605_write_reg(
+            LASER_CONTROLLER_DRV2605_MODE_REG,
+            mode_reg);
+    }
+
+    if (err == ESP_OK) {
+        laser_controller_board_capture_haptic_readback();
+    } else {
+        s_haptic_readback.last_error = (int32_t)err;
+    }
+    laser_controller_board_service_report_probe(
+        LASER_CONTROLLER_MODULE_HAPTIC,
+        err == ESP_OK,
+        err == ESP_OK);
+    return err;
+}
+
+esp_err_t laser_controller_board_fire_haptic_test(void)
+{
+    laser_controller_service_status_t status;
+    esp_err_t err;
+
+    if (!laser_controller_service_module_write_enabled(LASER_CONTROLLER_MODULE_HAPTIC)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    laser_controller_service_copy_status(&status);
+    err = laser_controller_board_configure_haptic_debug(
+        status.haptic_effect_id,
+        status.haptic_mode,
+        status.haptic_library,
+        status.haptic_actuator,
+        status.haptic_rtp_level);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    return laser_controller_board_drv2605_write_reg(
+        LASER_CONTROLLER_DRV2605_GO_REG,
+        0x01U);
+}
+
+void laser_controller_board_apply_actuator_targets(
+    const laser_controller_config_t *config,
+    laser_controller_amps_t high_state_current_a,
+    laser_controller_celsius_t target_temp_c,
+    bool modulation_enabled,
+    uint32_t modulation_frequency_hz,
+    uint32_t modulation_duty_cycle_pct,
+    bool nir_output_enable,
+    bool select_driver_low_current)
+{
+    laser_controller_service_status_t service_status;
+    const float ld_volts_per_amp =
+            config != NULL && config->analog.ld_command_volts_per_amp > 0.0f ?
+            config->analog.ld_command_volts_per_amp :
+            (LASER_CONTROLLER_DAC_FULL_SCALE_V / 6.0f);
+    const float tec_volts_per_c =
+        config != NULL && config->analog.tec_command_volts_per_c > 0.0f ?
+            config->analog.tec_command_volts_per_c :
+            (2.5f / 65.0f);
+    float ld_voltage_v;
+    float tec_voltage_v;
+
+    laser_controller_service_copy_status(&service_status);
+    if (service_status.service_mode_requested) {
+        ld_voltage_v = laser_controller_board_clamp_float(
+            service_status.dac_ld_channel_v,
+            0.0f,
+            LASER_CONTROLLER_DAC_FULL_SCALE_V);
+        tec_voltage_v = laser_controller_board_clamp_float(
+            service_status.dac_tec_channel_v,
+            0.0f,
+            2.5f);
+    } else {
+        ld_voltage_v = laser_controller_board_clamp_float(
+            high_state_current_a * ld_volts_per_amp,
+            0.0f,
+            LASER_CONTROLLER_DAC_FULL_SCALE_V);
+        tec_voltage_v = laser_controller_board_clamp_float(
+            target_temp_c * tec_volts_per_c,
+            0.0f,
+            2.5f);
+    }
+
+    if (laser_controller_service_module_expected(LASER_CONTROLLER_MODULE_DAC) &&
+        laser_controller_board_dac_init_safe() == ESP_OK) {
+        if (fabsf(ld_voltage_v - s_last_ld_voltage_v) > 0.002f) {
+            (void)laser_controller_board_dac_write_command(
+                LASER_CONTROLLER_DAC_DATA_A_REG,
+                laser_controller_board_voltage_to_dac_code(ld_voltage_v));
+            s_last_ld_voltage_v = ld_voltage_v;
+        }
+        if (fabsf(tec_voltage_v - s_last_tec_voltage_v) > 0.002f) {
+            (void)laser_controller_board_dac_write_command(
+                LASER_CONTROLLER_DAC_DATA_B_REG,
+                laser_controller_board_voltage_to_dac_code(tec_voltage_v));
+            s_last_tec_voltage_v = tec_voltage_v;
+        }
+    }
+
+    if (nir_output_enable && modulation_enabled) {
+        ledc_timer_config_t timer_config = {
+            .speed_mode = LASER_CONTROLLER_PCN_PWM_SPEED_MODE,
+            .duty_resolution = LASER_CONTROLLER_PCN_PWM_RESOLUTION,
+            .timer_num = LASER_CONTROLLER_PCN_PWM_TIMER,
+            .freq_hz = laser_controller_board_clamp_u32(
+                modulation_frequency_hz,
+                10U,
+                50000U),
+            .clk_cfg = LEDC_AUTO_CLK,
+            .deconfigure = false,
+        };
+        ledc_channel_config_t channel_config = {
+            .gpio_num = LASER_CONTROLLER_GPIO_LD_PCN,
+            .speed_mode = LASER_CONTROLLER_PCN_PWM_SPEED_MODE,
+            .channel = LASER_CONTROLLER_PCN_PWM_CHANNEL,
+            .intr_type = LEDC_INTR_DISABLE,
+            .timer_sel = LASER_CONTROLLER_PCN_PWM_TIMER,
+            .duty = (laser_controller_board_clamp_u32(
+                        modulation_duty_cycle_pct,
+                        1U,
+                        99U) *
+                     LASER_CONTROLLER_PCN_PWM_DUTY_MAX) /
+                    100U,
+            .hpoint = 0,
+            .sleep_mode = LEDC_SLEEP_MODE_NO_ALIVE_NO_PD,
+            .flags = { .output_invert = 0 },
+            .deconfigure = false,
+        };
+
+        if (ledc_timer_config(&timer_config) == ESP_OK &&
+            ledc_channel_config(&channel_config) == ESP_OK) {
+            s_pwm_active = true;
+            return;
+        }
+    }
+
+    laser_controller_board_disable_pcn_pwm_and_drive(select_driver_low_current);
+}
+
+void laser_controller_board_inject_mock_inputs(const laser_controller_board_inputs_t *inputs)
+{
+    if (inputs == NULL) {
+        s_mock_override_enabled = false;
+        memset(&s_mock_inputs, 0, sizeof(s_mock_inputs));
+        return;
+    }
+
+    s_mock_inputs = *inputs;
+    s_mock_override_enabled = true;
+}

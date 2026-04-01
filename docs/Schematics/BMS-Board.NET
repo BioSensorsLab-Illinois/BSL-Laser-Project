@@ -1,0 +1,133 @@
+( {OrCAD PCB II Netlist Format}
+ ( 00000001 C0805 C1 0.1uF_50V
+  ( 1 NetC1_1 )
+  ( 2 GND )
+ )
+ ( 00000002 C1210 C2 10uF
+  ( 1 GND )
+  ( 2 VSYS )
+ )
+ ( 00000003 C1210 C3 10uF
+  ( 1 GND )
+  ( 2 VSYS )
+ )
+ ( 00000004 C0603 C4 1uF
+  ( 1 GND )
+  ( 2 VSYS )
+ )
+ ( 00000005 C1210 C5 10uF
+  ( 1 GND )
+  ( 2 VBUS )
+ )
+ ( 00000006 C1210 C6 10uF
+  ( 1 GND )
+  ( 2 VBUS )
+ )
+ ( 00000007 C0603 C7 1uF
+  ( 1 GND )
+  ( 2 VBUS )
+ )
+ ( 00000008 C1210 C8 10uF
+  ( 1 GND )
+  ( 2 VBAT )
+ )
+ ( 00000009 C1210 C9 10uF
+  ( 1 GND )
+  ( 2 VBAT )
+ )
+ ( 00000010 C0603 C10 1uF
+  ( 1 GND )
+  ( 2 VBAT )
+ )
+ ( 00000011 TFM-105-12-L-D-A J1 TFM-105-12-L-D-A
+  ( 01 GPIO4 )
+  ( 02 D_P )
+  ( 03 GPIO5 )
+  ( 04 D_N )
+  ( 05 GPIO7 )
+  ( 06 GPIO6 )
+  ( 07 GND )
+  ( 08 VSYS )
+  ( 09 GND )
+  ( 10 VSYS )
+ )
+ ( 00000012 MP011983 J2 MP011983
+  ( 1 GPIO7 )
+  ( 2 GPIO6 )
+  ( 3 VBAT )
+  ( 4 GND )
+  ( 5 VBAT )
+  ( 6 GND )
+  ( 7 VBAT )
+  ( 8 GND )
+ )
+ ( 00000013 TFM-105-12-L-D-A J3 TFM-105-12-L-D-A
+  ( 01 GND )
+  ( 02 VBUS )
+  ( 03 GND )
+  ( 04 VBUS )
+  ( 05 GND )
+  ( 06 VBUS )
+  ( 07 D_P )
+  ( 08 GPIO4 )
+  ( 09 D_N )
+  ( 10 GPIO5 )
+ )
+ ( 00000014 R0402 R1 10k
+  ( 1 NetR1_1 )
+  ( 2 VBUS )
+ )
+ ( 00000015 R0402 R2 97k6
+  ( 1 NetR2_1 )
+  ( 2 VBAT )
+ )
+ ( 00000016 R0402 R3 97k6
+  ( 1 NetR3_1 )
+  ( 2 VBUS )
+ )
+ ( 00000017 R0402 R4 18k7
+  ( 1 GND )
+  ( 2 NetR4_2 )
+ )
+ ( 00000018 R0402 R5 5k
+  ( 1 GND )
+  ( 2 NetR1_1 )
+ )
+ ( 00000019 R0402 R6 5k
+  ( 1 GND )
+  ( 2 NetR2_1 )
+ )
+ ( 00000020 R0402 R7 5k
+  ( 1 GND )
+  ( 2 NetR3_1 )
+ )
+ ( 00000021 5190tr-Footprint-1 TP1 5190tr
+  ( 1 GND )
+ )
+ ( 00000022 5190tr-Footprint-1 TP2 5190tr
+  ( 1 NetTP2_1 )
+ )
+ ( 00000023 5190tr-Footprint-1 TP3 5190tr
+  ( 1 VSYS )
+ )
+ ( 00000024 5190tr-Footprint-1 TP4 5190tr
+  ( 1 VBUS )
+ )
+ ( 00000025 5190tr-Footprint-1 TP5 5190tr
+  ( 1 VBAT )
+ )
+ ( 00000026 FP-RUX0012A-MFG U1 TPS2121RUXR
+  ( 1 VSYS )
+  ( 2 VBAT )
+  ( 3 GND )
+  ( 4 NetR2_1 )
+  ( 5 NetR3_1 )
+  ( 6 NetR1_1 )
+  ( 7 VBUS )
+  ( 8 VSYS )
+  ( 9 NetTP2_1 )
+  ( 10 NetR4_2 )
+  ( 11 NetC1_1 )
+  ( 12 GND )
+ )
+)
