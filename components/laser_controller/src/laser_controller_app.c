@@ -484,17 +484,31 @@ static laser_controller_board_outputs_t laser_controller_derive_outputs(
     const laser_controller_context_t *context,
     const laser_controller_safety_decision_t *decision)
 {
+    laser_controller_service_status_t service_status;
     laser_controller_board_outputs_t outputs = {
         .enable_ld_vin = false,
         .enable_tec_vin = false,
+        .enable_haptic_driver = false,
         .enable_alignment_laser = false,
         .assert_driver_standby = true,
         .select_driver_low_current = true,
     };
 
-    if (!context->boot_complete || !context->config_valid || context->fault_latched ||
-        laser_controller_service_mode_requested() ||
-        context->state_machine.current == LASER_CONTROLLER_STATE_SERVICE_MODE) {
+    if (!context->boot_complete || !context->config_valid) {
+        return outputs;
+    }
+
+    laser_controller_service_copy_status(&service_status);
+
+    if (context->state_machine.current == LASER_CONTROLLER_STATE_SERVICE_MODE) {
+        outputs.enable_ld_vin = service_status.ld_rail_debug_enabled;
+        outputs.enable_tec_vin = service_status.tec_rail_debug_enabled;
+        outputs.enable_haptic_driver =
+            service_status.haptic_driver_enable_requested;
+        return outputs;
+    }
+
+    if (context->fault_latched || laser_controller_service_mode_requested()) {
         return outputs;
     }
 

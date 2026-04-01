@@ -118,6 +118,11 @@
 #define LASER_CONTROLLER_DRV2605_WAVESEQ1_REG  0x04U
 #define LASER_CONTROLLER_DRV2605_GO_REG        0x0CU
 #define LASER_CONTROLLER_DRV2605_FEEDBACK_REG  0x1AU
+
+static void laser_controller_board_normalize_pd_profiles(
+    const laser_controller_service_pd_profile_t *profiles,
+    laser_controller_service_pd_profile_t *normalized_profiles,
+    uint8_t *profile_count_encoded);
 #define LASER_CONTROLLER_DRV2605_STANDBY_BIT   0x40U
 #define LASER_CONTROLLER_DRV2605_RESET_BIT     0x80U
 #define LASER_CONTROLLER_PCN_PWM_SPEED_MODE    LEDC_LOW_SPEED_MODE
@@ -214,6 +219,7 @@ static const uint8_t kVl53l1xDefaultConfiguration[] = {
 static const laser_controller_board_outputs_t kSafeOutputs = {
     .enable_ld_vin = false,
     .enable_tec_vin = false,
+    .enable_haptic_driver = false,
     .enable_alignment_laser = false,
     .assert_driver_standby = true,
     .select_driver_low_current = true,
@@ -244,6 +250,7 @@ static laser_controller_board_inputs_t s_mock_inputs;
 static laser_controller_board_outputs_t s_last_outputs = {
     .enable_ld_vin = false,
     .enable_tec_vin = false,
+    .enable_haptic_driver = false,
     .enable_alignment_laser = false,
     .assert_driver_standby = true,
     .select_driver_low_current = true,
@@ -498,7 +505,9 @@ static void laser_controller_board_drive_safe_gpio_levels(
     (void)gpio_set_level(
         LASER_CONTROLLER_GPIO_ERM_TRIG_GN_LD_EN,
         effective.enable_alignment_laser ? 1 : 0);
-    (void)gpio_set_level(LASER_CONTROLLER_GPIO_ERM_EN, 0);
+    (void)gpio_set_level(
+        LASER_CONTROLLER_GPIO_ERM_EN,
+        effective.enable_haptic_driver ? 1 : 0);
 }
 
 static esp_err_t laser_controller_board_ensure_gpio_ready(void)
@@ -1645,6 +1654,14 @@ static void laser_controller_board_clear_haptic_readback(void)
     s_haptic_readback.last_error = ESP_OK;
 }
 
+static void laser_controller_board_refresh_haptic_gpio_levels(void)
+{
+    s_haptic_readback.enable_pin_high =
+        gpio_get_level(LASER_CONTROLLER_GPIO_ERM_EN) != 0;
+    s_haptic_readback.trigger_pin_high =
+        gpio_get_level(LASER_CONTROLLER_GPIO_ERM_TRIG_GN_LD_EN) != 0;
+}
+
 static void laser_controller_board_clear_tof_readback(void)
 {
     memset(&s_tof_readback, 0, sizeof(s_tof_readback));
@@ -2040,6 +2057,7 @@ static void laser_controller_board_capture_haptic_readback(void)
     esp_err_t err;
 
     laser_controller_board_clear_haptic_readback();
+    laser_controller_board_refresh_haptic_gpio_levels();
 
     if (!laser_controller_service_module_expected(LASER_CONTROLLER_MODULE_HAPTIC)) {
         return;
@@ -4043,6 +4061,10 @@ esp_err_t laser_controller_board_fire_haptic_test(void)
     esp_err_t err;
 
     if (!laser_controller_service_module_write_enabled(LASER_CONTROLLER_MODULE_HAPTIC)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (gpio_get_level(LASER_CONTROLLER_GPIO_ERM_EN) == 0) {
         return ESP_ERR_INVALID_STATE;
     }
 

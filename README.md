@@ -217,6 +217,15 @@ Browser flashing note:
 - The host Web Serial flasher now requires a valid embedded BSL firmware signature block inside the raw app binary.
 - That signature currently verifies image compatibility and provenance for bench flashing; it is not a substitute for a production cryptographic release-signing PKI.
 
+Wireless bench link note:
+
+- The bench firmware now starts a dedicated Wi‑Fi SoftAP for the host console:
+  - SSID: `BSL-HTLS-Bench`
+  - password: `bslbench2026`
+  - WebSocket endpoint: `ws://192.168.4.1/ws`
+- Use that wireless path when USB-C must stay occupied by the PD source.
+- Firmware flashing and first-recovery still stay on the USB path.
+
 ## Documentation
 
 - Hardware: [hardware-recon.md](/Users/zz4/BSL/BSL-Laser/docs/hardware-recon.md)
@@ -226,7 +235,7 @@ Browser flashing note:
 - Protocol: [protocol-spec.md](/Users/zz4/BSL/BSL-Laser/docs/protocol-spec.md)
 - Validation: [validation-plan.md](/Users/zz4/BSL/BSL-Laser/docs/validation-plan.md)
 
-The host console bring-up flow now uses a module navigator rather than one long mixed debug page. IMU, DAC, haptic, ToF, PD, buttons, laser-driver, TEC, and generic bus diagnostics each have their own page, and the current bench firmware mirrors the richer DAC, IMU, ToF, and DRV2605 service tuning fields in the live `bringup.tuning` snapshot.
+The host console bring-up flow now uses a module navigator rather than one long mixed debug page. IMU, DAC, haptic, ToF, PD, buttons, laser-driver, TEC, and a dedicated `Power supplies` page for the two MPM3530 rails each have their own page, and the current bench firmware mirrors the richer DAC, IMU, ToF, DRV2605, and service-rail bring-up state in the live `bringup` snapshot.
 - Host console architecture: [host-console-architecture.md](/Users/zz4/BSL/BSL-Laser/docs/host-console-architecture.md)
 - Next-agent guidance: [AGENT.md](/Users/zz4/BSL/BSL-Laser/AGENT.md)
 
@@ -245,7 +254,7 @@ The refactored GUI now includes:
 - a compact bench-console layout with clearer connection guidance
 - a darker operator theme with larger, higher-contrast status indicators
 - a dedicated `Control` page for laser power, auto-follow setpoint staging, TEC temperature or wavelength targeting, and PCN modulation setup
-- a dedicated `Bring-up` page for module presence profiles and staged DAC/IMU/ToF/DRV2605 tuning, with the low-level Bus Lab merged into its `Service` landing page
+- a dedicated `Bring-up` page for module presence profiles, MPM3530 rail bring-up, and staged DAC/IMU/ToF/DRV2605 tuning, with the low-level Bus Lab merged into its `Service` landing page
 - a richer event viewer with module-aware filters and decoded I2C/SPI activity
 - a firmware page with a board-aware visual guide for the ESP32-S3 `RST` and `BOOT` buttons plus raw app-binary browser flashing over Web Serial
 - live power estimates for laser input, TEC input, cooling power, and total wall draw

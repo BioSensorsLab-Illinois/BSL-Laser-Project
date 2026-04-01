@@ -69,7 +69,7 @@ type BringupWorkbenchProps = {
   }>
 }
 
-type BringupPageKey = 'workflow' | ModuleKey
+type BringupPageKey = 'workflow' | 'power' | ModuleKey
 
 type BringupFormState = {
   profileName: string
@@ -186,6 +186,12 @@ const bringupPages: PageDefinition[] = [
     label: 'Service',
     detail: 'Start here for write session control, saved plan, and runtime safety policy.',
     icon: Wrench,
+  },
+  {
+    id: 'power',
+    label: 'Power supplies',
+    detail: 'MPM3530 rail enables, requested service override, and live PGOOD readback.',
+    icon: Cable,
   },
   {
     id: 'imu',
@@ -427,7 +433,7 @@ function ensureModuleDebugWrite(
 
 function makeStoredState(snapshot: DeviceSnapshot): BringupStoredState {
   return {
-    version: 8,
+    version: 9,
     activePage: 'workflow',
     form: makeFormState(snapshot),
     i2cAddress: '0x48',
@@ -464,6 +470,7 @@ function loadHostDraftState(snapshot: DeviceSnapshot): BringupStoredState {
           } as BringupDraft),
           activePage:
             parsed.activePage === 'workflow' ||
+            parsed.activePage === 'power' ||
             parsed.activePage in moduleMeta
               ? (parsed.activePage as BringupPageKey)
               : 'workflow',
@@ -693,6 +700,47 @@ function overallBringupPercent(modules: BringupModuleMap): number {
   )
 }
 
+function powerSupplyScore(
+  snapshot: DeviceSnapshot,
+  connected: boolean,
+): ModuleScore {
+  if (!connected) {
+    return {
+      progress: 0,
+      tone: 'warning',
+      label: 'Offline',
+    }
+  }
+
+  const ldRequested = snapshot.bringup.power.ldRequested
+  const tecRequested = snapshot.bringup.power.tecRequested
+
+  if (!ldRequested && !tecRequested) {
+    return {
+      progress: 0,
+      tone: 'warning',
+      label: 'Rails safe off',
+    }
+  }
+
+  const ldGood = !ldRequested || (snapshot.rails.ld.enabled && snapshot.rails.ld.pgood)
+  const tecGood = !tecRequested || (snapshot.rails.tec.enabled && snapshot.rails.tec.pgood)
+
+  if (ldGood && tecGood) {
+    return {
+      progress: 100,
+      tone: 'steady',
+      label: 'Requested rails good',
+    }
+  }
+
+  return {
+    progress: 56,
+    tone: 'warning',
+    label: 'Waiting for PGOOD',
+  }
+}
+
 function FieldLabel({
   label,
   help,
@@ -743,11 +791,17 @@ export function BringupWorkbench({
   )
   const livePdProfiles = snapshot.bringup.tuning.pdProfiles ?? makeDefaultPdProfiles()
   const overallProgress = overallBringupPercent(displayModules)
+  const powerPageScore = powerSupplyScore(snapshot, connected)
   const livePageModule =
-    activePage !== 'workflow'
+    activePage !== 'workflow' && activePage !== 'power'
       ? displayModules[activePage]
       : null
-  const livePageScore = livePageModule === null ? null : moduleScore(livePageModule)
+  const livePageScore =
+    activePage === 'power'
+      ? powerPageScore
+      : livePageModule === null
+        ? null
+        : moduleScore(livePageModule)
   const operationBusyRef = useRef(false)
   const operationConfirmResolveRef = useRef<(() => void) | null>(null)
   const probeBusyRef = useRef(false)
@@ -911,7 +965,7 @@ export function BringupWorkbench({
 
   useEffect(() => {
     persistStoredState({
-      version: 8,
+      version: 9,
       activePage,
       form,
       i2cAddress,
@@ -1060,7 +1114,7 @@ export function BringupWorkbench({
 
   function saveHostDraft() {
     persistStoredState({
-      version: 8,
+      version: 9,
       activePage,
       form,
       i2cAddress,
@@ -2305,6 +2359,200 @@ export function BringupWorkbench({
     )
   }
 
+  async function setSupplyEnable(rail: 'ld' | 'tec', enabled: boolean) {
+    const railLabel = rail === 'ld' ? 'LD supply' : 'TEC supply'
+
+    await runCommandSequence(
+      `${enabled ? 'Enable' : 'Disable'} ${railLabel}`,
+      `${railLabel} service request updated and live rail status refreshed.`,
+      [
+        {
+          detail: `${enabled ? 'Enabling' : 'Disabling'} ${railLabel.toLowerCase()} service override...`,
+          cmd: 'set_supply_enable',
+          risk: 'service',
+          note: `${enabled ? 'Enable' : 'Disable'} the ${railLabel.toLowerCase()} service-only MPM3530 rail request while keeping beam outputs forced safe.`,
+          requireService: true,
+          args: {
+            rail,
+            enabled,
+          },
+        },
+      ],
+    )
+  }
+
+  async function setHapticEnable(enabled: boolean) {
+    await runCommandSequence(
+      `${enabled ? 'Enable' : 'Disable'} ERM driver`,
+      `GPIO48 ${enabled ? 'asserted' : 'cleared'} for the DRV2605/ERM driver enable path.`,
+      [
+        {
+          detail: `${enabled ? 'Asserting' : 'Clearing'} ERM EN on GPIO48...`,
+          cmd: 'set_haptic_enable',
+          risk: 'service',
+          note: 'Service-only direct control of the dedicated ERM driver enable pin on GPIO48.',
+          requireService: true,
+          args: {
+            enabled,
+          },
+        },
+      ],
+    )
+  }
+
+  function renderPowerPage() {
+    const rails = [
+      {
+        key: 'ld' as const,
+        label: 'LD MPM3530',
+        detail:
+          'Service-only VIN enable for the laser-driver power rail. Driver standby stays asserted; this page never enables emission.',
+        requested: connected ? snapshot.bringup.power.ldRequested : false,
+        enabled: snapshot.rails.ld.enabled,
+        pgood: snapshot.rails.ld.pgood,
+      },
+      {
+        key: 'tec' as const,
+        label: 'TEC MPM3530',
+        detail:
+          'Service-only VIN enable for the TEC controller rail. Use this to prove rail startup and PGOOD behavior before closing the loop.',
+        requested: connected ? snapshot.bringup.power.tecRequested : false,
+        enabled: snapshot.rails.tec.enabled,
+        pgood: snapshot.rails.tec.pgood,
+      },
+    ]
+
+    return (
+      <div className="bringup-page-grid">
+        <article className="panel-cutout bringup-hero">
+          <div className="cutout-head">
+            <Cable size={16} />
+            <strong>Power supply bring-up</strong>
+          </div>
+          <p className="panel-note">
+            This page controls the two MPM3530 rail enables in service mode only. It
+            is for proving rail sequencing and PGOOD wiring with the optical path held
+            safe: alignment stays off, driver standby stays asserted, and no NIR
+            request is generated here.
+          </p>
+          <div className="bringup-fact-grid">
+            <div>
+              <span>Service rail requests</span>
+              <strong>
+                {snapshot.bringup.power.ldRequested || snapshot.bringup.power.tecRequested
+                  ? `${Number(snapshot.bringup.power.ldRequested) + Number(snapshot.bringup.power.tecRequested)} active`
+                  : 'none'}
+              </strong>
+            </div>
+            <div>
+              <span>Live LD rail</span>
+              <strong>
+                {snapshot.rails.ld.enabled
+                  ? snapshot.rails.ld.pgood
+                    ? 'enabled / PGOOD'
+                    : 'enabled / waiting'
+                  : 'off'}
+              </strong>
+            </div>
+            <div>
+              <span>Live TEC rail</span>
+              <strong>
+                {snapshot.rails.tec.enabled
+                  ? snapshot.rails.tec.pgood
+                    ? 'enabled / PGOOD'
+                    : 'enabled / waiting'
+                  : 'off'}
+              </strong>
+            </div>
+            <div>
+              <span>Write session</span>
+              <strong>{serviceModeActive ? 'service active' : 'required for rail control'}</strong>
+            </div>
+          </div>
+        </article>
+
+        {rails.map((rail) => (
+          <article key={rail.key} className="panel-cutout">
+            <div className="cutout-head">
+              <Cable size={16} />
+              <strong>{rail.label}</strong>
+            </div>
+            <p className="panel-note">{rail.detail}</p>
+            <div className="bringup-module-frame__status">
+              <span className={rail.requested ? 'status-badge is-on' : 'status-badge'}>
+                request {rail.requested ? 'on' : 'off'}
+              </span>
+              <span
+                className={
+                  rail.enabled
+                    ? rail.pgood
+                      ? 'status-badge is-on'
+                      : 'status-badge is-warn'
+                    : 'status-badge'
+                }
+              >
+                rail {rail.enabled ? 'enabled' : 'off'}
+              </span>
+              <span className={rail.pgood ? 'status-badge is-on' : 'status-badge is-warn'}>
+                pgood {rail.pgood ? 'high' : 'low'}
+              </span>
+            </div>
+            <div className="bringup-fact-grid">
+              <div>
+                <span>Requested service override</span>
+                <strong>{rail.requested ? 'Enabled' : 'Disabled'}</strong>
+              </div>
+              <div>
+                <span>Actual output enable</span>
+                <strong>{rail.enabled ? 'Asserted' : 'Off'}</strong>
+              </div>
+              <div>
+                <span>PGOOD</span>
+                <strong>{rail.pgood ? 'High' : 'Low'}</strong>
+              </div>
+              <div>
+                <span>Status</span>
+                <strong>
+                  {rail.requested
+                    ? rail.enabled
+                      ? rail.pgood
+                        ? 'Ready'
+                        : 'Waiting for PGOOD'
+                      : 'Requested, output still off'
+                    : 'Safe off'}
+                </strong>
+              </div>
+            </div>
+            <div className="button-row">
+              <button
+                type="button"
+                className="action-button is-inline is-accent"
+                disabled={writesDisabled || rail.requested}
+                title={`Request ${rail.label} on in service mode. Beam outputs remain forced safe.`}
+                onClick={() => {
+                  void setSupplyEnable(rail.key, true)
+                }}
+              >
+                Enable {rail.key === 'ld' ? 'LD' : 'TEC'} rail
+              </button>
+              <button
+                type="button"
+                className="action-button is-inline"
+                disabled={writesDisabled || !rail.requested}
+                title={`Clear the ${rail.label} service override and force the rail back off.`}
+                onClick={() => {
+                  void setSupplyEnable(rail.key, false)
+                }}
+              >
+                Disable {rail.key === 'ld' ? 'LD' : 'TEC'} rail
+              </button>
+            </div>
+          </article>
+        ))}
+      </div>
+    )
+  }
+
   function renderWorkflowPage() {
     return (
       <div className="bringup-page-grid">
@@ -3273,6 +3521,28 @@ export function BringupWorkbench({
             <button
               type="button"
               className="action-button is-inline is-accent"
+              disabled={writesDisabled || snapshot.peripherals.haptic.enablePinHigh}
+              title="Assert the dedicated ERM driver enable pin on GPIO48 in service mode."
+              onClick={() => {
+                void setHapticEnable(true)
+              }}
+            >
+              Enable ERM EN
+            </button>
+            <button
+              type="button"
+              className="action-button is-inline"
+              disabled={writesDisabled || !snapshot.peripherals.haptic.enablePinHigh}
+              title="Force the dedicated ERM driver enable pin on GPIO48 low."
+              onClick={() => {
+                void setHapticEnable(false)
+              }}
+            >
+              Disable ERM EN
+            </button>
+            <button
+              type="button"
+              className="action-button is-inline is-accent"
               disabled={writesDisabled}
               title="Push the full DAC bring-up profile and both channel shadow voltages."
               onClick={() => {
@@ -3577,8 +3847,8 @@ export function BringupWorkbench({
             <button
               type="button"
               className="action-button is-inline"
-              disabled={writesDisabled}
-              title="Fire the staged haptic test effect."
+              disabled={writesDisabled || !snapshot.peripherals.haptic.enablePinHigh}
+              title="Fire the staged haptic test effect. GPIO48 must already be high for the ERM driver path."
               onClick={() =>
                 void runCommandSequence(
                   'Fire haptic test',
@@ -3637,6 +3907,14 @@ export function BringupWorkbench({
               <strong>{snapshot.peripherals.haptic.reachable ? 'Yes' : 'No'}</strong>
             </div>
             <div>
+              <span>ERM EN GPIO48</span>
+              <strong>{snapshot.peripherals.haptic.enablePinHigh ? 'High' : 'Low'}</strong>
+            </div>
+            <div>
+              <span>Shared TRIG / green net</span>
+              <strong>{snapshot.peripherals.haptic.triggerPinHigh ? 'High' : 'Low'}</strong>
+            </div>
+            <div>
               <span>MODE</span>
               <strong>{formatRegisterHex(snapshot.peripherals.haptic.modeReg, 2)}</strong>
             </div>
@@ -3667,18 +3945,22 @@ export function BringupWorkbench({
             These fields are actual DRV2605 register readback from the peripheral, not
             just staged host settings.
           </p>
+          <p className="inline-help">
+            `GPIO48` is the dedicated ERM driver enable pin. For bench tests, assert
+            `ERM EN`, apply the DRV2605 profile, then fire `GO`.
+          </p>
           <p className="inline-help">{snapshot.bringup.tools.lastI2cOp}</p>
         </article>
 
         <article className="panel-cutout">
           <div className="cutout-head">
             <Waves size={16} />
-            <strong>Hazard note</strong>
+            <strong>Board note</strong>
           </div>
           <p className="inline-help">
-            The recovered netlist suggests the haptic trigger path may share IO37
-            with the visible laser enable path. Stay on short, explicit, service-only
-            tests until that coupling is disproven on hardware.
+            `IO37` still appears shared between DRV2605 trigger and the green-laser
+            net. This page now shows that shared level for visibility, but the primary
+            ERM bring-up path is the dedicated `GPIO48` enable plus I2C `GO`.
           </p>
         </article>
       </div>
@@ -4503,6 +4785,8 @@ export function BringupWorkbench({
     switch (activePage) {
       case 'workflow':
         return renderWorkflowPage()
+      case 'power':
+        return renderPowerPage()
       case 'imu':
         return renderImuPage()
       case 'dac':
@@ -4604,7 +4888,9 @@ export function BringupWorkbench({
                       ) as UiTone,
                       label: 'Service and policy',
                     }
-                  : moduleScore(displayModules[page.id])
+                  : page.id === 'power'
+                    ? powerPageScore
+                    : moduleScore(displayModules[page.id])
 
               return (
                 <button

@@ -101,12 +101,14 @@ Required fields:
 | `set_profile_name` | rename the active bring-up profile | safe bring-up metadata; does not require service mode |
 | `set_module_state` | declare whether a module is expected present and debug-enabled | safe bring-up metadata; does not require service mode |
 | `save_bringup_profile` | request device-side persistence of the bring-up profile | safe bring-up metadata write; may be unavailable in early firmware |
+| `set_supply_enable` | request the LD or TEC MPM3530 VIN rail on/off during service bring-up | service-only; beam outputs stay forced safe |
 | `refresh_pd_status` | force an immediate STUSB4500 contract/PDO refresh | read-only diagnostic; does not require service mode |
 | `dac_debug_set` | stage DAC channel shadow voltages for bench validation | service-only; actuator shadow, not direct beam authority |
 | `dac_debug_config` | stage DAC reference, gain, divider, and update policy | service-only; safe shadow/config only |
 | `imu_debug_config` | tune IMU ODR, full-scale, and runtime interface flags during bring-up | service-only |
 | `tof_debug_config` | tune ToF thresholds and stale-data timeout during bring-up | service-only |
 | `haptic_debug_config` | stage DRV2605 mode, library, actuator, RTP level, and effect selection | service-only |
+| `set_haptic_enable` | assert or clear the dedicated ERM driver enable pin on `GPIO48` | service-only; direct bench GPIO control for the motor path |
 | `haptic_debug_fire` | fire a service-mode haptic pattern | service-only |
 | `i2c_scan` | probe declared I2C targets | read-only diagnostic; does not require service mode |
 | `i2c_read` | read an I2C register | read-only diagnostic; must be logged |
@@ -121,6 +123,8 @@ Current bring-up-specific behavior:
 - `enter_service_mode` updates `serviceModeRequested` immediately and `serviceModeActive` on the next control-cycle/state-machine pass.
 - `set_profile_name`, `set_module_state`, and `save_bringup_profile` are intentionally allowed outside service mode so the bench plan can be saved without opening a write session.
 - `i2c_scan`, `i2c_read`, `spi_read`, and `refresh_pd_status` are intentionally allowed outside service mode because they are read-only probes.
+- `set_supply_enable` is intentionally separate from beam-control commands. In `SERVICE_MODE`, it only requests the LD or TEC MPM3530 VIN rail while alignment stays off and the laser driver stays in standby.
+- `set_haptic_enable` is intentionally separate from `haptic_debug_config`. It directly controls the dedicated ERM enable line on `GPIO48` during service bring-up so the operator can prove the motor power path independently from DRV2605 register writes.
 - `i2c_scan` now reports raw shared-bus line levels in failure text when the bus is unavailable, for example `Shared I2C unavailable (ESP_ERR_TIMEOUT, SDA=0, SCL=1).`
 - `pd_debug_config` now writes the runtime PDO registers, verifies the STUSB4500 readback, and sends a PD soft reset so the source renegotiates against the new PDO set.
 - `pd_save_firmware_plan` first applies the same runtime PDO update, then refreshes live STUSB4500 readback, and only saves the plan into MCU NVS if the live PDO table matches the requested plan.
@@ -240,6 +244,10 @@ Current bring-up-specific behavior:
     "profileRevision": 4,
     "persistenceDirty": true,
     "persistenceAvailable": false,
+    "power": {
+      "ldRequested": false,
+      "tecRequested": true
+    },
     "modules": {
       "imu": { "expectedPresent": true, "debugEnabled": true, "detected": true, "healthy": true },
       "tof": { "expectedPresent": false, "debugEnabled": false, "detected": false, "healthy": false }

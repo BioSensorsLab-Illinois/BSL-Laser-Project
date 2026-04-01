@@ -368,6 +368,8 @@ function makeSeedSnapshot(): DeviceSnapshot {
       },
       haptic: {
         reachable: false,
+        enablePinHigh: false,
+        triggerPinHigh: false,
         modeReg: 0,
         libraryReg: 0,
         goReg: 0,
@@ -468,6 +470,10 @@ function mergeSnapshot(
     bringup: {
       ...current.bringup,
       ...incoming.bringup,
+      power: {
+        ...current.bringup.power,
+        ...incoming.bringup.power,
+      },
       modules: {
         ...current.bringup.modules,
         ...incoming.bringup.modules,

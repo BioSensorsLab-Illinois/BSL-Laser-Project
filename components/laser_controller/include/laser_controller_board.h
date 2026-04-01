@@ -14,6 +14,7 @@
 typedef struct {
     bool enable_ld_vin;
     bool enable_tec_vin;
+    bool enable_haptic_driver;
     bool enable_alignment_laser;
     bool assert_driver_standby;
     bool select_driver_low_current;
@@ -55,6 +56,8 @@ typedef struct {
 
 typedef struct {
     bool reachable;
+    bool enable_pin_high;
+    bool trigger_pin_high;
     uint8_t mode_reg;
     uint8_t library_reg;
     uint8_t go_reg;

@@ -60,6 +60,8 @@ Preserve a firmware architecture where the default answer to any ambiguity is:
   Bench-only Wi-Fi SoftAP + WebSocket bridge that carries the same newline-delimited JSON protocol as USB CDC so the host can stay connected while USB-C is occupied by PD power.
 - [host-console/src/lib/websocket-transport.ts](/Users/zz4/BSL/BSL-Laser/host-console/src/lib/websocket-transport.ts)
   Browser wireless transport for the controller WebSocket bridge. It must preserve the same protocol semantics and service-mode gating as the USB path.
+- [host-console/src/lib/controller-protocol.ts](/Users/zz4/BSL/BSL-Laser/host-console/src/lib/controller-protocol.ts)
+  Shared host-side parser for the controller JSON line protocol. USB and wireless must stay on this one parser so transport changes do not fork protocol behavior.
 - [host-console/src/components/CommandDeck.tsx](/Users/zz4/BSL/BSL-Laser/host-console/src/components/CommandDeck.tsx)
   Guarded maintenance command surface, split I2C/SPI bus lab, decoded register readback, and the host-side multi-PCB provisioning worksheet for Main / ToF / BMS / PD / Button boards. Do not turn this into a direct beam-control panel.
 - [host-console/src/components/ControlWorkbench.tsx](/Users/zz4/BSL/BSL-Laser/host-console/src/components/ControlWorkbench.tsx)
@@ -97,7 +99,7 @@ Preserve a firmware architecture where the default answer to any ambiguity is:
   - `peripherals.dac`: `SYNC`, `CONFIG`, `GAIN`, `STATUS`, `DATA_A`, `DATA_B`, `REF_ALARM`, reachability, and last low-level error
   - `peripherals.pd`: raw STUSB4500 `CC_STATUS`, `DPM_PDO_NUMB`, `RDO_STATUS`, reachability, and attachment state
   - `peripherals.imu`: `WHO_AM_I`, `STATUS_REG`, key runtime `CTRL*` registers, reachability/configured state, and last low-level error
-  - `peripherals.haptic`: DRV2605 `MODE`, `LIBRARY`, `GO`, `FEEDBACK`, reachability, and last low-level error
+  - `peripherals.haptic`: DRV2605 `MODE`, `LIBRARY`, `GO`, `FEEDBACK`, actual `GPIO48` enable level, shared `IO37` trigger level, reachability, and last low-level error
 - Host UI should distinguish carefully between:
   - staged/local bring-up settings
   - derived summaries or safety classifications
@@ -106,8 +108,13 @@ Preserve a firmware architecture where the default answer to any ambiguity is:
 - `refresh_pd_status` is the read-only path for forcing an immediate STUSB4500 contract/PDO refresh from the host.
 - The host console now exposes service-only bench and bring-up workflows, but those actions remain advisory commands routed to firmware, not direct hardware access.
 - Service mode currently forces derived outputs safe while still allowing staged host requests and bus diagnostics.
+- The Bring-up navigator now also includes a dedicated `Power supplies` page for the two MPM3530 rails. That page is for service-only rail sequencing and PGOOD validation, not for beam enable.
 - Bring-up plan metadata (`set_profile_name`, `set_module_state`, `save_bringup_profile`) is intentionally allowed outside service mode so the bench build plan can be saved without opening a hardware write session.
 - Read-only bring-up probes (`i2c_scan`, `i2c_read`, `spi_read`) are intentionally allowed outside service mode.
+- `set_supply_enable` is service-only. In `SERVICE_MODE`, it may request the LD or TEC VIN rail on for bench bring-up, but alignment must remain off, the driver must remain in standby, and no NIR request should be created from that page.
+- Host UI must show requested service rail overrides (`bringup.power.ldRequested`, `bringup.power.tecRequested`) separately from actual live rail status (`rails.ld.enabled/pgood`, `rails.tec.enabled/pgood`). Requested intent is not the same thing as hardware readback.
+- ERM bring-up should treat `GPIO48` as the dedicated driver-enable path. Expose it as an explicit service-only control in the haptic page instead of assuming DRV2605 register writes alone are enough to energize the motor path.
+- The haptic page should show both actual `GPIO48` level and the shared `IO37` trigger / green-laser sideband level, so the operator can distinguish “DRV2605 configured over I2C” from “ERM driver electrically enabled.”
 - The Bring-up page now auto-syncs local module expectation/debug flags into firmware when connected. The operator should not have to click `Save module plan` before a normal per-module `Apply ...` action becomes predictable.
 - That auto-sync must keep retrying until the controller plan actually matches the local host draft. It must not be a one-shot timer that gives up forever just because a background probe happened to be running at the wrong moment.
 - Background bring-up probes should stay paused while local module-plan sync is still outstanding. Otherwise the UI can show `Awaiting probe` for a module that is physically present simply because the controller never received the expected-present flag yet.
@@ -212,6 +219,7 @@ Pay special attention to:
 
 - `GPIO4/GPIO5` being the default shared I2C bus for `STUSB4500`, `DAC80502`, and `DRV2605`
 - `GPIO4/GPIO5` also leaving the board through both the BMS and Sensor & LED connectors
+- `GPIO48` being the dedicated `ERM_EN` line for the DRV2605 / ERM path
 - `IO37` appearing to drive both `ERM_TRIG` and `GN_LD_EN`
 - `GPIO6/GPIO7` being shared with the BMS battery-toggle connector and the Sensor & LED board
 - the resolved ToF board facts:

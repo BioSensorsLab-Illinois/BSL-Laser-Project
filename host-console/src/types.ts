@@ -228,6 +228,8 @@ export interface ImuPeripheralReadback {
 
 export interface HapticPeripheralReadback {
   reachable: boolean
+  enablePinHigh: boolean
+  triggerPinHigh: boolean
   modeReg: number
   libraryReg: number
   goReg: number
@@ -266,6 +268,10 @@ export interface BringupStatus {
   lastSaveOk: boolean
   profileRevision: number
   profileName: string
+  power: {
+    ldRequested: boolean
+    tecRequested: boolean
+  }
   modules: BringupModuleMap
   tuning: BringupTuning
   tools: BringupTools

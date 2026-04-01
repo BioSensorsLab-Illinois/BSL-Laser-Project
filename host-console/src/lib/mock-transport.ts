@@ -54,6 +54,7 @@ type MockState = {
   modulationDutyCyclePct: number
   lowStateCurrentA: number
   laserHighCurrentA: number
+  hapticDriverEnabled: boolean
   safety: DeviceSnapshot['safety']
   bringup: DeviceSnapshot['bringup']
 }
@@ -220,6 +221,7 @@ export class MockTransport implements DeviceTransport {
     modulationDutyCyclePct: 50,
     lowStateCurrentA: 0,
     laserHighCurrentA: currentFromOpticalPowerW(2.8),
+    hapticDriverEnabled: false,
     safety: {
       allowAlignment: true,
       allowNir: true,
@@ -607,6 +609,7 @@ export class MockTransport implements DeviceTransport {
         this.state.tecSettlingTicks = 3
         this.state.bringup.serviceModeActive = false
         this.state.bringup.serviceModeRequested = false
+        this.state.hapticDriverEnabled = false
         this.emit({
           kind: 'event',
           event: this.makeEvent(
@@ -630,6 +633,7 @@ export class MockTransport implements DeviceTransport {
         this.state.systemState = 'SAFE_IDLE'
         this.state.laserRequested = false
         this.state.alignmentRequested = false
+        this.state.hapticDriverEnabled = false
         break
       case 'apply_bringup_preset':
         if (typeof command.args?.preset === 'string') {
@@ -658,6 +662,27 @@ export class MockTransport implements DeviceTransport {
             }
             this.bumpBringupRevision(`Module ${module} expectations updated.`)
           }
+        }
+        break
+      case 'set_supply_enable':
+        if (typeof command.args?.rail === 'string' && typeof command.args?.enabled === 'boolean') {
+          if (command.args.rail === 'ld') {
+            this.state.bringup.power.ldRequested = command.args.enabled
+          }
+          if (command.args.rail === 'tec') {
+            this.state.bringup.power.tecRequested = command.args.enabled
+          }
+          this.bumpBringupRevision(
+            `${String(command.args.rail).toUpperCase()} rail service request ${command.args.enabled ? 'enabled' : 'disabled'}.`,
+          )
+        }
+        break
+      case 'set_haptic_enable':
+        if (typeof command.args?.enabled === 'boolean') {
+          this.state.hapticDriverEnabled = command.args.enabled
+          this.bumpBringupRevision(
+            `ERM driver enable ${command.args.enabled ? 'asserted on GPIO48' : 'cleared on GPIO48'}.`,
+          )
         }
         break
       case 'save_bringup_profile':
@@ -1134,6 +1159,18 @@ export class MockTransport implements DeviceTransport {
                   ? 'tec_temp_adc_high'
                   : 'none'
     const benchDefaults = makeDefaultBenchControlStatus()
+    const serviceLdEnabled =
+      this.state.serviceMode && this.state.bringup.power.ldRequested
+    const serviceTecEnabled =
+      this.state.serviceMode && this.state.bringup.power.tecRequested
+    const ldRailEnabled =
+      this.state.serviceMode
+        ? serviceLdEnabled
+        : this.state.powerTier === 'full' && tecReady && !this.state.faultLatched
+    const tecRailEnabled =
+      this.state.serviceMode
+        ? serviceTecEnabled
+        : this.state.powerTier === 'full'
 
     return {
       identity: {
@@ -1170,12 +1207,12 @@ export class MockTransport implements DeviceTransport {
       },
       rails: {
         ld: {
-          enabled: this.state.powerTier === 'full' && tecReady && !this.state.faultLatched,
-          pgood: this.state.powerTier === 'full' && tecReady && !this.state.faultLatched,
+          enabled: ldRailEnabled,
+          pgood: ldRailEnabled,
         },
         tec: {
-          enabled: this.state.powerTier === 'full',
-          pgood: this.state.powerTier === 'full',
+          enabled: tecRailEnabled,
+          pgood: tecRailEnabled,
         },
       },
       imu: {
@@ -1255,6 +1292,8 @@ export class MockTransport implements DeviceTransport {
         },
         haptic: {
           reachable: this.state.bringup.modules.haptic.expectedPresent,
+          enablePinHigh: this.state.serviceMode && this.state.hapticDriverEnabled,
+          triggerPinHigh: alignmentEnabled,
           modeReg: 0x00,
           libraryReg: 0x01,
           goReg: 0x00,

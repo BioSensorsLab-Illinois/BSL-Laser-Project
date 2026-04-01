@@ -258,6 +258,10 @@ export function makeDefaultBringupStatus(): BringupStatus {
     lastSaveOk: false,
     profileRevision: 1,
     profileName: 'manual-bringup',
+    power: {
+      ldRequested: false,
+      tecRequested: false,
+    },
     modules: makeDefaultBringupModules(),
     tuning: {
       dacLdChannelV: 0,

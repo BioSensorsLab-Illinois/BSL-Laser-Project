@@ -75,6 +75,15 @@ typedef struct {
     bool truncated;
 } laser_controller_comms_buffer_t;
 
+static bool laser_controller_comms_extract_float(
+    const char *line,
+    const char *key,
+    float *value);
+static bool laser_controller_comms_extract_bool(
+    const char *line,
+    const char *key,
+    bool *value);
+
 static void laser_controller_comms_output_lock(void)
 {
     if (s_output_lock != NULL) {
@@ -418,8 +427,10 @@ static void laser_controller_comms_write_peripheral_readback_json(
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        "\"haptic\":{\"reachable\":%s,\"modeReg\":%u,\"libraryReg\":%u,\"goReg\":%u,\"feedbackReg\":%u,\"lastErrorCode\":%ld,\"lastError\":",
+        "\"haptic\":{\"reachable\":%s,\"enablePinHigh\":%s,\"triggerPinHigh\":%s,\"modeReg\":%u,\"libraryReg\":%u,\"goReg\":%u,\"feedbackReg\":%u,\"lastErrorCode\":%ld,\"lastError\":",
         haptic->reachable ? "true" : "false",
+        haptic->enable_pin_high ? "true" : "false",
+        haptic->trigger_pin_high ? "true" : "false",
         (unsigned)haptic->mode_reg,
         (unsigned)haptic->library_reg,
         (unsigned)haptic->go_reg,
@@ -843,7 +854,11 @@ static void laser_controller_comms_write_snapshot_json(
         status->bringup.last_save_ok ? "true" : "false",
         (unsigned long)status->bringup.profile_revision);
     laser_controller_comms_write_escaped_string(buffer, status->bringup.profile_name);
-    laser_controller_comms_buffer_append_raw(buffer, ",\"modules\":{");
+    laser_controller_comms_buffer_append_fmt(
+        buffer,
+        ",\"power\":{\"ldRequested\":%s,\"tecRequested\":%s},\"modules\":{",
+        status->bringup.ld_rail_debug_enabled ? "true" : "false",
+        status->bringup.tec_rail_debug_enabled ? "true" : "false");
     laser_controller_comms_buffer_append_raw(buffer, "\"imu\":");
     laser_controller_comms_write_module_json(
         buffer,
@@ -1426,6 +1441,8 @@ static void laser_controller_comms_handle_command_line(const char *line)
         (strcmp(command, "set_laser_power") == 0 ||
          strcmp(command, "set_max_current") == 0 ||
          strcmp(command, "set_runtime_safety") == 0 ||
+         strcmp(command, "set_supply_enable") == 0 ||
+         strcmp(command, "set_haptic_enable") == 0 ||
          strcmp(command, "pd_debug_config") == 0 ||
          strcmp(command, "pd_save_firmware_plan") == 0 ||
          strcmp(command, "pd_burn_nvm") == 0 ||
@@ -1969,6 +1986,65 @@ static void laser_controller_comms_handle_command_line(const char *line)
             laser_controller_service_module_name(module),
             expected_present,
             debug_enabled);
+        (void)laser_controller_app_copy_status(&status);
+        laser_controller_comms_emit_status_response(id, &status);
+        return;
+    }
+
+    if (strcmp(command, "set_supply_enable") == 0) {
+        laser_controller_service_supply_t supply;
+        bool enabled = false;
+
+        if (!laser_controller_comms_extract_string(
+                line,
+                "\"rail\":\"",
+                text_arg,
+                sizeof(text_arg)) ||
+            !laser_controller_service_parse_supply(text_arg, &supply)) {
+            laser_controller_comms_emit_error_response(id, "Unknown supply rail.");
+            return;
+        }
+
+        if (!laser_controller_comms_extract_bool(
+                line,
+                "\"enabled\":",
+                &enabled)) {
+            laser_controller_comms_emit_error_response(id, "Missing rail enable state.");
+            return;
+        }
+
+        if (!laser_controller_service_set_supply_enable(supply, enabled, now_ms)) {
+            laser_controller_comms_emit_error_response(id, "Supply rail request rejected.");
+            return;
+        }
+
+        laser_controller_logger_logf(
+            now_ms,
+            "service",
+            "service rail %s -> %s",
+            laser_controller_service_supply_name(supply),
+            enabled ? "enabled" : "disabled");
+        (void)laser_controller_app_copy_status(&status);
+        laser_controller_comms_emit_status_response(id, &status);
+        return;
+    }
+
+    if (strcmp(command, "set_haptic_enable") == 0) {
+        bool enabled = false;
+
+        if (!laser_controller_comms_extract_bool(line, "\"enabled\":", &enabled)) {
+            laser_controller_comms_emit_error_response(
+                id,
+                "Missing ERM enable state.");
+            return;
+        }
+
+        laser_controller_service_set_haptic_driver_enable(enabled, now_ms);
+        laser_controller_logger_logf(
+            now_ms,
+            "service",
+            "ERM driver enable GPIO48 -> %s",
+            enabled ? "high" : "low");
         (void)laser_controller_app_copy_status(&status);
         laser_controller_comms_emit_status_response(id, &status);
         return;

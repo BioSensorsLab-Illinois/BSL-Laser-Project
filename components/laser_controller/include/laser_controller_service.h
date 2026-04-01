@@ -39,6 +39,11 @@ typedef struct {
 } laser_controller_service_pd_profile_t;
 
 typedef enum {
+    LASER_CONTROLLER_SERVICE_SUPPLY_LD = 0,
+    LASER_CONTROLLER_SERVICE_SUPPLY_TEC,
+} laser_controller_service_supply_t;
+
+typedef enum {
     LASER_CONTROLLER_SERVICE_DAC_REFERENCE_INTERNAL = 0,
     LASER_CONTROLLER_SERVICE_DAC_REFERENCE_EXTERNAL,
 } laser_controller_service_dac_reference_t;
@@ -71,6 +76,9 @@ typedef struct {
     bool last_save_ok;
     uint32_t profile_revision;
     char profile_name[LASER_CONTROLLER_SERVICE_PROFILE_NAME_LEN];
+    bool ld_rail_debug_enabled;
+    bool tec_rail_debug_enabled;
+    bool haptic_driver_enable_requested;
     laser_controller_module_status_t modules[LASER_CONTROLLER_MODULE_COUNT];
     float dac_ld_channel_v;
     float dac_tec_channel_v;
@@ -130,6 +138,13 @@ bool laser_controller_service_set_module_state(
     laser_controller_module_t module,
     bool expected_present,
     bool debug_enabled,
+    laser_controller_time_ms_t now_ms);
+bool laser_controller_service_set_supply_enable(
+    laser_controller_service_supply_t supply,
+    bool enabled,
+    laser_controller_time_ms_t now_ms);
+void laser_controller_service_set_haptic_driver_enable(
+    bool enabled,
     laser_controller_time_ms_t now_ms);
 void laser_controller_service_mark_runtime_status(
     const char *message,
@@ -211,6 +226,11 @@ bool laser_controller_service_parse_module(
     const char *name,
     laser_controller_module_t *module);
 const char *laser_controller_service_module_name(laser_controller_module_t module);
+bool laser_controller_service_parse_supply(
+    const char *name,
+    laser_controller_service_supply_t *supply);
+const char *laser_controller_service_supply_name(
+    laser_controller_service_supply_t supply);
 bool laser_controller_service_parse_dac_reference(
     const char *name,
     laser_controller_service_dac_reference_t *reference);

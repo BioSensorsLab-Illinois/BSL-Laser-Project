@@ -24,13 +24,15 @@ export class WebSocketTransport implements DeviceTransport {
 
   private disconnecting = false
 
-  private protocolReady = false
-
   private eventSequence = 0
 
   private handshakeProbeTimers: number[] = []
 
-  constructor(private readonly url: string) {}
+  private readonly url: string
+
+  constructor(url: string) {
+    this.url = url
+  }
 
   private nextEventId(kind: string): string {
     this.eventSequence += 1
@@ -74,9 +76,7 @@ export class WebSocketTransport implements DeviceTransport {
     interpretControllerLine(line, {
       makeEventId: (kind) => this.nextEventId(kind),
       emit: (message) => this.emit(message),
-      onProtocolReady: () => {
-        this.protocolReady = true
-      },
+      onProtocolReady: () => undefined,
     })
   }
 
@@ -116,7 +116,6 @@ export class WebSocketTransport implements DeviceTransport {
         () => {
           this.active = true
           this.disconnecting = false
-          this.protocolReady = false
           this.emit({
             kind: 'transport',
             status: 'connected',
@@ -151,7 +150,6 @@ export class WebSocketTransport implements DeviceTransport {
 
       socket.addEventListener('close', () => {
         this.clearHandshakeProbeTimers()
-        this.protocolReady = false
         this.active = false
         this.socket = null
 
@@ -168,7 +166,6 @@ export class WebSocketTransport implements DeviceTransport {
       this.socket = null
       this.active = false
       this.disconnecting = false
-      this.protocolReady = false
       this.clearHandshakeProbeTimers()
       this.emit({
         kind: 'transport',
@@ -182,7 +179,6 @@ export class WebSocketTransport implements DeviceTransport {
   async disconnect(): Promise<void> {
     this.disconnecting = true
     this.active = false
-    this.protocolReady = false
     this.clearHandshakeProbeTimers()
 
     if (this.socket !== null) {

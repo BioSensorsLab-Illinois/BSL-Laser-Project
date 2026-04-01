@@ -15,8 +15,8 @@
 #define LASER_CONTROLLER_LSM6DSO_WHOAMI 0x6CU
 #define LASER_CONTROLLER_SERVICE_NVS_NAMESPACE "laser_ctrl"
 #define LASER_CONTROLLER_SERVICE_NVS_KEY       "svc_profile"
-#define LASER_CONTROLLER_SERVICE_PROFILE_VER   3U
-#define LASER_CONTROLLER_SERVICE_PROFILE_VER_MIN 2U
+#define LASER_CONTROLLER_SERVICE_PROFILE_VER   4U
+#define LASER_CONTROLLER_SERVICE_PROFILE_VER_MIN 3U
 #define LASER_CONTROLLER_SERVICE_DAC_MAX_V     2.5f
 
 typedef struct {
@@ -27,6 +27,45 @@ typedef struct {
 typedef struct {
     uint32_t version;
     char profile_name[LASER_CONTROLLER_SERVICE_PROFILE_NAME_LEN];
+    laser_controller_service_persisted_module_t
+        modules[LASER_CONTROLLER_MODULE_COUNT];
+    float dac_ld_channel_v;
+    float dac_tec_channel_v;
+    laser_controller_service_dac_reference_t dac_reference;
+    bool dac_gain_2x;
+    bool dac_ref_div;
+    laser_controller_service_dac_sync_t dac_sync_mode;
+    uint32_t imu_odr_hz;
+    uint32_t imu_accel_range_g;
+    uint32_t imu_gyro_range_dps;
+    bool imu_gyro_enabled;
+    bool imu_lpf2_enabled;
+    bool imu_timestamp_enabled;
+    bool imu_bdu_enabled;
+    bool imu_if_inc_enabled;
+    bool imu_i2c_disabled;
+    float tof_min_range_m;
+    float tof_max_range_m;
+    uint32_t tof_stale_timeout_ms;
+    laser_controller_service_pd_profile_t
+        pd_profiles[LASER_CONTROLLER_SERVICE_PD_PROFILE_COUNT];
+    float pd_programming_only_max_w;
+    float pd_reduced_mode_min_w;
+    float pd_reduced_mode_max_w;
+    float pd_full_mode_min_w;
+    bool pd_firmware_plan_enabled;
+    uint32_t haptic_effect_id;
+    laser_controller_service_haptic_mode_t haptic_mode;
+    uint32_t haptic_library;
+    laser_controller_service_haptic_actuator_t haptic_actuator;
+    uint32_t haptic_rtp_level;
+} laser_controller_service_persisted_profile_v3_t;
+
+typedef struct {
+    uint32_t version;
+    char profile_name[LASER_CONTROLLER_SERVICE_PROFILE_NAME_LEN];
+    bool ld_rail_debug_enabled;
+    bool tec_rail_debug_enabled;
     laser_controller_service_persisted_module_t
         modules[LASER_CONTROLLER_MODULE_COUNT];
     float dac_ld_channel_v;
@@ -90,6 +129,9 @@ static bool laser_controller_service_pd_config_valid(
     const laser_controller_service_pd_profile_t *profiles,
     size_t profile_count);
 static void laser_controller_service_sync_shadow_regs_locked(void);
+static void laser_controller_service_migrate_v3_profile(
+    const laser_controller_service_persisted_profile_v3_t *legacy,
+    laser_controller_service_persisted_profile_t *profile);
 static void laser_controller_service_normalize_pd_profiles(
     const laser_controller_service_pd_profile_t *profiles,
     laser_controller_service_pd_profile_t *normalized_profiles);
@@ -404,6 +446,54 @@ static void laser_controller_service_seed_mock_registers_locked(void)
     s_service.stusb4500_regs[0x07U] = 0x45U;
 }
 
+static void laser_controller_service_migrate_v3_profile(
+    const laser_controller_service_persisted_profile_v3_t *legacy,
+    laser_controller_service_persisted_profile_t *profile)
+{
+    if (legacy == NULL || profile == NULL) {
+        return;
+    }
+
+    memset(profile, 0, sizeof(*profile));
+    profile->version = LASER_CONTROLLER_SERVICE_PROFILE_VER;
+    laser_controller_service_copy_text(
+        profile->profile_name,
+        sizeof(profile->profile_name),
+        legacy->profile_name);
+    memcpy(profile->modules, legacy->modules, sizeof(profile->modules));
+    profile->dac_ld_channel_v = legacy->dac_ld_channel_v;
+    profile->dac_tec_channel_v = legacy->dac_tec_channel_v;
+    profile->dac_reference = legacy->dac_reference;
+    profile->dac_gain_2x = legacy->dac_gain_2x;
+    profile->dac_ref_div = legacy->dac_ref_div;
+    profile->dac_sync_mode = legacy->dac_sync_mode;
+    profile->imu_odr_hz = legacy->imu_odr_hz;
+    profile->imu_accel_range_g = legacy->imu_accel_range_g;
+    profile->imu_gyro_range_dps = legacy->imu_gyro_range_dps;
+    profile->imu_gyro_enabled = legacy->imu_gyro_enabled;
+    profile->imu_lpf2_enabled = legacy->imu_lpf2_enabled;
+    profile->imu_timestamp_enabled = legacy->imu_timestamp_enabled;
+    profile->imu_bdu_enabled = legacy->imu_bdu_enabled;
+    profile->imu_if_inc_enabled = legacy->imu_if_inc_enabled;
+    profile->imu_i2c_disabled = legacy->imu_i2c_disabled;
+    profile->tof_min_range_m = legacy->tof_min_range_m;
+    profile->tof_max_range_m = legacy->tof_max_range_m;
+    profile->tof_stale_timeout_ms = legacy->tof_stale_timeout_ms;
+    memcpy(profile->pd_profiles, legacy->pd_profiles, sizeof(profile->pd_profiles));
+    profile->pd_programming_only_max_w = legacy->pd_programming_only_max_w;
+    profile->pd_reduced_mode_min_w = legacy->pd_reduced_mode_min_w;
+    profile->pd_reduced_mode_max_w = legacy->pd_reduced_mode_max_w;
+    profile->pd_full_mode_min_w = legacy->pd_full_mode_min_w;
+    profile->pd_firmware_plan_enabled = legacy->pd_firmware_plan_enabled;
+    profile->haptic_effect_id = legacy->haptic_effect_id;
+    profile->haptic_mode = legacy->haptic_mode;
+    profile->haptic_library = legacy->haptic_library;
+    profile->haptic_actuator = legacy->haptic_actuator;
+    profile->haptic_rtp_level = legacy->haptic_rtp_level;
+    profile->ld_rail_debug_enabled = false;
+    profile->tec_rail_debug_enabled = false;
+}
+
 static void laser_controller_service_export_persisted_locked(
     laser_controller_service_persisted_profile_t *profile)
 {
@@ -417,6 +507,8 @@ static void laser_controller_service_export_persisted_locked(
         profile->profile_name,
         sizeof(profile->profile_name),
         s_service.status.profile_name);
+    profile->ld_rail_debug_enabled = s_service.status.ld_rail_debug_enabled;
+    profile->tec_rail_debug_enabled = s_service.status.tec_rail_debug_enabled;
 
     for (uint32_t index = 0U; index < LASER_CONTROLLER_MODULE_COUNT; ++index) {
         profile->modules[index].expected_present =
@@ -507,6 +599,8 @@ static void laser_controller_service_apply_persisted_locked(
         s_service.status.profile_name,
         sizeof(s_service.status.profile_name),
         profile->profile_name);
+    s_service.status.ld_rail_debug_enabled = profile->ld_rail_debug_enabled;
+    s_service.status.tec_rail_debug_enabled = profile->tec_rail_debug_enabled;
     for (uint32_t index = 0U; index < LASER_CONTROLLER_MODULE_COUNT; ++index) {
         s_service.status.modules[index].expected_present =
             profile->modules[index].expected_present;
@@ -560,7 +654,8 @@ static bool laser_controller_service_load_profile_locked(void)
 {
     nvs_handle_t handle = 0;
     laser_controller_service_persisted_profile_t profile;
-    size_t size = sizeof(profile);
+    laser_controller_service_persisted_profile_v3_t legacy_profile;
+    size_t size = 0U;
     esp_err_t err;
 
     err = nvs_open(
@@ -573,7 +668,27 @@ static bool laser_controller_service_load_profile_locked(void)
     }
 
     s_service.status.persistence_available = true;
-    err = nvs_get_blob(handle, LASER_CONTROLLER_SERVICE_NVS_KEY, &profile, &size);
+    err = nvs_get_blob(handle, LASER_CONTROLLER_SERVICE_NVS_KEY, NULL, &size);
+    if (err != ESP_OK) {
+        nvs_close(handle);
+        return false;
+    }
+
+    if (size == sizeof(profile)) {
+        err = nvs_get_blob(handle, LASER_CONTROLLER_SERVICE_NVS_KEY, &profile, &size);
+    } else if (size == sizeof(legacy_profile)) {
+        err = nvs_get_blob(
+            handle,
+            LASER_CONTROLLER_SERVICE_NVS_KEY,
+            &legacy_profile,
+            &size);
+        if (err == ESP_OK) {
+            laser_controller_service_migrate_v3_profile(&legacy_profile, &profile);
+            size = sizeof(profile);
+        }
+    } else {
+        err = ESP_ERR_INVALID_SIZE;
+    }
     nvs_close(handle);
     if (err != ESP_OK || size != sizeof(profile) ||
         !laser_controller_service_profile_is_valid(&profile)) {
@@ -615,6 +730,8 @@ static void laser_controller_service_apply_core_preset_locked(const char *profil
         s_service.status.profile_name,
         sizeof(s_service.status.profile_name),
         profile_name);
+    s_service.status.ld_rail_debug_enabled = false;
+    s_service.status.tec_rail_debug_enabled = false;
 
     s_service.status.modules[LASER_CONTROLLER_MODULE_IMU].expected_present = true;
     s_service.status.modules[LASER_CONTROLLER_MODULE_IMU].debug_enabled = true;
@@ -933,6 +1050,9 @@ void laser_controller_service_set_mode_requested(
 {
     portENTER_CRITICAL(&s_service_lock);
     s_service.status.service_mode_requested = enable;
+    if (!enable) {
+        s_service.status.haptic_driver_enable_requested = false;
+    }
     laser_controller_service_write_action_locked(
         enable ? "Service mode requested from host." :
                  "Service mode request cleared from host.",
@@ -1035,6 +1155,50 @@ bool laser_controller_service_set_module_state(
         now_ms);
     portEXIT_CRITICAL(&s_service_lock);
     return true;
+}
+
+bool laser_controller_service_set_supply_enable(
+    laser_controller_service_supply_t supply,
+    bool enabled,
+    laser_controller_time_ms_t now_ms)
+{
+    if (supply != LASER_CONTROLLER_SERVICE_SUPPLY_LD &&
+        supply != LASER_CONTROLLER_SERVICE_SUPPLY_TEC) {
+        return false;
+    }
+
+    portENTER_CRITICAL(&s_service_lock);
+    if (supply == LASER_CONTROLLER_SERVICE_SUPPLY_LD) {
+        s_service.status.ld_rail_debug_enabled = enabled;
+    } else {
+        s_service.status.tec_rail_debug_enabled = enabled;
+    }
+    laser_controller_service_touch_profile_locked();
+    laser_controller_service_write_action_locked(
+        enabled ?
+            (supply == LASER_CONTROLLER_SERVICE_SUPPLY_LD ?
+                 "Service rail request set: LD supply enabled." :
+                 "Service rail request set: TEC supply enabled.") :
+            (supply == LASER_CONTROLLER_SERVICE_SUPPLY_LD ?
+                 "Service rail request cleared: LD supply disabled." :
+                 "Service rail request cleared: TEC supply disabled."),
+        now_ms);
+    portEXIT_CRITICAL(&s_service_lock);
+    return true;
+}
+
+void laser_controller_service_set_haptic_driver_enable(
+    bool enabled,
+    laser_controller_time_ms_t now_ms)
+{
+    portENTER_CRITICAL(&s_service_lock);
+    s_service.status.haptic_driver_enable_requested = enabled;
+    laser_controller_service_write_action_locked(
+        enabled ?
+            "ERM driver enable requested on GPIO48 in service mode." :
+            "ERM driver enable cleared; GPIO48 forced low.",
+        now_ms);
+    portEXIT_CRITICAL(&s_service_lock);
 }
 
 void laser_controller_service_mark_runtime_status(
@@ -1388,11 +1552,17 @@ void laser_controller_service_fire_haptic_test(laser_controller_time_ms_t now_ms
     laser_controller_service_copy_text(
         s_service.status.last_i2c_op,
         sizeof(s_service.status.last_i2c_op),
-        err == ESP_OK ? "DRV2605 GO pulse applied." :
-                        "DRV2605 GO pulse unavailable on hardware.");
+        err == ESP_OK ?
+            "DRV2605 GO pulse applied." :
+            (err == ESP_ERR_INVALID_STATE ?
+                 "DRV2605 GO blocked: assert ERM EN on GPIO48 first." :
+                 "DRV2605 GO pulse unavailable on hardware."));
     laser_controller_service_write_action_locked(
-        err == ESP_OK ? "Haptic test fired in service mode." :
-                        "Haptic test request staged but hardware did not acknowledge.",
+        err == ESP_OK ?
+            "Haptic test fired in service mode." :
+            (err == ESP_ERR_INVALID_STATE ?
+                 "Haptic test blocked: ERM EN is low on GPIO48." :
+                 "Haptic test request staged but hardware did not acknowledge."),
         now_ms);
     portEXIT_CRITICAL(&s_service_lock);
 }
@@ -1819,6 +1989,39 @@ const char *laser_controller_service_module_name(laser_controller_module_t modul
         case LASER_CONTROLLER_MODULE_LASER_DRIVER:
             return "laser_driver";
         case LASER_CONTROLLER_MODULE_TEC:
+            return "tec";
+        default:
+            return "unknown";
+    }
+}
+
+bool laser_controller_service_parse_supply(
+    const char *name,
+    laser_controller_service_supply_t *supply)
+{
+    if (name == NULL || supply == NULL) {
+        return false;
+    }
+
+    if (strcmp(name, "ld") == 0) {
+        *supply = LASER_CONTROLLER_SERVICE_SUPPLY_LD;
+        return true;
+    }
+    if (strcmp(name, "tec") == 0) {
+        *supply = LASER_CONTROLLER_SERVICE_SUPPLY_TEC;
+        return true;
+    }
+
+    return false;
+}
+
+const char *laser_controller_service_supply_name(
+    laser_controller_service_supply_t supply)
+{
+    switch (supply) {
+        case LASER_CONTROLLER_SERVICE_SUPPLY_LD:
+            return "ld";
+        case LASER_CONTROLLER_SERVICE_SUPPLY_TEC:
             return "tec";
         default:
             return "unknown";
