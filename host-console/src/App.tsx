@@ -29,6 +29,9 @@ import { useDeviceSession } from './hooks/use-device-session'
 import {
   buildSafetyChecks,
   formatEnumLabel,
+  formatTofValidityLabel,
+  formatTofWindowSummary,
+  getTofDisplayDistanceM,
   summarizeSafetyChecks,
   toneFromSystemState,
 } from './lib/presentation'
@@ -42,6 +45,7 @@ import type {
 const HOST_THEME_STORAGE_KEY = 'bsl-host-theme'
 
 type AppView = 'overview' | 'control' | 'bringup' | 'events' | 'firmware' | 'service'
+type EventLogView = 'system' | 'comms'
 
 const navItems: Array<{
   id: AppView
@@ -120,6 +124,7 @@ function App() {
   const [eventQuery, setEventQuery] = useState('')
   const [eventSeverity, setEventSeverity] = useState<Severity | 'all'>('all')
   const [eventModuleFilter, setEventModuleFilter] = useState('all')
+  const [eventLogView, setEventLogView] = useState<EventLogView>('system')
   const [packageDescriptor, setPackageDescriptor] = useState<FirmwarePackageDescriptor | null>(null)
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => readStoredTheme())
 
@@ -145,6 +150,7 @@ function App() {
   const benchEstimate = useMemo(() => deriveBenchEstimate(snapshot), [snapshot])
   const safetyChecks = useMemo(() => buildSafetyChecks(snapshot), [snapshot])
   const safetySummary = useMemo(() => summarizeSafetyChecks(safetyChecks), [safetyChecks])
+  const tofDisplayDistance = useMemo(() => getTofDisplayDistanceM(snapshot), [snapshot])
   const heroKpis = useMemo(
     () => [
       {
@@ -673,15 +679,19 @@ function App() {
                       </div>
                       <div>
                         <dt>ToF validity</dt>
-                        <dd>{snapshot.tof.valid && snapshot.tof.fresh ? 'Fresh and valid' : 'Stale or invalid'}</dd>
+                        <dd>{formatTofValidityLabel(snapshot)}</dd>
                       </div>
                       <div>
                         <dt>Distance</dt>
-                        <dd>{formatNumber(snapshot.tof.distanceM, 2)} m</dd>
+                        <dd>
+                          {tofDisplayDistance !== null
+                            ? `${formatNumber(tofDisplayDistance, 2)} m`
+                            : 'No live sample'}
+                        </dd>
                       </div>
                       <div>
                         <dt>Allowed window</dt>
-                        <dd>See ToF bring-up and service safety pages</dd>
+                        <dd>{formatTofWindowSummary(snapshot)}</dd>
                       </div>
                     </dl>
                   </article>
@@ -691,6 +701,7 @@ function App() {
 
                 <EventTimeline
                   events={events}
+                  commands={commands}
                   query={eventQuery}
                   severity={eventSeverity}
                   moduleFilter={eventModuleFilter}
@@ -721,16 +732,49 @@ function App() {
 
             {activeView === 'events' ? (
               <>
-                <BusTrafficViewer events={events} commands={commands} />
-                <EventTimeline
-                  events={events}
-                  query={eventQuery}
-                  severity={eventSeverity}
-                  moduleFilter={eventModuleFilter}
-                  onQueryChange={setEventQuery}
-                  onSeverityChange={setEventSeverity}
-                  onModuleFilterChange={setEventModuleFilter}
-                />
+                <section className="panel-section log-workspace-switcher">
+                  <div className="panel-section__head">
+                    <div>
+                      <p className="eyebrow">Log workspace</p>
+                      <h2>Separate system and comms views</h2>
+                    </div>
+                    <p className="panel-note">
+                      Switch between controller/system history and the SPI or I2C traffic stream instead of stacking both on one page.
+                    </p>
+                  </div>
+                  <div className="segmented log-workspace-switcher__tabs">
+                    <button
+                      type="button"
+                      className={eventLogView === 'system' ? 'segmented__button is-active' : 'segmented__button'}
+                      onClick={() => setEventLogView('system')}
+                    >
+                      System log
+                    </button>
+                    <button
+                      type="button"
+                      className={eventLogView === 'comms' ? 'segmented__button is-active' : 'segmented__button'}
+                      onClick={() => setEventLogView('comms')}
+                    >
+                      Comms log
+                    </button>
+                  </div>
+                </section>
+
+                {eventLogView === 'system' ? (
+                  <EventTimeline
+                    events={events}
+                    commands={commands}
+                    query={eventQuery}
+                    severity={eventSeverity}
+                    moduleFilter={eventModuleFilter}
+                    onQueryChange={setEventQuery}
+                    onSeverityChange={setEventSeverity}
+                    onModuleFilterChange={setEventModuleFilter}
+                    mode="system"
+                  />
+                ) : (
+                  <BusTrafficViewer events={events} commands={commands} />
+                )}
               </>
             ) : null}
 

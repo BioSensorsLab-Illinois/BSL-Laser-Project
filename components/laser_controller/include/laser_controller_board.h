@@ -63,6 +63,19 @@ typedef struct {
 } laser_controller_board_haptic_readback_t;
 
 typedef struct {
+    bool reachable;
+    bool configured;
+    bool interrupt_line_high;
+    bool led_ctrl_asserted;
+    bool data_ready;
+    uint8_t boot_state;
+    uint8_t range_status;
+    uint16_t sensor_id;
+    uint16_t distance_mm;
+    int32_t last_error;
+} laser_controller_board_tof_readback_t;
+
+typedef struct {
     bool ld_rail_pgood;
     bool tec_rail_pgood;
     bool pd_contract_valid;
@@ -99,6 +112,7 @@ typedef struct {
     laser_controller_board_pd_readback_t pd_readback;
     laser_controller_board_imu_readback_t imu_readback;
     laser_controller_board_haptic_readback_t haptic_readback;
+    laser_controller_board_tof_readback_t tof_readback;
 } laser_controller_board_inputs_t;
 
 void laser_controller_board_init_safe_defaults(void);

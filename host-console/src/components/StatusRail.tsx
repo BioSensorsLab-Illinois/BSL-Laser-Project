@@ -9,7 +9,11 @@ import {
   computePitchMarginPercent,
   computePowerHeadroomPercent,
   computeTecSettlePercent,
+  formatTofDistanceDetail,
   formatEnumLabel,
+  formatTofWindowSummary,
+  formatTofValidityLabel,
+  getTofDisplayDistanceM,
 } from '../lib/presentation'
 import type { BringupModuleStatus, DeviceSnapshot } from '../types'
 
@@ -69,6 +73,12 @@ export function StatusRail({ snapshot }: StatusRailProps) {
   const imuAvailability = describeStripAvailability(snapshot.bringup.modules.imu, 'IMU posture sensing')
   const tecAvailability = describeStripAvailability(snapshot.bringup.modules.tec, 'TEC control')
   const laserAvailability = describeStripAvailability(snapshot.bringup.modules.laserDriver, 'Laser driver')
+  const tofDisplayDistance = getTofDisplayDistanceM(snapshot)
+  const tofHasRawReadback = snapshot.peripherals.tof.distanceMm > 0
+  const tofWithinWindow =
+    tofDisplayDistance !== null &&
+    tofDisplayDistance >= snapshot.safety.tofMinRangeM &&
+    tofDisplayDistance <= snapshot.safety.tofMaxRangeM
 
   const stats = [
     {
@@ -96,9 +106,13 @@ export function StatusRail({ snapshot }: StatusRailProps) {
       key: 'distance',
       label: 'Range margin',
       icon: Gauge,
-      value: tofAvailability.available ? `${formatNumber(snapshot.tof.distanceM, 2)} m` : tofAvailability.value,
+      value: tofAvailability.available
+        ? tofDisplayDistance !== null
+          ? `${formatNumber(tofDisplayDistance, 2)} m`
+          : formatTofValidityLabel(snapshot)
+        : tofAvailability.value,
       detail: tofAvailability.available
-        ? `${formatNumber(snapshot.tof.minRangeM, 2)}–${formatNumber(snapshot.tof.maxRangeM, 2)} m safe`
+        ? `${formatTofWindowSummary(snapshot)} • ${formatTofDistanceDetail(snapshot)}`
         : tofAvailability.detail,
       progress: tofAvailability.available ? distancePercent : 0,
       tone:
@@ -106,6 +120,8 @@ export function StatusRail({ snapshot }: StatusRailProps) {
           ? 'steady'
           : snapshot.tof.valid && snapshot.tof.fresh && distancePercent >= 55
           ? 'steady'
+          : tofHasRawReadback && tofWithinWindow
+            ? 'warning'
           : snapshot.tof.valid && snapshot.tof.fresh && distancePercent > 0
             ? 'warning'
             : 'critical',

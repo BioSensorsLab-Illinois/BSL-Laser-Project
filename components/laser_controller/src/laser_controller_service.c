@@ -355,7 +355,6 @@ static void laser_controller_service_sanitize_dac_settings_locked(void)
 {
     if (s_service.status.dac_reference ==
             LASER_CONTROLLER_SERVICE_DAC_REFERENCE_INTERNAL &&
-        s_service.status.dac_gain_2x &&
         !s_service.status.dac_ref_div) {
         s_service.status.dac_ref_div = true;
     }
@@ -1087,18 +1086,20 @@ esp_err_t laser_controller_service_set_dac_config(
     laser_controller_service_dac_sync_t sync_mode,
     laser_controller_time_ms_t now_ms)
 {
+    const bool effective_ref_div =
+        reference == LASER_CONTROLLER_SERVICE_DAC_REFERENCE_INTERNAL ? true : ref_div;
     const esp_err_t err =
         laser_controller_board_configure_dac_debug(
             reference,
             gain_2x,
-            ref_div,
+            effective_ref_div,
             sync_mode);
 
     portENTER_CRITICAL(&s_service_lock);
     if (err == ESP_OK) {
         s_service.status.dac_reference = reference;
         s_service.status.dac_gain_2x = gain_2x;
-        s_service.status.dac_ref_div = ref_div;
+        s_service.status.dac_ref_div = effective_ref_div;
         s_service.status.dac_sync_mode = sync_mode;
         laser_controller_service_sanitize_dac_settings_locked();
     }

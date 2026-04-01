@@ -6,6 +6,8 @@ This document finishes the firmware-facing pin designation using the uploaded ne
 
 - [MainPCB.NET](/Users/zz4/BSL/BSL-Laser/docs/Schematics/MainPCB.NET)
 - [MainPCB.pdf](/Users/zz4/BSL/BSL-Laser/docs/Schematics/MainPCB.pdf)
+- [ToF-LED-Board.NET](/Users/zz4/BSL/BSL-Laser/docs/Schematics/ToF-LED-Board.NET)
+- [ToF-LED-Board.pdf](/Users/zz4/BSL/BSL-Laser/docs/Schematics/ToF-LED-Board.pdf)
 - [BMS-Board.NET](/Users/zz4/BSL/BSL-Laser/docs/Schematics/BMS-Board.NET)
 - [BMS.pdf](/Users/zz4/BSL/BSL-Laser/docs/Schematics/BMS.pdf)
 - [USB_PD-PHY.NET](/Users/zz4/BSL/BSL-Laser/docs/Schematics/USB_PD-PHY.NET)
@@ -26,8 +28,9 @@ ESP32-S3 module pin numbers were cross-referenced against the official Espressif
    - the Sensor & LED board connector
    - the BMS battery-toggle connector
 3. `GPIO37` is electrically shared between the DRV2605 `IN/TRIG` input and the visible laser switch enable path.
-4. The current repository still does not include the Sensor & LED board netlist or schematic, so the ToF sensor, two-stage trigger, and any other sensor-board-only wiring remain unresolved at source level.
-5. The board as drawn assumes a compatible ESP32-S3 module variant that exposes `GPIO35/36/37` and supports `GPIO47/48` at 3.3 V logic.
+4. The ToF daughterboard is now source-backed and uses `VL53L1X` over the shared `GPIO4/GPIO5` I2C bus, with optional sideband on `GPIO7` and `GPIO6`.
+5. The separate button board is still unresolved at source level.
+6. The board as drawn assumes a compatible ESP32-S3 module variant that exposes `GPIO35/36/37` and supports `GPIO47/48` at 3.3 V logic.
 
 ## Confirmed ESP32 GPIO Map
 
@@ -130,7 +133,7 @@ The BMS board bridges the USB-PD board onto the same USB and I2C nets:
 
 ### MainPCB J2 Sensor & LED board
 
-This connector is present on the main board, but the mating board netlist is not in the repository:
+This connector is present on the main board and now cross-validates against the uploaded ToF daughterboard:
 
 | Pin | Net | Meaning |
 | --- | --- | --- |
@@ -147,8 +150,14 @@ This connector is present on the main board, but the mating board netlist is not
 
 Firmware implication:
 
-- the missing Sensor & LED board likely contains the unresolved ToF, button, or auxiliary LED circuitry
-- until that board is reviewed, `GPIO4/5/6/7` must remain board-configurable and safety-reviewed before hard binding new functions
+- confirmed ToF board wiring is:
+  - `GPIO4` -> `VL53L1X SDA`
+  - `GPIO5` -> `VL53L1X SCL`
+  - `GPIO7` -> recommended interrupt input from `VL53L1X GPIO1` (`LD_GPIO` on the daughterboard)
+  - `GPIO6` -> recommended output to the onboard LED-driver `CTRL` input (`LD_INT` on the daughterboard)
+- `VL53L1X XSHUT` is pulled up locally on the daughterboard and is not exported, so no dedicated MCU shutdown line exists on this revision
+- the ToF board is I2C only; do not route it onto the IMU SPI bus
+- `GPIO4/5/6/7` still must remain board-configurable because the separate button board is not yet source-backed
 
 ### BMS J2 battery-toggle connector
 
@@ -186,11 +195,11 @@ Production firmware should therefore lock the allowed module BOM, not just the s
 
 ## Remaining Unknowns
 
-The following are still not finished because the corresponding board files are not in the repository as of March 31, 2026:
+The following are still not finished:
 
-- ToF sensor device identity and pin-level wiring
 - two-stage trigger button pin-level wiring
-- any LED-board-only or sensor-board-only interrupts
-- whether the Sensor & LED board adds pull-ups or other loading to `GPIO4/5/6/7`
+- whether the final production button board shares or repurposes any of `GPIO4/5/6/7`
+- the exact firmware policy for `VL53L1X GPIO1` interrupt usage versus polling-only operation
+- the total added I2C pull-up/loading once every external daughterboard is populated
 
-Until those files exist, any firmware binding of ToF or trigger signals would still be a hardware assumption rather than a netlist-backed fact.
+The ToF board itself is no longer a netlist-level unknown, but the full external-board stack still needs review before hard-freezing every off-board GPIO assignment.

@@ -241,6 +241,8 @@ static void laser_controller_comms_write_peripheral_readback_json(
     const laser_controller_board_imu_readback_t *imu = &status->inputs.imu_readback;
     const laser_controller_board_haptic_readback_t *haptic =
         &status->inputs.haptic_readback;
+    const laser_controller_board_tof_readback_t *tof =
+        &status->inputs.tof_readback;
 
     fputs("\"peripherals\":{", stdout);
 
@@ -291,6 +293,25 @@ static void laser_controller_comms_write_peripheral_readback_json(
     (void)printf("\"lastErrorCode\":%ld,", (long)haptic->last_error);
     fputs("\"lastError\":", stdout);
     laser_controller_comms_write_error_name_json(haptic->last_error);
+    fputs("},", stdout);
+
+    fputs("\"tof\":{", stdout);
+    (void)printf("\"reachable\":%s,", tof->reachable ? "true" : "false");
+    (void)printf("\"configured\":%s,", tof->configured ? "true" : "false");
+    (void)printf(
+        "\"interruptLineHigh\":%s,",
+        tof->interrupt_line_high ? "true" : "false");
+    (void)printf(
+        "\"ledCtrlAsserted\":%s,",
+        tof->led_ctrl_asserted ? "true" : "false");
+    (void)printf("\"dataReady\":%s,", tof->data_ready ? "true" : "false");
+    (void)printf("\"bootState\":%u,", (unsigned)tof->boot_state);
+    (void)printf("\"rangeStatus\":%u,", (unsigned)tof->range_status);
+    (void)printf("\"sensorId\":%u,", (unsigned)tof->sensor_id);
+    (void)printf("\"distanceMm\":%u,", (unsigned)tof->distance_mm);
+    (void)printf("\"lastErrorCode\":%ld,", (long)tof->last_error);
+    fputs("\"lastError\":", stdout);
+    laser_controller_comms_write_error_name_json(tof->last_error);
     fputs("}", stdout);
 
     fputs("},", stdout);
@@ -727,6 +748,67 @@ static void laser_controller_comms_emit_error_response(
     fputs("}\n", stdout);
     fflush(stdout);
     laser_controller_comms_output_unlock();
+}
+
+static void laser_controller_comms_format_dac_block_reason(
+    char *buffer,
+    size_t buffer_len,
+    const laser_controller_runtime_status_t *status,
+    bool config_action)
+{
+    const laser_controller_module_status_t *module = NULL;
+    const laser_controller_board_dac_readback_t *dac = NULL;
+
+    if (buffer == NULL || buffer_len == 0U) {
+        return;
+    }
+
+    if (status == NULL) {
+        (void)snprintf(
+            buffer,
+            buffer_len,
+            config_action ?
+                "DAC config blocked; read STATUS." :
+                "DAC write blocked; read STATUS.");
+        return;
+    }
+
+    module = &status->bringup.modules[LASER_CONTROLLER_MODULE_DAC];
+    dac = &status->inputs.dac;
+
+    if (dac->ref_alarm) {
+        (void)snprintf(
+            buffer,
+            buffer_len,
+            "%s REF_ALARM asserted on DAC80502. STATUS=0x%04X GAIN=0x%04X CONFIG=0x%04X. On this 3.3 V board the internal 2.5 V reference requires REF-DIV=1.",
+            config_action ? "DAC config blocked;" : "DAC write blocked;",
+            (unsigned)dac->status_reg,
+            (unsigned)dac->gain_reg,
+            (unsigned)dac->config_reg);
+        return;
+    }
+
+    if (!module->expected_present && !module->debug_enabled) {
+        (void)snprintf(
+            buffer,
+            buffer_len,
+            "%s DAC module write gate is closed. expected_present=0 debug_enabled=0.",
+            config_action ? "DAC config blocked;" : "DAC write blocked;");
+        return;
+    }
+
+    (void)snprintf(
+        buffer,
+        buffer_len,
+        "%s DAC module armed but peripheral is not healthy. expected_present=%d debug_enabled=%d detected=%d healthy=%d STATUS=0x%04X GAIN=0x%04X CONFIG=0x%04X.",
+        config_action ? "DAC config blocked;" : "DAC write blocked;",
+        module->expected_present ? 1 : 0,
+        module->debug_enabled ? 1 : 0,
+        module->detected ? 1 : 0,
+        module->healthy ? 1 : 0,
+        (unsigned)dac->status_reg,
+        (unsigned)dac->gain_reg,
+        (unsigned)dac->config_reg);
 }
 
 static void laser_controller_comms_emit_status_response(
@@ -1654,10 +1736,12 @@ static void laser_controller_comms_handle_command_line(const char *line)
         err = laser_controller_service_set_dac_shadow(tec_channel, voltage_v, now_ms);
         if (err != ESP_OK) {
             if (err == ESP_ERR_INVALID_STATE) {
-                (void)snprintf(
+                (void)laser_controller_app_copy_status(&status);
+                laser_controller_comms_format_dac_block_reason(
                     text_arg,
                     sizeof(text_arg),
-                    "DAC write blocked; arm debug, read STATUS.");
+                    &status,
+                    false);
             } else {
                 snprintf(
                     text_arg,
@@ -1712,15 +1796,17 @@ static void laser_controller_comms_handle_command_line(const char *line)
             now_ms);
         if (err != ESP_OK) {
             if (err == ESP_ERR_INVALID_STATE) {
-                (void)snprintf(
+                (void)laser_controller_app_copy_status(&status);
+                laser_controller_comms_format_dac_block_reason(
                     text_arg,
                     sizeof(text_arg),
-                    "DAC config blocked; arm debug, read STATUS.");
+                    &status,
+                    true);
             } else if (err == ESP_ERR_INVALID_ARG) {
                 (void)snprintf(
                     text_arg,
                     sizeof(text_arg),
-                    "DAC config rejected; internal+x2 needs REF-DIV.");
+                    "DAC rejected; internal ref needs REF-DIV=1.");
             } else {
                 snprintf(
                     text_arg,

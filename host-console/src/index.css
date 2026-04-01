@@ -956,6 +956,18 @@ code {
   gap: 18px;
 }
 
+.log-workspace-switcher {
+  gap: 14px;
+}
+
+.log-workspace-switcher__tabs {
+  width: min(440px, 100%);
+}
+
+.log-workspace-switcher__tabs .segmented__button {
+  min-height: 46px;
+}
+
 .tools-section {
   gap: 16px;
 }
@@ -1426,6 +1438,36 @@ code {
   background:
     linear-gradient(180deg, var(--surface-elevated), var(--surface-strong)),
     var(--surface-soft);
+}
+
+.event-command-failures {
+  display: grid;
+  gap: 12px;
+  padding: 16px 18px;
+  border: 1px solid color-mix(in srgb, var(--critical) 24%, var(--line));
+  border-radius: 22px;
+  background: color-mix(in srgb, var(--status-critical-surface) 82%, var(--surface-strong));
+}
+
+.event-command-failure__copy {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+  align-content: start;
+}
+
+.event-command-failure__copy span {
+  color: var(--text-soft);
+  font-family: var(--mono);
+  font-size: 0.76rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.event-command-failure__note {
+  margin: 0;
+  color: var(--text-soft);
+  line-height: 1.45;
 }
 
 .event-toolbar.is-compact {
@@ -3132,6 +3174,10 @@ code {
   color: var(--text-soft);
 }
 
+.controller-busy-dialog__detail {
+  white-space: pre-wrap;
+}
+
 .bringup-busy-dialog p,
 .bringup-busy-dialog small,
 .controller-busy-dialog p,
@@ -3434,6 +3480,14 @@ code {
   background: rgba(17, 26, 45, 0.025);
 }
 
+.bringup-fact-grid > div.is-critical-glow {
+  border-color: color-mix(in srgb, var(--critical) 56%, var(--line));
+  background: color-mix(in srgb, var(--critical) 12%, var(--panel));
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--critical) 20%, transparent),
+    0 0 28px color-mix(in srgb, var(--critical) 24%, transparent);
+}
+
 .bringup-fact-grid span {
   display: block;
   margin-bottom: 6px;
@@ -3443,6 +3497,10 @@ code {
 
 .bringup-fact-grid strong {
   font-size: 1rem;
+}
+
+.bringup-fact-grid > div.is-critical-glow strong {
+  color: var(--critical-strong);
 }
 
 .bringup-fact-grid--compact {

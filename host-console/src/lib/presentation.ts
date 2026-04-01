@@ -16,6 +16,68 @@ export type SafetyCheck = {
   tone: UiTone
 }
 
+export function getTofDisplayDistanceM(snapshot: DeviceSnapshot): number | null {
+  if (snapshot.tof.valid && snapshot.tof.fresh) {
+    return snapshot.tof.distanceM
+  }
+
+  if (snapshot.peripherals.tof.distanceMm > 0) {
+    return snapshot.peripherals.tof.distanceMm / 1000
+  }
+
+  if (snapshot.tof.distanceM > 0) {
+    return snapshot.tof.distanceM
+  }
+
+  return null
+}
+
+export function formatTofValidityLabel(snapshot: DeviceSnapshot): string {
+  if (snapshot.tof.valid && snapshot.tof.fresh) {
+    return 'Fresh and valid'
+  }
+
+  if (snapshot.peripherals.tof.reachable && snapshot.peripherals.tof.distanceMm > 0) {
+    return 'Raw peripheral reading only'
+  }
+
+  if (snapshot.peripherals.tof.reachable && snapshot.peripherals.tof.configured) {
+    return 'Configured, awaiting range sample'
+  }
+
+  if (snapshot.peripherals.tof.reachable) {
+    return 'Reachable, not configured'
+  }
+
+  return 'Stale or invalid'
+}
+
+export function formatTofWindowSummary(snapshot: DeviceSnapshot): string {
+  return `${formatNumber(snapshot.safety.tofMinRangeM, 2)}–${formatNumber(snapshot.safety.tofMaxRangeM, 2)} m safe • ${snapshot.safety.tofStaleMs} ms timeout`
+}
+
+export function formatTofDistanceDetail(snapshot: DeviceSnapshot): string {
+  const distance = getTofDisplayDistanceM(snapshot)
+
+  if (distance !== null && snapshot.tof.valid && snapshot.tof.fresh) {
+    return `${formatNumber(distance, 2)} m live • controller-valid safety sample`
+  }
+
+  if (distance !== null && snapshot.peripherals.tof.distanceMm > 0) {
+    return `${formatNumber(distance, 2)} m raw VL53L1X readback • not yet safety-valid`
+  }
+
+  if (snapshot.peripherals.tof.reachable && snapshot.peripherals.tof.configured) {
+    return 'VL53L1X is configured, but no data-ready range sample is available yet'
+  }
+
+  if (snapshot.peripherals.tof.reachable) {
+    return 'VL53L1X responds on I2C, but setup has not completed yet'
+  }
+
+  return 'No live VL53L1X reading is available yet'
+}
+
 export function formatEnumLabel(value: string): string {
   const uppercaseTokens = new Set([
     'NIR',
@@ -79,13 +141,14 @@ export function computePowerHeadroomPercent(snapshot: DeviceSnapshot): number {
 }
 
 export function computeDistanceWindowPercent(snapshot: DeviceSnapshot): number {
-  if (!snapshot.tof.valid || !snapshot.tof.fresh) {
+  const distance = getTofDisplayDistanceM(snapshot)
+
+  if (distance === null) {
     return 0
   }
 
-  const min = snapshot.tof.minRangeM
-  const max = snapshot.tof.maxRangeM
-  const distance = snapshot.tof.distanceM
+  const min = snapshot.safety.tofMinRangeM
+  const max = snapshot.safety.tofMaxRangeM
 
   if (distance < min || distance > max || max <= min) {
     return 0
@@ -132,6 +195,25 @@ export function buildSafetyChecks(snapshot: DeviceSnapshot): SafetyCheck[] {
   const pitchProgress = computePitchMarginPercent(snapshot)
   const distanceProgress = computeDistanceWindowPercent(snapshot)
   const tecProgress = computeTecSettlePercent(snapshot)
+  const tofDisplayDistance = getTofDisplayDistanceM(snapshot)
+  const tofWindowDetail = formatTofWindowSummary(snapshot)
+  const tofPass =
+    snapshot.tof.valid &&
+    snapshot.tof.fresh &&
+    tofDisplayDistance !== null &&
+    tofDisplayDistance >= snapshot.safety.tofMinRangeM &&
+    tofDisplayDistance <= snapshot.safety.tofMaxRangeM
+
+  let tofDetail = 'No valid range sample'
+  if (tofDisplayDistance !== null && snapshot.tof.valid && snapshot.tof.fresh) {
+    tofDetail = `${formatNumber(tofDisplayDistance, 2)} m live • ${tofWindowDetail}`
+  } else if (tofDisplayDistance !== null) {
+    tofDetail = `${formatNumber(tofDisplayDistance, 2)} m raw • controller still holds unsafe`
+  } else if (snapshot.peripherals.tof.reachable && snapshot.peripherals.tof.configured) {
+    tofDetail = 'VL53L1X configured • no data-ready sample yet'
+  } else if (snapshot.peripherals.tof.reachable) {
+    tofDetail = 'VL53L1X reachable • configuration incomplete'
+  }
 
   const checks: SafetyCheck[] = [
     {
@@ -186,20 +268,10 @@ export function buildSafetyChecks(snapshot: DeviceSnapshot): SafetyCheck[] {
     },
     {
       label: 'Distance window safe',
-      pass:
-        snapshot.tof.valid &&
-        snapshot.tof.fresh &&
-        snapshot.tof.distanceM >= snapshot.tof.minRangeM &&
-        snapshot.tof.distanceM <= snapshot.tof.maxRangeM,
-      detail: `${formatNumber(snapshot.tof.distanceM, 2)} m live`,
+      pass: tofPass,
+      detail: tofDetail,
       progress: distanceProgress,
-      tone: toneFromProgress(
-        distanceProgress,
-        snapshot.tof.valid &&
-          snapshot.tof.fresh &&
-          snapshot.tof.distanceM >= snapshot.tof.minRangeM &&
-          snapshot.tof.distanceM <= snapshot.tof.maxRangeM,
-      ),
+      tone: toneFromProgress(distanceProgress, tofPass),
     },
     {
       label: 'Driver loop good',

@@ -397,10 +397,7 @@ function makeFormState(snapshot: DeviceSnapshot): BringupFormState {
 }
 
 function sanitizeDacDraft(form: BringupFormState): BringupFormState {
-  const dacRefDiv =
-    form.dacReferenceMode === 'internal' && form.dacGain2x
-      ? true
-      : form.dacRefDiv
+  const dacRefDiv = form.dacReferenceMode === 'internal' ? true : form.dacRefDiv
 
   return {
     ...form,
@@ -795,6 +792,22 @@ export function BringupWorkbench({
     await waitForOperationConfirm()
   }
 
+  function describeDacCommandFailure(note: string): string {
+    if (!note.toLowerCase().includes('dac')) {
+      return note
+    }
+
+    const live = latestSnapshotRef.current
+    const module = live.bringup.modules.dac
+    const dac = live.peripherals.dac
+
+    return [
+      note,
+      `Live DAC expected=${module.expectedPresent ? 1 : 0} debug=${module.debugEnabled ? 1 : 0} detected=${module.detected ? 1 : 0} healthy=${module.healthy ? 1 : 0}.`,
+      `STATUS ${formatRegisterHex(dac.statusReg)}; REF_ALARM ${dac.refAlarm ? 'asserted' : 'clear'}; GAIN ${formatRegisterHex(dac.gainReg)}; CONFIG ${formatRegisterHex(dac.configReg)}.`,
+    ].join(' ')
+  }
+
   function patchForm<K extends keyof BringupFormState>(
     key: K,
     value: BringupFormState[K],
@@ -873,73 +886,85 @@ export function BringupWorkbench({
       return
     }
 
-    const timerId = window.setTimeout(() => {
-      if (operationBusyRef.current || probeBusyRef.current || moduleSyncBusyRef.current) {
+    let cancelled = false
+
+    const syncModulePlan = async () => {
+      if (
+        cancelled ||
+        operationBusyRef.current ||
+        probeBusyRef.current ||
+        moduleSyncBusyRef.current
+      ) {
         return
       }
 
       moduleSyncBusyRef.current = true
       probeBusyRef.current = true
 
-      void (async () => {
-        let syncedCount = 0
+      let syncedCount = 0
 
-        try {
-          const liveModulesSnapshot = latestSnapshotRef.current.bringup.modules
+      try {
+        const liveModulesSnapshot = latestSnapshotRef.current.bringup.modules
 
-          for (const module of moduleKeys) {
-            const planned = form.modules[module]
-            const live = liveModulesSnapshot[module]
+        for (const module of moduleKeys) {
+          const planned = form.modules[module]
+          const live = liveModulesSnapshot[module]
 
-            if (
-              planned.expectedPresent === live.expectedPresent &&
-              planned.debugEnabled === live.debugEnabled
-            ) {
-              continue
-            }
-
-            const result = await onIssueCommandAwaitAck(
-              'set_module_state',
-              'write',
-              `Auto-sync bring-up plan for ${moduleMeta[module].label}.`,
-              {
-                module: toFirmwareModuleName(module),
-                expected_present: planned.expectedPresent,
-                debug_enabled: planned.debugEnabled,
-              },
-              {
-                logHistory: false,
-                timeoutMs: BRINGUP_ACK_TIMEOUT_MS,
-              },
-            )
-
-            if (!result.ok) {
-              setDraftNote(
-                `${moduleMeta[module].label} plan did not auto-sync: ${result.note}`,
-              )
-              return
-            }
-
-            syncedCount += 1
+          if (
+            planned.expectedPresent === live.expectedPresent &&
+            planned.debugEnabled === live.debugEnabled
+          ) {
+            continue
           }
 
-          if (syncedCount > 0) {
-            void pollLiveStatus(false)
+          const result = await onIssueCommandAwaitAck(
+            'set_module_state',
+            'write',
+            `Auto-sync bring-up plan for ${moduleMeta[module].label}.`,
+            {
+              module: toFirmwareModuleName(module),
+              expected_present: planned.expectedPresent,
+              debug_enabled: planned.debugEnabled,
+            },
+            {
+              logHistory: false,
+              timeoutMs: BRINGUP_ACK_TIMEOUT_MS,
+            },
+          )
+
+          if (!result.ok) {
             setDraftNote(
-              syncedCount === 1
-                ? 'One module plan auto-synced to the controller.'
-                : `${syncedCount} module plans auto-synced to the controller.`,
+              `${moduleMeta[module].label} plan did not auto-sync: ${result.note}`,
             )
+            return
           }
-        } finally {
-          probeBusyRef.current = false
-          moduleSyncBusyRef.current = false
+
+          syncedCount += 1
         }
-      })()
-    }, 280)
+
+        if (syncedCount > 0) {
+          void pollLiveStatus(false)
+          setDraftNote(
+            syncedCount === 1
+              ? 'One module plan auto-synced to the controller.'
+              : `${syncedCount} module plans auto-synced to the controller.`,
+          )
+        }
+      } finally {
+        probeBusyRef.current = false
+        moduleSyncBusyRef.current = false
+      }
+    }
+
+    void syncModulePlan()
+
+    const timerId = window.setInterval(() => {
+      void syncModulePlan()
+    }, 320)
 
     return () => {
-      window.clearTimeout(timerId)
+      cancelled = true
+      window.clearInterval(timerId)
     }
   }, [
     connected,
@@ -1164,6 +1189,12 @@ export function BringupWorkbench({
       requireService?: boolean
       logHistory?: boolean
       timeoutMs?: number
+      retryOnModuleBlocked?: {
+        module: ModuleKey
+        expectedPresent: boolean
+        debugEnabled: boolean
+        label: string
+      }
     }>,
     options?: {
       refreshAfter?: boolean
@@ -1242,8 +1273,62 @@ export function BringupWorkbench({
           }
         }
 
+        if (
+          !result.ok &&
+          step.retryOnModuleBlocked !== undefined &&
+          result.note.toLowerCase().includes('arm debug')
+        ) {
+          setOperation({
+            label,
+            detail: `Controller still reports ${step.retryOnModuleBlocked.label} write-gate closed. Re-syncing the module plan and retrying once...`,
+            percent: Math.max(
+              28,
+              Math.round((completedSteps / totalSteps) * 100),
+            ),
+            tone: 'warning',
+          })
+
+          const resyncResult = await onIssueCommandAwaitAck(
+            'set_module_state',
+            'write',
+            `Re-sync the ${step.retryOnModuleBlocked.label} module plan before retrying the write.`,
+            {
+              module: toFirmwareModuleName(step.retryOnModuleBlocked.module),
+              expected_present: step.retryOnModuleBlocked.expectedPresent,
+              debug_enabled: step.retryOnModuleBlocked.debugEnabled,
+            },
+            {
+              logHistory: false,
+              timeoutMs: BRINGUP_ACK_TIMEOUT_MS,
+            },
+          )
+
+          if (resyncResult.ok) {
+            await pause(80)
+            const refreshResult = await pollLiveStatus(false)
+
+            if (refreshResult.ok) {
+              result = await onIssueCommandAwaitAck(
+                step.cmd,
+                step.risk,
+                step.note,
+                step.args,
+                {
+                  logHistory: step.logHistory ?? true,
+                  timeoutMs: step.timeoutMs ?? BRINGUP_ACK_TIMEOUT_MS,
+                },
+              )
+            }
+          }
+        }
+
         if (!result.ok) {
-          await holdOperationError(label, result.note)
+          await holdOperationError(
+            label,
+            step.cmd === 'dac_debug_config'
+              ? describeDacCommandFailure(result.note)
+              : result.note,
+          )
           clearOnExit = false
           return false
         }
@@ -1518,6 +1603,13 @@ export function BringupWorkbench({
           },
         },
         {
+          detail: 'Refreshing live DAC module state before write...',
+          cmd: 'get_status',
+          risk: 'read',
+          note: 'Refresh the live bring-up snapshot after arming DAC writes.',
+          logHistory: false,
+        },
+        {
           detail: 'Applying DAC reference and update policy...',
           cmd: 'dac_debug_config',
           risk: 'service',
@@ -1528,6 +1620,12 @@ export function BringupWorkbench({
             gain_2x: preparedForm.dacGain2x,
             ref_div: preparedForm.dacRefDiv,
             sync_mode: preparedForm.dacSyncMode,
+          },
+          retryOnModuleBlocked: {
+            module: 'dac',
+            expectedPresent: preparedForm.modules.dac.expectedPresent,
+            debugEnabled: preparedForm.modules.dac.debugEnabled,
+            label: moduleMeta.dac.label,
           },
         },
         {
@@ -2139,7 +2237,12 @@ export function BringupWorkbench({
     }
 
     const timerId = window.setInterval(() => {
-      if (operationBusyRef.current || probeBusyRef.current) {
+      if (
+        desiredModulePlanSignature !== liveModulePlanSignature ||
+        operationBusyRef.current ||
+        probeBusyRef.current ||
+        moduleSyncBusyRef.current
+      ) {
         return
       }
 
@@ -2164,7 +2267,13 @@ export function BringupWorkbench({
     return () => {
       window.clearInterval(timerId)
     }
-  }, [connected, form.modules, onIssueCommandAwaitAck])
+  }, [
+    connected,
+    desiredModulePlanSignature,
+    form.modules,
+    liveModulePlanSignature,
+    onIssueCommandAwaitAck,
+  ])
 
   function renderModuleSettings(module: ModuleKey) {
     const liveStatus = displayModules[module]
@@ -3121,8 +3230,7 @@ export function BringupWorkbench({
   }
 
   function renderDacPage() {
-    const dacModeNeedsRefDiv =
-      form.dacReferenceMode === 'internal' && form.dacGain2x && !form.dacRefDiv
+    const dacInternalReferenceSelected = form.dacReferenceMode === 'internal'
 
     return (
       <div className="bringup-page-grid">
@@ -3191,8 +3299,13 @@ export function BringupWorkbench({
             <label className="arming-toggle is-compact">
               <input
                 type="checkbox"
-                checked={form.dacRefDiv}
-                title="Enable the reference divide-by-two path for span scaling."
+                checked={dacInternalReferenceSelected ? true : form.dacRefDiv}
+                disabled={dacInternalReferenceSelected}
+                title={
+                  dacInternalReferenceSelected
+                    ? 'REF-DIV is forced on with the internal 2.5 V reference on this 3.3 V board.'
+                    : 'Enable the reference divide-by-two path for span scaling.'
+                }
                 onChange={(event) => patchForm('dacRefDiv', event.target.checked)}
               />
               <span>Reference divider enabled</span>
@@ -3203,11 +3316,11 @@ export function BringupWorkbench({
             Board-valid DAC output span on this PCB is `0.0-2.5 V` for both channels.
             `DAC_OUTA` drives laser `LISH`; `DAC_OUTB` drives TEC `TMS`.
           </p>
-          {dacModeNeedsRefDiv ? (
+          {dacInternalReferenceSelected ? (
             <p className="inline-help">
-              Internal reference with gain `x2` needs the reference divider enabled on this
-              `3.3 V` board. If `REF-DIV` is off, the DAC trips `REF-ALARM` and both outputs
-              collapse to `0 V`.
+              On this `3.3 V` board, the DAC80502 internal `2.5 V` reference requires
+              `REF-DIV` enabled. The controller auto-enforces that rule; if it is violated,
+              `REF-ALARM` forces both outputs to `0 V`.
             </p>
           ) : null}
 
@@ -3241,12 +3354,8 @@ export function BringupWorkbench({
             <button
               type="button"
               className="action-button is-inline is-accent"
-              disabled={writesDisabled || dacModeNeedsRefDiv}
-              title={
-                dacModeNeedsRefDiv
-                  ? 'Enable the reference divider before applying an internal-reference x2 gain DAC profile on this 3.3 V board.'
-                  : 'Push the full DAC bring-up profile and both channel shadow voltages.'
-              }
+              disabled={writesDisabled}
+              title="Push the full DAC bring-up profile and both channel shadow voltages."
               onClick={() => {
                 void applyDacProfile()
               }}
@@ -3360,7 +3469,7 @@ export function BringupWorkbench({
               <span>Configured in silicon</span>
               <strong>{snapshot.peripherals.dac.configured ? 'Yes' : 'No'}</strong>
             </div>
-            <div>
+            <div className={snapshot.peripherals.dac.refAlarm ? 'is-critical-glow' : undefined}>
               <span>REF_ALARM</span>
               <strong>{snapshot.peripherals.dac.refAlarm ? 'Asserted' : 'Clear'}</strong>
             </div>
@@ -3665,19 +3774,20 @@ export function BringupWorkbench({
         <article className="panel-cutout">
           <div className="cutout-head">
             <Waves size={16} />
-            <strong>Safety window placeholder</strong>
+            <strong>VL53L1X board status</strong>
           </div>
           <p className="panel-note">
-            The repository still does not include the ToF datasheet or the missing
-            Sensor and LED board files. This page only stages generic safety limits
-            and freshness expectations. It does not imply a real device model.
+            This board is now modeled as a shared-I2C `VL53L1X` daughtercard.
+            Firmware probes `0x29` on `GPIO4/GPIO5`, treats `GPIO7` as the optional
+            `GPIO1` interrupt input, and holds `GPIO6` low so the onboard LED-driver
+            control path stays inactive unless it is intentionally exercised.
           </p>
 
           <div className="field-grid">
             <label className="field">
               <FieldLabel
-                label="Minimum range"
-                help="Lower bound for the allowed distance window in meters."
+                label="Minimum safe range (m)"
+                help="Lower bound of the allowed distance window. Any reading below this limit is treated as unsafe."
               />
               <input
                 value={form.tofMinRangeM}
@@ -3688,8 +3798,8 @@ export function BringupWorkbench({
 
             <label className="field">
               <FieldLabel
-                label="Maximum range"
-                help="Upper bound for the allowed distance window in meters."
+                label="Maximum safe range (m)"
+                help="Upper bound of the allowed distance window. Any reading above this limit is treated as unsafe."
               />
               <input
                 value={form.tofMaxRangeM}
@@ -3700,8 +3810,8 @@ export function BringupWorkbench({
 
             <label className="field">
               <FieldLabel
-                label="Stale timeout"
-                help="Freshness budget in milliseconds. Unknown or stale distance should be treated unsafe."
+                label="Stale-data timeout (ms)"
+                help="Freshness budget in milliseconds. If the controller does not receive a new valid sample before this timeout expires, the distance path is treated as unsafe."
               />
               <input
                 value={form.tofStaleTimeoutMs}
@@ -3710,6 +3820,12 @@ export function BringupWorkbench({
               />
             </label>
           </div>
+
+          <p className="inline-help">
+            Distance limits are in meters. The stale timeout is in milliseconds.
+            Unknown, out-of-window, or older-than-timeout samples must force the
+            controller to treat the ToF path as unsafe.
+          </p>
 
           <div className="button-row">
             <button
@@ -3727,14 +3843,66 @@ export function BringupWorkbench({
 
           <div className="bringup-fact-grid">
             <div>
-              <span>Live distance</span>
+              <span>Controller live distance</span>
               <strong>{formatNumber(snapshot.tof.distanceM, 2)} m</strong>
             </div>
             <div>
-              <span>Validity</span>
-              <strong>{snapshot.tof.valid && snapshot.tof.fresh ? 'Fresh' : 'Unsafe'}</strong>
+              <span>Controller validity</span>
+              <strong>{snapshot.tof.valid && snapshot.tof.fresh ? 'Fresh + valid' : 'Unsafe / held low'}</strong>
+            </div>
+            <div>
+              <span>Peripheral probe</span>
+              <strong>{snapshot.peripherals.tof.reachable ? 'Reachable' : 'No response'}</strong>
+            </div>
+            <div>
+              <span>Sensor ID</span>
+              <strong>{`0x${snapshot.peripherals.tof.sensorId.toString(16).toUpperCase().padStart(4, '0')}`}</strong>
+            </div>
+            <div>
+              <span>Boot state register</span>
+              <strong>{snapshot.peripherals.tof.bootState}</strong>
+            </div>
+            <div>
+              <span>Configured</span>
+              <strong>{snapshot.peripherals.tof.configured ? 'Yes' : 'No'}</strong>
+            </div>
+            <div>
+              <span>Data-ready flag</span>
+              <strong>{snapshot.peripherals.tof.dataReady ? 'Yes' : 'No'}</strong>
+            </div>
+            <div>
+              <span>Range status code</span>
+              <strong>{snapshot.peripherals.tof.rangeStatus}</strong>
+            </div>
+            <div>
+              <span>Raw distance register</span>
+              <strong>{snapshot.peripherals.tof.distanceMm} mm</strong>
+            </div>
+            <div>
+              <span>GPIO1 interrupt line</span>
+              <strong>{snapshot.peripherals.tof.interruptLineHigh ? 'High' : 'Low'}</strong>
+            </div>
+            <div>
+              <span>LED control line</span>
+              <strong>{snapshot.peripherals.tof.ledCtrlAsserted ? 'Asserted' : 'Held low'}</strong>
+            </div>
+            <div>
+              <span>Last low-level result</span>
+              <strong>{snapshot.peripherals.tof.lastError}</strong>
             </div>
           </div>
+
+          <p className="inline-help">
+            These fields should now reflect actual `VL53L1X` peripheral readback:
+            probe reachability, boot state, sensor ID, data-ready state, range
+            status, and the raw distance register in millimeters.
+          </p>
+          <p className="inline-help">
+            `Controller live distance` and `Controller validity` are the safety-path
+            values the rest of the GUI uses for interlock cards. `Raw distance register`
+            is direct peripheral readback and may be present before the controller
+            promotes it into a valid, fresh safety sample.
+          </p>
         </article>
       </div>
     )

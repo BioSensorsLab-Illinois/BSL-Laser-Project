@@ -279,6 +279,57 @@ const pdRegisters: RegisterMap = {
   },
 }
 
+const tofRegisters: RegisterMap = {
+  '0x0030': {
+    name: 'GPIO_HV_MUX__CTRL',
+    summary: 'Interrupt polarity control',
+    describe: () =>
+      'Controls the VL53L1X GPIO1 interrupt polarity. The firmware reads this before checking whether a new measurement is ready.',
+  },
+  '0x0031': {
+    name: 'GPIO__TIO_HV_STATUS',
+    summary: 'Data-ready interrupt status',
+    describe: () =>
+      'Reports the current GPIO1 interrupt state. Firmware uses this together with the configured polarity to decide whether a fresh ranging result is available.',
+  },
+  '0x0086': {
+    name: 'SYSTEM__INTERRUPT_CLEAR',
+    summary: 'Interrupt clear register',
+    describe: () =>
+      'Must be written after a result is consumed so the next ranging sample can raise data-ready again.',
+  },
+  '0x0087': {
+    name: 'SYSTEM__MODE_START',
+    summary: 'Ranging start and stop control',
+    describe: () =>
+      'Writing 0x40 starts continuous ranging. Writing 0x00 stops the measurement engine.',
+  },
+  '0x0089': {
+    name: 'RESULT__RANGE_STATUS',
+    summary: 'Measurement validity code',
+    describe: () =>
+      'Raw range-status code from the sensor. Zero-equivalent means the distance is usable; nonzero codes indicate sigma, signal, bounds, or wraparound faults.',
+  },
+  '0x0096': {
+    name: 'RESULT__FINAL_CROSSTALK_CORRECTED_RANGE_MM_SD0',
+    summary: 'Distance result in millimeters',
+    describe: () =>
+      'Primary distance result register read by the firmware once the VL53L1X reports data ready.',
+  },
+  '0x00e5': {
+    name: 'FIRMWARE__SYSTEM_STATUS',
+    summary: 'Boot-state register',
+    describe: () =>
+      'Returns 1 once the sensor has completed boot. Firmware should not attempt full configuration until this register reports boot complete.',
+  },
+  '0x010f': {
+    name: 'IDENTIFICATION__MODEL_ID',
+    summary: 'Sensor identification word',
+    describe: () =>
+      'Should read back 0xEACC on a real VL53L1X. This is the cleanest identity check before starting ranging.',
+  },
+}
+
 const i2cDevices: Record<string, KnownBusTarget> = {
   '0x28': {
     key: 'stusb4500',
@@ -290,6 +341,17 @@ const i2cDevices: Record<string, KnownBusTarget> = {
     benchRole:
       'Negotiates source power, exposes active PDO and RDO status, and feeds the firmware power-tier classifier.',
     registers: pdRegisters,
+  },
+  '0x29': {
+    key: 'vl53l1x',
+    module: 'tof',
+    device: 'VL53L1X',
+    bus: 'i2c',
+    addressHex: '0x29',
+    purpose: 'Distance sensor on the external ToF daughterboard.',
+    benchRole:
+      'Uses the shared GPIO4/GPIO5 I2C bus. GPIO7 is the optional GPIO1 interrupt line, and GPIO6 is the separate LED-control sideband for the board illumination path.',
+    registers: tofRegisters,
   },
   '0x48': {
     key: 'dac80502',
@@ -409,6 +471,7 @@ export function describeSpiSelection(
 export function listKnownBusTargets(): KnownBusTarget[] {
   return [
     i2cDevices['0x28'],
+    i2cDevices['0x29'],
     i2cDevices['0x48'],
     i2cDevices['0x5a'],
     spiDevices.imu,
@@ -418,6 +481,7 @@ export function listKnownBusTargets(): KnownBusTarget[] {
 export function listKnownI2cTargets(): KnownBusTarget[] {
   return [
     i2cDevices['0x28'],
+    i2cDevices['0x29'],
     i2cDevices['0x48'],
     i2cDevices['0x5a'],
   ]
@@ -439,7 +503,7 @@ function parseI2cScan(detail: string): SessionEvent | null {
       title: 'I2C scan unavailable',
       detail: normalized,
       decodedDetail:
-        'GPIO4/GPIO5 are the shared bench I2C bus on this board. Expected populated targets are STUSB4500 at 0x28, DAC80502 at 0x48, and DRV2605 at 0x5A. If SDA is held low, no address probe can complete reliably.',
+        'GPIO4/GPIO5 are the shared bench I2C bus on this board. Expected populated targets are STUSB4500 at 0x28, VL53L1X at 0x29, DAC80502 at 0x48, and DRV2605 at 0x5A. If SDA is held low, no address probe can complete reliably.',
       module: 'bus',
       source: 'derived',
       bus: 'i2c',
@@ -457,7 +521,7 @@ function parseI2cScan(detail: string): SessionEvent | null {
       title: 'No known I2C target acknowledged',
       detail: normalized,
       decodedDetail:
-        'The bench scan only probes the known shared-I2C targets for this board: STUSB4500 at 0x28, DAC80502 at 0x48, and DRV2605 at 0x5A.',
+        'The bench scan only probes the known shared-I2C targets for this board: STUSB4500 at 0x28, VL53L1X at 0x29, DAC80502 at 0x48, and DRV2605 at 0x5A.',
       module: 'bus',
       source: 'derived',
       bus: 'i2c',

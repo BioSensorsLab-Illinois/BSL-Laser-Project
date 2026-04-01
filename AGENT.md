@@ -105,11 +105,15 @@ Preserve a firmware architecture where the default answer to any ambiguity is:
 - Bring-up plan metadata (`set_profile_name`, `set_module_state`, `save_bringup_profile`) is intentionally allowed outside service mode so the bench build plan can be saved without opening a hardware write session.
 - Read-only bring-up probes (`i2c_scan`, `i2c_read`, `spi_read`) are intentionally allowed outside service mode.
 - The Bring-up page now auto-syncs local module expectation/debug flags into firmware when connected. The operator should not have to click `Save module plan` before a normal per-module `Apply ...` action becomes predictable.
+- That auto-sync must keep retrying until the controller plan actually matches the local host draft. It must not be a one-shot timer that gives up forever just because a background probe happened to be running at the wrong moment.
+- Background bring-up probes should stay paused while local module-plan sync is still outstanding. Otherwise the UI can show `Awaiting probe` for a module that is physically present simply because the controller never received the expected-present flag yet.
 - The Events page now contains a dedicated decoded bus-traffic viewer for all SPI/I2C communication. It is the preferred place to isolate communication for a single module or device before dropping into manual Bus Lab reads.
+- The Events workspace should also surface failed host commands directly from command history, not only from derived transport events. A rejected `dac_debug_config` or similar service write must remain visible even if the inspector rail is collapsed.
 - Service-mode peripheral writes should only succeed when the module is armed for writes through the bring-up plan (`expected_present` or `debug_enabled`). They must not return fake success when the module plan still disallows hardware access.
 - The host Bring-up `Apply ...` actions should sync that module's current plan to firmware before attempting the module-specific write, so a stale unsaved checkbox state cannot make hardware writes look dead.
+- The DAC Bring-up path should explicitly refresh live module state after arming the DAC module plan, and it should retry `dac_debug_config` once after a forced module-plan resync if the controller still reports the DAC write gate as blocked.
 - DAC80502 init on this board needs a short settle period after software reset before follow-on register writes. Without that delay, `dac_debug_config` can fail intermittently with `ESP_ERR_INVALID_RESPONSE` even though the DAC is physically present.
-- DAC80502 on this board is powered from `3.3 V` and drives `0-2.5 V` command nets. With the internal `2.5 V` reference, `gain x2` requires `REF-DIV=1`; otherwise `REF-ALARM` forces both outputs to `0 V` even though the DAC data registers still read back correctly.
+- DAC80502 on this board is powered from `3.3 V` and drives `0-2.5 V` command nets. With the internal `2.5 V` reference, `REF-DIV=1` is required on this board even at `gain x1`; otherwise `REF-ALARM` forces both outputs to `0 V` even though the DAC data registers still read back correctly.
 - STUSB4500 PDO writes should verify register readback and trigger PD soft-reset renegotiation before the host treats the apply as complete.
 - The new `pd_save_firmware_plan` path is MCU-owned persistence, not STUSB4500 NVM. It must validate runtime PDO readback first, then save the verified plan into ESP32 NVS.
 - If MCU-owned PDO auto-reconcile is enabled, firmware must compare the saved plan against live STUSB4500 runtime PDO readback and only write the chip when the live table does not already match.
@@ -131,11 +135,27 @@ Current bench validation on the attached board:
 - Bring-up profile save to NVS: verified
 - Shared I2C bus recovery + scan diagnostics: verified, but current board shows `SDA=0, SCL=1` and `ESP_ERR_TIMEOUT`, so DAC / STUSB are not yet communicating on this hardware stack
 - Structured peripheral snapshot fields and decoded bus-traffic view: build-verified; they still need fresh bench verification on the attached board after the updated image is flashed
+- The uploaded ToF daughterboard is now source-backed: it uses `VL53L1X` on the shared I2C bus, exports `GPIO1` as `LD_GPIO`, and uses a separate `LD_INT` line to control the onboard LED boost driver. `XSHUT` is pulled up locally and is not exported to the MCU.
+- The board layer now aliases that ToF wiring explicitly:
+  - `GPIO4/GPIO5` -> `VL53L1X` I2C
+  - `GPIO7` -> optional `GPIO1` interrupt input
+  - `GPIO6` -> LED-control sideband, driven low only when the ToF module is explicitly declared present
+- The current ToF bench path now includes a minimal `VL53L1X` ranging sequence derived from ST's published init/start/read/clear flow: boot-state readback, sensor-ID readback, default config load, long-distance mode, timing budget, intermeasurement setup, data-ready polling, range-status decode, and distance-mm readback.
+- The host ToF page and protocol now expose actual low-level ToF peripheral truth:
+  - `reachable`
+  - `configured`
+  - `bootState`
+  - `sensorId`
+  - `dataReady`
+  - `rangeStatus`
+  - `distanceMm`
+- Host overview/status components may show raw `VL53L1X` distance readback when the peripheral is alive, but they must still keep the safety posture in `hold` until the controller marks the ToF sample `valid` and `fresh`. Do not visually turn a raw peripheral sample into a passed interlock.
+- The Tools/Event decoder should treat `VL53L1X` at `0x29` as a first-class known I2C target. If it does not appear in the dropdown, the operator is almost certainly running a stale browser bundle and needs a hard refresh.
 
 Remaining blockers before claiming hardware-test readiness:
 
 - Shared I2C bus is physically or electrically stuck low on `SDA` on the current bench setup; DAC / STUSB / DRV2605 are not firmware-verified yet
-- ToF runtime path is still unresolved
+- ToF runtime path is still unresolved at the driver/policy level, but the hardware model is now known (`VL53L1X` over I2C, not SPI)
 - Two-stage trigger / button runtime path is still unresolved
 - PD contract classification is still bench-oriented; it is not yet a finished production PD supervisor
 - IMU runtime path is good enough for bench bring-up, but beam-axis sign/orientation still needs real mechanical validation on the assembled instrument
@@ -161,7 +181,7 @@ That is the correct current state for an unprovisioned, unvalidated codebase.
 - If the image lacks this block, or any field mismatches the expected contract, Web Serial flashing must stay blocked and explain why.
 - If a future production signing chain is added, it must extend this contract instead of bypassing it.
 4. Add the ToF driver with explicit invalid, saturated, stale, and timeout handling.
-5. Add the two-stage trigger / button runtime path after the missing Sensor & LED board details are resolved.
+5. Add the two-stage trigger / button runtime path after the missing button-board details are resolved.
 6. Tighten PD supervision into a finished production policy once STUSB4500 communication is stable.
 7. Keep host compatibility by updating [protocol-spec.md](/Users/zz4/BSL/BSL-Laser/docs/protocol-spec.md) in the same patch whenever bench or bring-up fields change.
 8. Keep firmware-update work behind service/programming state checks and never let the host bypass controller interlocks.
@@ -177,8 +197,12 @@ Pay special attention to:
 - `GPIO4/GPIO5` also leaving the board through both the BMS and Sensor & LED connectors
 - `IO37` appearing to drive both `ERM_TRIG` and `GN_LD_EN`
 - `GPIO6/GPIO7` being shared with the BMS battery-toggle connector and the Sensor & LED board
-- the missing Sensor & LED board files, which still block ToF and trigger confirmation
-- the missing ToF datasheet, which means the ToF driver model is still intentionally unresolved
+- the resolved ToF board facts:
+  - `VL53L1X` on `GPIO4/GPIO5`
+  - optional interrupt output on `GPIO7`
+  - optional LED-control sideband on `GPIO6`
+  - no exported `XSHUT` on this board revision
+- the still-missing button-board files, which continue to block trigger confirmation
 - the fact that STUSB4500 has no alert/status GPIOs wired back to the MCU
 - the module-variant caveat around `GPIO35/36/37` and `GPIO47/48`
 

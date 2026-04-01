@@ -8,6 +8,8 @@ Reviewed files:
 
 - [MainPCB.NET](/Users/zz4/BSL/BSL-Laser/docs/Schematics/MainPCB.NET)
 - [MainPCB.pdf](/Users/zz4/BSL/BSL-Laser/docs/Schematics/MainPCB.pdf)
+- [ToF-LED-Board.NET](/Users/zz4/BSL/BSL-Laser/docs/Schematics/ToF-LED-Board.NET)
+- [ToF-LED-Board.pdf](/Users/zz4/BSL/BSL-Laser/docs/Schematics/ToF-LED-Board.pdf)
 - [USB_PD-PHY.NET](/Users/zz4/BSL/BSL-Laser/docs/Schematics/USB_PD-PHY.NET)
 - [USB-PD.pdf](/Users/zz4/BSL/BSL-Laser/docs/Schematics/USB-PD.pdf)
 - [BMS-Board.NET](/Users/zz4/BSL/BSL-Laser/docs/Schematics/BMS-Board.NET)
@@ -18,6 +20,7 @@ Reviewed files:
 - [lsm6dso.pdf](/Users/zz4/BSL/BSL-Laser/docs/Datasheets/lsm6dso.pdf)
 - [drv2605.pdf](/Users/zz4/BSL/BSL-Laser/docs/Datasheets/drv2605.pdf)
 - [stusb4500.pdf](/Users/zz4/BSL/BSL-Laser/docs/Datasheets/stusb4500.pdf)
+- [vl53l1x.pdf](/Users/zz4/BSL/BSL-Laser/docs/Datasheets/vl53l1x.pdf)
 - [MPM3530GRF.pdf](/Users/zz4/BSL/BSL-Laser/docs/Datasheets/MPM3530GRF.pdf)
 
 This is intentionally a firmware-facing summary, not a substitute for the source schematics.
@@ -29,7 +32,7 @@ This is intentionally a firmware-facing summary, not a substitute for the source
 3. The IMU is wired for direct SPI to the ESP32 by default, with optional I2C stuffing called out but not populated.
 4. The visible green laser enable net `GN_LD_EN` is tied to the same ESP32 net as `ERM_TRIG` on `IO37`.
 5. `GPIO6/GPIO7` are not local-only nets; they are shared between the main-board Sensor & LED connector and the BMS battery-toggle connector.
-6. The provided board bundle still does not include the Sensor & LED board netlist or schematic, so the ToF sensor and two-stage trigger pinout remain unresolved.
+6. The ToF and LED daughterboard is now identified as a `VL53L1X` I2C ranger plus a separate LED boost-driver path.
 7. The STUSB4500 interrupt/status pins are not wired to the MCU; firmware should assume PD supervision is by I2C polling only.
 8. The DAC powers up to zero scale with the shown stuffing, which is the safe default we want.
 
@@ -40,12 +43,13 @@ The new `.NET` files confirm the following board-to-board paths:
 - MainPCB `J1` mates to BMS `J1` and carries `GPIO4`, `GPIO5`, `GPIO6`, `GPIO7`, `D+`, `D-`, `GND`, and switched system power.
 - BMS `J3` mates to USB-PD `J2` and carries `VBUS/VSINK`, `D+`, `D-`, and the `STUSB4500` I2C lines back to `GPIO4/GPIO5`.
 - MainPCB `J2` is explicitly labeled `B2B - Sensor & LED Board` and exports `GPIO4`, `GPIO5`, `GPIO6`, `GPIO7`, `DVDD_3V3`, and `GND`.
+- The uploaded ToF daughterboard uses `VL53L1CXV0FY/1` on `LD_SDA` / `LD_SCL`, routes the sensor interrupt output to `LD_GPIO`, and uses a separate `LD_INT` net to drive the onboard LED boost converter control input.
 - BMS `J2` is labeled `Battery Toggle Pins` and exports `GPIO7` and `GPIO6` again, plus `VBAT` and `GND`.
 
 Firmware implication:
 
 - `GPIO4/GPIO5` and `GPIO6/GPIO7` must be treated as cross-board shared nets, not private MCU pins.
-- missing Sensor & LED board source files are now the main blocker to fully resolving ToF and trigger assignments.
+- the ToF board itself is now source-backed, but the separate button board is still unresolved.
 - the firmware-facing final GPIO table is now maintained in [firmware-pinmap.md](/Users/zz4/BSL/BSL-Laser/docs/firmware-pinmap.md).
 
 ## ESP32-S3 Pin Map
@@ -367,13 +371,24 @@ Visible connections on the main PCB connectors sheet:
 | 8 | `DVDD_3V3` |
 | 10 | `GND` |
 
-The remaining pins appear unused on the provided sheet.
+The uploaded ToF board makes the following functional use of those exported nets:
+
+- `GPIO4` -> `LD_SDA` -> `VL53L1X SDA`
+- `GPIO5` -> `LD_SCL` -> `VL53L1X SCL`
+- `GPIO7` -> recommended host input for `LD_GPIO` -> `VL53L1X GPIO1` interrupt output
+- `GPIO6` -> recommended host output for `LD_INT` -> `TPS61169 CTRL` on the LED string driver
+- `DVDD_3V3` -> ToF board supply
+- `GND` -> ToF board return
+
+The board-level netlist does not show any `SDA` / `SCL` pull-ups on the ToF daughtercard, so the host-side shared I2C bus pull-ups remain required.
 
 Firmware implication:
 
-- the missing ToF device may live on this external sensor board
-- if so, it is likely reachable through `GPIO4/GPIO5` plus optional sideband on `GPIO6/GPIO7`
-- this still needs the actual sensor-board schematic or BOM to confirm
+- the ToF board is I2C, not SPI
+- the sensor device is `VL53L1X` with a default datasheet address of `0x52` on the wire (`0x29` 7-bit)
+- `XSHUT` is pulled up locally on the daughterboard and is not exported to the MCU, so firmware cannot use a dedicated hardware-shutdown GPIO for this board revision
+- `GPIO1` from the `VL53L1X` is exported and should be treated as an optional interrupt/ready line, not a sole safety authority
+- the `LD_INT` sideband is not the ToF interrupt; it is the LED-driver control path and should be held low unless the illumination LEDs are intentionally being exercised
 
 ### BMS / battery board notes
 
@@ -387,7 +402,7 @@ From [BMS.pdf](/Users/zz4/BSL/BSL-Laser/docs/Schematics/BMS.pdf):
 
 These gaps block a complete firmware pin/peripheral spec:
 
-1. No ToF sensor schematic or datasheet is present in the repository.
+1. The separate button board is still missing, so the two-stage trigger wiring remains unresolved.
 2. No datasheet is present for `MPM3612`, even though it generates the always-on 3.3 V rail.
 3. No datasheets are present for several support ICs that matter during bring-up:
    - `TPS22918`
@@ -404,4 +419,4 @@ These gaps block a complete firmware pin/peripheral spec:
 3. Reserve `IO1`, `IO2`, `IO8`, `IO9`, and `IO10` for ADC1-only usage as the schematic note intends.
 4. Default the DAC to an explicit zero-safe configuration immediately after boot even though the hardware stuffing already biases it that way.
 5. Plan STUSB4500 supervision around I2C polling only, because no alert/status GPIOs are wired.
-6. Do not finalize the ToF interlock module until the missing sensor board documentation is added.
+6. Do not finalize the ToF interlock module until the `VL53L1X` driver, timing budget, stale-data handling, and interrupt policy are implemented and validated on real hardware.

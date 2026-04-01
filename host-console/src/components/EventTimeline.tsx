@@ -18,10 +18,11 @@ import {
 } from 'lucide-react'
 
 import { formatShortTime } from '../lib/format'
-import type { EventSource, SessionEvent, Severity } from '../types'
+import type { CommandHistoryEntry, EventSource, SessionEvent, Severity } from '../types'
 
 type EventTimelineProps = {
   events: SessionEvent[]
+  commands?: CommandHistoryEntry[]
   query: string
   severity: Severity | 'all'
   moduleFilter: string
@@ -29,6 +30,7 @@ type EventTimelineProps = {
   onSeverityChange: (value: Severity | 'all') => void
   onModuleFilterChange: (value: string) => void
   compact?: boolean
+  mode?: 'all' | 'system'
 }
 
 type FocusMode = 'all' | 'faults' | 'bus' | 'service' | 'firmware' | 'transport'
@@ -168,8 +170,45 @@ function uniqueTokens(tokens: Array<string | undefined>): string[] {
   return ordered
 }
 
+function moduleFromCommand(cmd: string): string {
+  if (cmd.startsWith('i2c_') || cmd.startsWith('spi_')) {
+    return 'bus'
+  }
+
+  if (cmd.startsWith('set_target_') || cmd.includes('tec')) {
+    return 'tec'
+  }
+
+  if (cmd.includes('pd') || cmd === 'refresh_pd_status') {
+    return 'pd'
+  }
+
+  if (cmd.includes('imu')) {
+    return 'imu'
+  }
+
+  if (cmd.includes('dac')) {
+    return 'dac'
+  }
+
+  if (cmd.includes('haptic')) {
+    return 'haptic'
+  }
+
+  if (cmd.includes('alignment') || cmd.includes('laser') || cmd.includes('modulation')) {
+    return 'laser'
+  }
+
+  if (cmd.includes('service') || cmd.includes('fault') || cmd === 'reboot') {
+    return 'service'
+  }
+
+  return 'system'
+}
+
 export function EventTimeline({
   events,
+  commands = [],
   query,
   severity,
   moduleFilter,
@@ -177,45 +216,85 @@ export function EventTimeline({
   onSeverityChange,
   onModuleFilterChange,
   compact = false,
+  mode = 'all',
 }: EventTimelineProps) {
   const [focusMode, setFocusMode] = useState<FocusMode>('all')
   const [sourceFilter, setSourceFilter] = useState<'all' | EventSource>('all')
   const [sortMode, setSortMode] = useState<SortMode>('latest')
   const [expandedEventId, setExpandedEventId] = useState<string | null>(null)
   const deferredQuery = useDeferredValue(query)
+  const effectiveFocusMode: FocusMode =
+    mode === 'system' && focusMode === 'bus' ? 'all' : focusMode
+  const failedCommands = useMemo(
+    () => commands.filter((entry) => entry.status === 'error').slice(0, 6),
+    [commands],
+  )
+
+  const commandFailureEvents = useMemo(
+    () =>
+      failedCommands.map<SessionEvent>((entry) => ({
+        id: `command-failure-${entry.id}`,
+        atIso: entry.issuedAtIso,
+        severity: 'warn',
+        category: 'command',
+        title: 'Host command failed',
+        detail: `${entry.cmd}: ${entry.note}`,
+        module: moduleFromCommand(entry.cmd),
+        source: 'host',
+        summary: entry.note,
+      })),
+    [failedCommands],
+  )
+
+  const timelineEvents = useMemo(() => {
+    const merged = [...events, ...commandFailureEvents]
+    const filtered =
+      mode === 'system'
+        ? merged.filter((event) => event.bus === undefined && event.category !== 'bus')
+        : merged
+
+    return filtered.sort(
+      (left, right) => Date.parse(right.atIso) - Date.parse(left.atIso),
+    )
+  }, [commandFailureEvents, events, mode])
 
   const moduleOptions = useMemo(() => {
     const modules = new Set<string>(['all'])
 
-    for (const event of events) {
+    for (const event of timelineEvents) {
       if (event.module !== undefined && event.module.length > 0) {
         modules.add(event.module)
       }
     }
 
     return Array.from(modules)
-  }, [events])
+  }, [timelineEvents])
 
   const sourceOptions = useMemo(() => {
     const options = new Set<'all' | EventSource>(['all'])
 
-    for (const event of events) {
+    for (const event of timelineEvents) {
       if (event.source !== undefined) {
         options.add(event.source)
       }
     }
 
     return Array.from(options)
-  }, [events])
+  }, [timelineEvents])
+
+  const availableFocusOptions = useMemo(
+    () => focusOptions.filter((option) => !(mode === 'system' && option.value === 'bus')),
+    [mode],
+  )
 
   const filteredEvents = useMemo(() => {
     const search = deferredQuery.trim().toLowerCase()
 
-    const matched = events.filter((event) => {
+    const matched = timelineEvents.filter((event) => {
       const severityMatch = severity === 'all' || event.severity === severity
       const moduleMatch = moduleFilter === 'all' || event.module === moduleFilter
       const sourceMatch = sourceFilter === 'all' || event.source === sourceFilter
-      const focusMatch = matchesFocus(event, focusMode)
+      const focusMatch = matchesFocus(event, effectiveFocusMode)
       const queryMatch =
         search.length === 0 ||
         event.title.toLowerCase().includes(search) ||
@@ -233,17 +312,17 @@ export function EventTimeline({
     })
 
     return sortEvents(matched, sortMode)
-  }, [deferredQuery, events, focusMode, moduleFilter, severity, sortMode, sourceFilter])
+  }, [deferredQuery, effectiveFocusMode, moduleFilter, severity, sortMode, sourceFilter, timelineEvents])
 
   const visibleEvents = compact ? filteredEvents.slice(0, 8) : filteredEvents
 
   const summary = useMemo(() => {
-    const total = events.length
-    const critical = events.filter((event) => event.severity === 'critical').length
-    const warnings = events.filter((event) => event.severity === 'warn').length
-    const bus = events.filter((event) => event.bus !== undefined || event.category === 'bus').length
-    const modules = new Set(events.map((event) => event.module).filter((value): value is string => value !== undefined))
-    const latest = events[0]
+    const total = timelineEvents.length
+    const critical = timelineEvents.filter((event) => event.severity === 'critical').length
+    const warnings = timelineEvents.filter((event) => event.severity === 'warn').length
+    const bus = timelineEvents.filter((event) => event.bus !== undefined || event.category === 'bus').length
+    const modules = new Set(timelineEvents.map((event) => event.module).filter((value): value is string => value !== undefined))
+    const latest = timelineEvents[0]
 
     return {
       total,
@@ -254,19 +333,23 @@ export function EventTimeline({
       latest,
       matches: filteredEvents.length,
     }
-  }, [events, filteredEvents.length])
+  }, [filteredEvents.length, timelineEvents])
 
   return (
     <section className={`panel-section ${compact ? 'event-surface is-compact' : 'event-surface'}`}>
       <div className="panel-section__head">
         <div>
           <p className="eyebrow">Observability</p>
-          <h2>{compact ? 'Recent events' : 'Event workspace'}</h2>
+          <h2>
+            {compact ? 'Recent events' : mode === 'system' ? 'System log' : 'Event workspace'}
+          </h2>
         </div>
         <p className="panel-note">
           {compact
             ? 'Latest decoded activity from transport, safety, and buses.'
-            : 'Triage faults, bus traffic, and service actions with decoded context and expandable detail.'}
+            : mode === 'system'
+              ? 'Controller, safety, service, and transport history without the SPI/I2C traffic flood.'
+              : 'Triage faults, bus traffic, and service actions with decoded context and expandable detail.'}
         </p>
       </div>
 
@@ -286,19 +369,21 @@ export function EventTimeline({
             <small>{summary.critical} critical • {summary.warnings} warnings</small>
           </button>
 
-          <button
-            type="button"
-            className="event-kpi"
-            data-tone={summary.bus > 0 ? 'warning' : 'steady'}
-            onClick={() => {
-              setFocusMode('bus')
-              onSeverityChange('all')
-            }}
-          >
-            <span>Bus activity</span>
-            <strong>{summary.bus}</strong>
-            <small>I2C and SPI decoded events in this session</small>
-          </button>
+          {mode === 'all' ? (
+            <button
+              type="button"
+              className="event-kpi"
+              data-tone={summary.bus > 0 ? 'warning' : 'steady'}
+              onClick={() => {
+                setFocusMode('bus')
+                onSeverityChange('all')
+              }}
+            >
+              <span>Bus activity</span>
+              <strong>{summary.bus}</strong>
+              <small>I2C and SPI decoded events in this session</small>
+            </button>
+          ) : null}
 
           <button
             type="button"
@@ -324,6 +409,35 @@ export function EventTimeline({
         </div>
       ) : null}
 
+      {!compact && failedCommands.length > 0 ? (
+        <div className="event-command-failures">
+          <div className="panel-section__head">
+            <div>
+              <p className="eyebrow">Command failures</p>
+              <h2>Recent rejected host actions</h2>
+            </div>
+            <p className="panel-note">
+              These come directly from command history, so a rejected service write is visible here even if you never opened the inspector rail.
+            </p>
+          </div>
+          <div className="command-history">
+            {failedCommands.map((command) => (
+              <div key={command.id} className="history-row is-error">
+                <div className="event-command-failure__copy">
+                  <strong>{command.cmd}</strong>
+                  <span>{formatShortTime(command.issuedAtIso)}</span>
+                  <p className="event-command-failure__note">{command.note}</p>
+                </div>
+                <div className="history-row__meta-group">
+                  <span className={`history-row__risk is-${command.risk}`}>{command.risk}</span>
+                  <em>error</em>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
+
       <div className={`event-toolbar ${compact ? 'is-compact' : ''}`}>
         <label className="search-field">
           <Search size={14} />
@@ -341,13 +455,13 @@ export function EventTimeline({
               Focus
             </span>
             <div className="chip-row">
-              {focusOptions.map((option) => {
+              {availableFocusOptions.map((option) => {
                 const Icon = option.icon
                 return (
                   <button
                     key={option.value}
                     type="button"
-                    className={option.value === focusMode ? 'chip is-active' : 'chip'}
+                    className={option.value === effectiveFocusMode ? 'chip is-active' : 'chip'}
                     onClick={() => setFocusMode(option.value)}
                   >
                     <Icon size={14} />

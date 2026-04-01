@@ -49,9 +49,9 @@ export const moduleMeta: Record<
   },
   tof: {
     label: 'ToF',
-    transport: 'Sensor board',
-    detail: 'Distance interlock module with unresolved connector mapping.',
-    datasheetStatus: 'No ToF datasheet is present yet. Do not invent register behavior.',
+    transport: 'I2C 0x29 + GPIO7/GPIO6',
+    detail: 'VL53L1X distance interlock board on the shared I2C bus, with GPIO7 interrupt in and GPIO6 LED-control out.',
+    datasheetStatus: 'VL53L1X board mapping is now known. XSHUT is not exported on this board revision, so firmware must use shared-I2C probe plus optional GPIO1 interrupt assist.',
   },
   buttons: {
     label: 'Buttons',

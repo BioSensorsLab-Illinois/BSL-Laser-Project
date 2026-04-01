@@ -12,13 +12,9 @@ Sources currently present in [docs/Datasheets](/Users/zz4/BSL/BSL-Laser/docs/Dat
 - [drv2605.pdf](/Users/zz4/BSL/BSL-Laser/docs/Datasheets/drv2605.pdf)
 - [lsm6dso.pdf](/Users/zz4/BSL/BSL-Laser/docs/Datasheets/lsm6dso.pdf)
 - [stusb4500.pdf](/Users/zz4/BSL/BSL-Laser/docs/Datasheets/stusb4500.pdf)
+- [vl53l1x.pdf](/Users/zz4/BSL/BSL-Laser/docs/Datasheets/vl53l1x.pdf)
 - [ATLS6A214D-3.pdf](/Users/zz4/BSL/BSL-Laser/docs/Datasheets/ATLS6A214D-3.pdf)
 - [Micro_TEC_Controller_TEC14M5V3R5AS-2.pdf](/Users/zz4/BSL/BSL-Laser/docs/Datasheets/Micro_TEC_Controller_TEC14M5V3R5AS-2.pdf)
-
-Important gap:
-
-- No ToF sensor datasheet is present in this repository today.
-- No ToF programming model, ranging mode, timing budget, or fault semantics should be invented until that source is added.
 
 ## Cross-Cutting Rules
 
@@ -324,18 +320,33 @@ Suggested driver shape:
 
 ## ToF Sensor
 
-Current status:
+Board context:
 
-- No ToF datasheet is present in [docs/Datasheets](/Users/zz4/BSL/BSL-Laser/docs/Datasheets).
-- The Sensor and LED board source files are also still missing.
+- The uploaded ToF daughterboard uses `VL53L1CXV0FY/1`, the `VL53L1X` family optical ToF sensor.
+- The daughterboard wiring is:
+  - `LD_SDA` -> sensor `SDA`
+  - `LD_SCL` -> sensor `SCL`
+  - `LD_GPIO` -> sensor `GPIO1` interrupt output
+  - sensor `XSHUT` has a local `10 kOhm` pull-up and is not exported to the host connector
+- The same daughterboard also carries a separate LED boost driver whose control input is named `LD_INT`; that net is not the ToF interrupt.
 
-Rules until the source is present:
+Datasheet-derived behavior:
 
-- Do not pick a driver model.
-- Do not hardcode register addresses.
-- Do not assume I2C vs SPI.
-- Do not assume timing budget, distance format, interrupt polarity, or saturation semantics.
-- Keep the host and firmware abstractions generic until the actual part is identified.
+- Interface is `I2C`, up to `400 kHz`.
+- Datasheet default address is `0x52` on the wire, which corresponds to `0x29` in 7-bit host notation.
+- `GPIO1` is an open-drain interrupt output.
+- `XSHUT` is active low and is required for hardware standby, but this board revision does not export it to the MCU.
+- `GPIO1` and `XSHUT` both want approximately `10 kOhm` pull-ups.
+- The part uses a single `2.6 V` to `3.5 V` supply.
+- ST recommends I2C pull-ups near the host; the ToF daughterboard netlist does not add its own `SDA` / `SCL` pull-ups.
+
+Firmware guidance:
+
+- Treat this board as an I2C ToF target on the existing shared `GPIO4/GPIO5` bus. Do not put it on SPI.
+- Because `XSHUT` is not exported, firmware cannot use a dedicated GPIO for hardware reset, deep standby entry, or multi-sensor address sequencing on this revision.
+- Use polling as the baseline implementation; `GPIO1` can be added as an optional interrupt/ready hint later, but host logic must remain authoritative for stale/invalid handling.
+- If the board illumination LEDs are not under test, drive `LD_INT` low or leave the LED-control path otherwise forced inactive. Do not leave that control input floating.
+- Driver work still needs the ST API/register model review before registers are hardcoded into mainline firmware.
 
 ## Practical Next Step
 

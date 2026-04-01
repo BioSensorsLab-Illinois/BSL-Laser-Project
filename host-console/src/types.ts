@@ -228,11 +228,26 @@ export interface HapticPeripheralReadback {
   lastError: string
 }
 
+export interface TofPeripheralReadback {
+  reachable: boolean
+  configured: boolean
+  interruptLineHigh: boolean
+  ledCtrlAsserted: boolean
+  dataReady: boolean
+  bootState: number
+  rangeStatus: number
+  sensorId: number
+  distanceMm: number
+  lastErrorCode: number
+  lastError: string
+}
+
 export interface PeripheralReadback {
   dac: DacPeripheralReadback
   pd: PdPeripheralReadback
   imu: ImuPeripheralReadback
   haptic: HapticPeripheralReadback
+  tof: TofPeripheralReadback
 }
 
 export interface BringupStatus {

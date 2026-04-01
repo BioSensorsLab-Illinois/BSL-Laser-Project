@@ -38,7 +38,7 @@ export function ControllerBusyOverlay({
           <strong>{label}</strong>
           <span>{percent}%</span>
         </div>
-        <p>{detail}</p>
+        <p className="controller-busy-dialog__detail">{detail}</p>
         <ProgressMeter value={percent} tone={tone} />
         <small>{footer}</small>
         {onConfirm ? (

@@ -1,0 +1,95 @@
+( {OrCAD PCB II Netlist Format}
+ ( 00000001 C0805 C1 4.7uF_50V
+  ( 1 GND )
+  ( 2 NetC1_2 )
+ )
+ ( 00000002 C0805 C2 1uF_50V
+  ( 1 GND )
+  ( 2 NetC1_2 )
+ )
+ ( 00000003 C0402 C3 1uF
+  ( 1 GND )
+  ( 2 DVDD_3V3 )
+ )
+ ( 00000004 C0805 C4 4.7uF
+  ( 1 GND )
+  ( 2 DVDD_3V3 )
+ )
+ ( 00000005 C0603 C5 4.7uF
+  ( 1 GND )
+  ( 2 DVDD_3V3 )
+ )
+ ( 00000006 C0402 C6 0.1uF
+  ( 1 GND )
+  ( 2 DVDD_3V3 )
+ )
+ ( 00000007 ONSC-SOD-923-2-514AB-01_V D1 NSR0240P2T5G
+  ( 1 NetC1_2 )
+  ( 2 NetD1_2 )
+ )
+ ( 00000008 TFM-106-02-L-S-Footprint-1 J1 TFM-106-02-L-S
+  ( 01 DVDD_3V3 )
+  ( 02 LD_SCL )
+  ( 03 LD_SDA )
+  ( 04 LD_GPIO )
+  ( 05 LD_INT )
+  ( 06 GND )
+ )
+ ( 00000009 LPS4018-103MRC-Footprint-1 L1 LPS4018-103MRC
+  ( 1 DVDD_3V3 )
+  ( 2 NetD1_2 )
+ )
+ ( 00000010 EAHC2835WD4-Footprint-1 LED1 EAHC2835WD4
+  ( 1 NetLED1_1 )
+  ( 2 NetC1_2 )
+ )
+ ( 00000011 EAHC2835WD4-Footprint-1 LED2 EAHC2835WD4
+  ( 1 NetLED2_1 )
+  ( 2 NetLED1_1 )
+ )
+ ( 00000012 EAHC2835WD4-Footprint-1 LED3 EAHC2835WD4
+  ( 1 NetLED3_1 )
+  ( 2 NetLED2_1 )
+ )
+ ( 00000013 EAHC2835WD4-Footprint-1 LED4 EAHC2835WD4
+  ( 1 NetLED4_1 )
+  ( 2 NetLED3_1 )
+ )
+ ( 00000014 EAHC2835WD4-Footprint-1 LED5 EAHC2835WD4
+  ( 1 NetLED5_1 )
+  ( 2 NetLED4_1 )
+ )
+ ( 00000015 LGA12 PD1 VL53L1CXV0FY/1
+  ( 1 DVDD_3V3 )
+  ( 2 GND )
+  ( 3 GND )
+  ( 4 GND )
+  ( 5 NetPD1_5 )
+  ( 6 GND )
+  ( 7 LD_GPIO )
+  ( 8 NetPD1_8 )
+  ( 9 LD_SDA )
+  ( 10 LD_SCL )
+  ( 11 DVDD_3V3 )
+  ( 12 GND )
+ )
+ ( 00000016 R0402 R1 R0402
+  ( 1 GND )
+  ( 2 NetLED5_1 )
+ )
+ ( 00000017 R0402 R2 10k?
+  ( 1 LD_GPIO )
+  ( 2 DVDD_3V3 )
+ )
+ ( 00000018 R0402 R3 10k
+  ( 1 NetPD1_5 )
+  ( 2 DVDD_3V3 )
+ )
+ ( 00000019 FP-DCK0005A-IPC_C U1 TPS61169DCKR
+  ( 1 NetD1_2 )
+  ( 2 GND )
+  ( 3 NetLED5_1 )
+  ( 4 LD_INT )
+  ( 5 DVDD_3V3 )
+ )
+)
