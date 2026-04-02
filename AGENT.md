@@ -64,6 +64,8 @@ Preserve a firmware architecture where the default answer to any ambiguity is:
   Shared host-side parser for the controller JSON line protocol. USB and wireless must stay on this one parser so transport changes do not fork protocol behavior.
 - [host-console/src/components/CommandDeck.tsx](/Users/zz4/BSL/BSL-Laser/host-console/src/components/CommandDeck.tsx)
   Guarded maintenance command surface, split I2C/SPI bus lab, decoded register readback, and the host-side multi-PCB provisioning worksheet for Main / ToF / BMS / PD / Button boards. Do not turn this into a direct beam-control panel.
+- [host-console/src/components/GpioWorkbench.tsx](/Users/zz4/BSL/BSL-Laser/host-console/src/components/GpioWorkbench.tsx)
+  Physical ESP32-S3-WROOM GPIO visualization and service-only pin override tool. Live readback must stay visually separate from staged overrides.
 - [host-console/src/components/ControlWorkbench.tsx](/Users/zz4/BSL/BSL-Laser/host-console/src/components/ControlWorkbench.tsx)
   Bench-only staging UI for laser, TEC, and modulation requests. Firmware must stay authoritative.
 - [host-console/src/components/BringupWorkbench.tsx](/Users/zz4/BSL/BSL-Laser/host-console/src/components/BringupWorkbench.tsx)
@@ -122,6 +124,11 @@ Preserve a firmware architecture where the default answer to any ambiguity is:
 - The Tools Bus Lab must show the actual returned transfer string (`lastI2cOp`, `lastSpiOp`, or `lastI2cScan`) as the command result, not just a generic "controller acknowledged command" message.
 - Repeated identical bus reads still need their own comms-log entries. Do not rely only on snapshot-diff events for SPI/I2C history, because the operator may intentionally read the same register value many times in a row.
 - The Events workspace should also surface failed host commands directly from command history, not only from derived transport events. A rejected `dac_debug_config` or similar service write must remain visible even if the inspector rail is collapsed.
+- The Tools workspace now also exposes a physical ESP32-S3-WROOM GPIO inspector. That tool must show actual controller readback for each pin (`gpioInspector`) separately from any staged override draft.
+- `set_gpio_override` and `clear_gpio_overrides` are service-only. They are for controlled bench proving only and must never be repurposed as a hidden runtime control path.
+- The GPIO inspector must keep a one-step escape hatch: `Reset all to firmware` clears every override and hands ownership back to the original firmware logic.
+- Treat transport, boot-strap, and debug pins as hazardous in the UI. `GPIO19/20`, `GPIO43/44`, `GPIO0`, `GPIO46`, `GPIO3`, and `GPIO45` should remain visibly risky because overriding them can drop the link or affect boot behavior.
+- A GPIO override tool should never imply that an overridden pin is part of normal validated firmware behavior. The safe interpretation is always "temporary service ownership."
 - Service-mode peripheral writes should only succeed when the module is armed for writes through the bring-up plan (`expected_present` or `debug_enabled`). They must not return fake success when the module plan still disallows hardware access.
 - The host Bring-up `Apply ...` actions should sync that module's current plan to firmware before attempting the module-specific write, so a stale unsaved checkbox state cannot make hardware writes look dead.
 - The DAC Bring-up path should explicitly refresh live module state after arming the DAC module plan, and it should retry `dac_debug_config` once after a forced module-plan resync if the controller still reports the DAC write gate as blocked.

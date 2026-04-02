@@ -136,6 +136,7 @@ static void laser_controller_service_normalize_pd_profiles(
     const laser_controller_service_pd_profile_t *profiles,
     laser_controller_service_pd_profile_t *normalized_profiles);
 static void laser_controller_service_sanitize_dac_settings_locked(void);
+static void laser_controller_service_refresh_gpio_override_count_locked(void);
 
 static bool laser_controller_service_i2c_address_to_module(
     uint32_t address,
@@ -393,6 +394,19 @@ static void laser_controller_service_write_action_locked(
         message);
 }
 
+static void laser_controller_service_refresh_gpio_override_count_locked(void)
+{
+    uint32_t count = 0U;
+
+    for (uint32_t gpio_num = 0U; gpio_num < LASER_CONTROLLER_SERVICE_GPIO_COUNT; ++gpio_num) {
+        if (s_service.status.gpio_overrides[gpio_num].active) {
+            ++count;
+        }
+    }
+
+    s_service.status.gpio_override_count = count;
+}
+
 static void laser_controller_service_sanitize_dac_settings_locked(void)
 {
     if (s_service.status.dac_reference ==
@@ -645,9 +659,15 @@ static void laser_controller_service_apply_persisted_locked(
     s_service.status.haptic_library = profile->haptic_library;
     s_service.status.haptic_actuator = profile->haptic_actuator;
     s_service.status.haptic_rtp_level = profile->haptic_rtp_level;
+    memset(
+        s_service.status.gpio_overrides,
+        0,
+        sizeof(s_service.status.gpio_overrides));
+    s_service.status.gpio_override_count = 0U;
     laser_controller_service_sanitize_dac_settings_locked();
     laser_controller_service_sync_shadow_regs_locked();
     laser_controller_service_refresh_modules_locked();
+    laser_controller_service_refresh_gpio_override_count_locked();
 }
 
 static bool laser_controller_service_load_profile_locked(void)
@@ -732,6 +752,11 @@ static void laser_controller_service_apply_core_preset_locked(const char *profil
         profile_name);
     s_service.status.ld_rail_debug_enabled = false;
     s_service.status.tec_rail_debug_enabled = false;
+    memset(
+        s_service.status.gpio_overrides,
+        0,
+        sizeof(s_service.status.gpio_overrides));
+    s_service.status.gpio_override_count = 0U;
 
     s_service.status.modules[LASER_CONTROLLER_MODULE_IMU].expected_present = true;
     s_service.status.modules[LASER_CONTROLLER_MODULE_IMU].debug_enabled = true;
@@ -792,6 +817,7 @@ static void laser_controller_service_apply_core_preset_locked(const char *profil
         sizeof(s_service.status.last_action),
         "Bring-up defaults loaded.");
     laser_controller_service_refresh_modules_locked();
+    laser_controller_service_refresh_gpio_override_count_locked();
     laser_controller_service_seed_mock_registers_locked();
 }
 
@@ -1048,16 +1074,28 @@ void laser_controller_service_set_mode_requested(
     bool enable,
     laser_controller_time_ms_t now_ms)
 {
+    bool reset_gpio_debug = false;
+
     portENTER_CRITICAL(&s_service_lock);
     s_service.status.service_mode_requested = enable;
     if (!enable) {
         s_service.status.haptic_driver_enable_requested = false;
+        memset(
+            s_service.status.gpio_overrides,
+            0,
+            sizeof(s_service.status.gpio_overrides));
+        laser_controller_service_refresh_gpio_override_count_locked();
+        reset_gpio_debug = true;
     }
     laser_controller_service_write_action_locked(
         enable ? "Service mode requested from host." :
                  "Service mode request cleared from host.",
         now_ms);
     portEXIT_CRITICAL(&s_service_lock);
+
+    if (reset_gpio_debug) {
+        laser_controller_board_reset_gpio_debug_state();
+    }
 }
 
 bool laser_controller_service_apply_preset(
@@ -1199,6 +1237,78 @@ void laser_controller_service_set_haptic_driver_enable(
             "ERM driver enable cleared; GPIO48 forced low.",
         now_ms);
     portEXIT_CRITICAL(&s_service_lock);
+}
+
+bool laser_controller_service_set_gpio_override(
+    uint32_t gpio_num,
+    laser_controller_service_gpio_mode_t mode,
+    bool level_high,
+    bool pullup_enabled,
+    bool pulldown_enabled,
+    laser_controller_time_ms_t now_ms)
+{
+    if (!laser_controller_board_gpio_inspector_has_pin(gpio_num) ||
+        mode > LASER_CONTROLLER_SERVICE_GPIO_MODE_OUTPUT) {
+        return false;
+    }
+
+    portENTER_CRITICAL(&s_service_lock);
+    if (mode == LASER_CONTROLLER_SERVICE_GPIO_MODE_FIRMWARE) {
+        memset(
+            &s_service.status.gpio_overrides[gpio_num],
+            0,
+            sizeof(s_service.status.gpio_overrides[gpio_num]));
+        laser_controller_service_write_action_locked(
+            "GPIO override released; firmware regains ownership.",
+            now_ms);
+    } else {
+        s_service.status.gpio_overrides[gpio_num].active = true;
+        s_service.status.gpio_overrides[gpio_num].mode = mode;
+        s_service.status.gpio_overrides[gpio_num].level_high = level_high;
+        s_service.status.gpio_overrides[gpio_num].pullup_enabled = pullup_enabled;
+        s_service.status.gpio_overrides[gpio_num].pulldown_enabled = pulldown_enabled;
+        laser_controller_service_write_action_locked(
+            mode == LASER_CONTROLLER_SERVICE_GPIO_MODE_INPUT ?
+                "GPIO override set to input mode." :
+                (level_high ?
+                     "GPIO override set to output high." :
+                     "GPIO override set to output low."),
+            now_ms);
+    }
+    laser_controller_service_refresh_gpio_override_count_locked();
+    portEXIT_CRITICAL(&s_service_lock);
+    return true;
+}
+
+void laser_controller_service_clear_gpio_overrides(laser_controller_time_ms_t now_ms)
+{
+    portENTER_CRITICAL(&s_service_lock);
+    memset(
+        s_service.status.gpio_overrides,
+        0,
+        sizeof(s_service.status.gpio_overrides));
+    laser_controller_service_refresh_gpio_override_count_locked();
+    laser_controller_service_write_action_locked(
+        "All GPIO overrides cleared; returning pin ownership to firmware.",
+        now_ms);
+    portEXIT_CRITICAL(&s_service_lock);
+
+    laser_controller_board_reset_gpio_debug_state();
+}
+
+bool laser_controller_service_get_gpio_override(
+    uint32_t gpio_num,
+    laser_controller_service_gpio_override_t *override_config)
+{
+    if (override_config == NULL ||
+        gpio_num >= LASER_CONTROLLER_SERVICE_GPIO_COUNT) {
+        return false;
+    }
+
+    portENTER_CRITICAL(&s_service_lock);
+    *override_config = s_service.status.gpio_overrides[gpio_num];
+    portEXIT_CRITICAL(&s_service_lock);
+    return true;
 }
 
 void laser_controller_service_mark_runtime_status(
@@ -2178,6 +2288,45 @@ const char *laser_controller_service_haptic_actuator_name(
             return "erm";
         case LASER_CONTROLLER_SERVICE_HAPTIC_ACTUATOR_LRA:
             return "lra";
+        default:
+            return "unknown";
+    }
+}
+
+bool laser_controller_service_parse_gpio_mode(
+    const char *name,
+    laser_controller_service_gpio_mode_t *mode)
+{
+    if (name == NULL || mode == NULL) {
+        return false;
+    }
+
+    if (strcmp(name, "firmware") == 0) {
+        *mode = LASER_CONTROLLER_SERVICE_GPIO_MODE_FIRMWARE;
+        return true;
+    }
+    if (strcmp(name, "input") == 0) {
+        *mode = LASER_CONTROLLER_SERVICE_GPIO_MODE_INPUT;
+        return true;
+    }
+    if (strcmp(name, "output") == 0) {
+        *mode = LASER_CONTROLLER_SERVICE_GPIO_MODE_OUTPUT;
+        return true;
+    }
+
+    return false;
+}
+
+const char *laser_controller_service_gpio_mode_name(
+    laser_controller_service_gpio_mode_t mode)
+{
+    switch (mode) {
+        case LASER_CONTROLLER_SERVICE_GPIO_MODE_FIRMWARE:
+            return "firmware";
+        case LASER_CONTROLLER_SERVICE_GPIO_MODE_INPUT:
+            return "input";
+        case LASER_CONTROLLER_SERVICE_GPIO_MODE_OUTPUT:
+            return "output";
         default:
             return "unknown";
     }

@@ -43,6 +43,7 @@ export type HapticMode =
   | 'diagnostics'
   | 'auto_cal'
 export type HapticActuator = 'erm' | 'lra'
+export type GpioOverrideMode = 'firmware' | 'input' | 'output'
 export type ModuleKey =
   | 'imu'
   | 'dac'
@@ -260,6 +261,29 @@ export interface PeripheralReadback {
   tof: TofPeripheralReadback
 }
 
+export interface GpioPinReadback {
+  gpioNum: number
+  modulePin: number
+  outputCapable: boolean
+  inputEnabled: boolean
+  outputEnabled: boolean
+  openDrainEnabled: boolean
+  pullupEnabled: boolean
+  pulldownEnabled: boolean
+  levelHigh: boolean
+  overrideActive: boolean
+  overrideMode: GpioOverrideMode
+  overrideLevelHigh: boolean
+  overridePullupEnabled: boolean
+  overridePulldownEnabled: boolean
+}
+
+export interface GpioInspectorStatus {
+  anyOverrideActive: boolean
+  activeOverrideCount: number
+  pins: GpioPinReadback[]
+}
+
 export interface BringupStatus {
   serviceModeRequested: boolean
   serviceModeActive: boolean
@@ -343,6 +367,7 @@ export interface DeviceSnapshot {
   laser: LaserStatus
   tec: TecStatus
   peripherals: PeripheralReadback
+  gpioInspector: GpioInspectorStatus
   bench: BenchControlStatus
   safety: SafetyStatus
   bringup: BringupStatus

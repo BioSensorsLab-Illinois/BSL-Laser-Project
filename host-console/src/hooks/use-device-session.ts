@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useEffectEvent, useMemo, useRef, useState } from 'react'
 
 import { makeDefaultBringupStatus } from '../lib/bringup'
+import { makeDefaultGpioInspectorStatus } from '../lib/gpio-layout'
 import { makeDefaultBenchControlStatus } from '../lib/bench-model'
 import { annotateSessionEvent } from '../lib/event-decode'
 import { MockTransport } from '../lib/mock-transport'
@@ -31,6 +32,10 @@ function makeEventId(suffix: string): string {
 }
 
 function moduleFromCommand(cmd: string): string {
+  if (cmd.includes('gpio')) {
+    return 'service'
+  }
+
   if (cmd.startsWith('i2c_') || cmd.startsWith('spi_')) {
     return 'bus'
   }
@@ -90,6 +95,16 @@ function noteFromSnapshotForCommand(
 
   if (cmd === 'refresh_pd_status') {
     return `PD refresh -> ${snapshot.pd.sourceVoltageV.toFixed(1)} V, ${snapshot.pd.sourceCurrentA.toFixed(2)} A, ${snapshot.pd.negotiatedPowerW.toFixed(1)} W`
+  }
+
+  if (cmd === 'set_gpio_override') {
+    return snapshot.gpioInspector.anyOverrideActive
+      ? `${snapshot.gpioInspector.activeOverrideCount} GPIO override${snapshot.gpioInspector.activeOverrideCount === 1 ? '' : 's'} active.`
+      : 'Selected GPIO returned to firmware ownership.'
+  }
+
+  if (cmd === 'clear_gpio_overrides') {
+    return 'All GPIO overrides cleared; original firmware logic owns every pin again.'
   }
 
   return null
@@ -391,6 +406,7 @@ function makeSeedSnapshot(): DeviceSnapshot {
         lastError: 'ESP_OK',
       },
     },
+    gpioInspector: makeDefaultGpioInspectorStatus(),
     bench: makeDefaultBenchControlStatus(),
     safety: {
       allowAlignment: false,
@@ -464,6 +480,15 @@ function mergeSnapshot(
       imu: { ...current.peripherals.imu, ...incoming.peripherals.imu },
       haptic: { ...current.peripherals.haptic, ...incoming.peripherals.haptic },
       tof: { ...current.peripherals.tof, ...incoming.peripherals.tof },
+    },
+    gpioInspector: {
+      ...current.gpioInspector,
+      ...incoming.gpioInspector,
+      pins:
+        incoming.gpioInspector?.pins !== undefined &&
+        incoming.gpioInspector.pins.length > 0
+          ? incoming.gpioInspector.pins
+          : current.gpioInspector.pins,
     },
     bench: { ...current.bench, ...incoming.bench },
     safety: { ...current.safety, ...incoming.safety },

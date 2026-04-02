@@ -44,6 +44,7 @@
 #define LASER_CONTROLLER_PD_RENEGOTIATE_WAIT_MS 650U
 #define LASER_CONTROLLER_SERVICE_MODE_WAIT_MS  1200U
 #define LASER_CONTROLLER_SERVICE_MODE_POLL_MS  20U
+#define LASER_CONTROLLER_HAPTIC_GPIO_WAIT_MS   400U
 
 static StaticTask_t s_tx_task_tcb;
 static StackType_t s_tx_task_stack[LASER_CONTROLLER_COMMS_TX_STACK_BYTES];
@@ -456,6 +457,55 @@ static void laser_controller_comms_write_peripheral_readback_json(
     laser_controller_comms_buffer_append_raw(buffer, "}},");
 }
 
+static void laser_controller_comms_write_gpio_inspector_json(
+    laser_controller_comms_buffer_t *buffer,
+    const laser_controller_runtime_status_t *status)
+{
+    const laser_controller_board_gpio_inspector_t *gpio =
+        &status->inputs.gpio_inspector;
+
+    laser_controller_comms_buffer_append_fmt(
+        buffer,
+        "\"gpioInspector\":{\"anyOverrideActive\":%s,\"activeOverrideCount\":%lu,\"pins\":[",
+        gpio->any_override_active ? "true" : "false",
+        (unsigned long)gpio->active_override_count);
+
+    for (size_t index = 0U;
+         index < LASER_CONTROLLER_BOARD_GPIO_INSPECTOR_PIN_COUNT;
+         ++index) {
+        const laser_controller_board_gpio_pin_readback_t *pin = &gpio->pins[index];
+
+        if (index > 0U) {
+            laser_controller_comms_buffer_append_raw(buffer, ",");
+        }
+
+        laser_controller_comms_buffer_append_fmt(
+            buffer,
+            "{\"gpioNum\":%u,\"modulePin\":%u,\"outputCapable\":%s,\"inputEnabled\":%s,\"outputEnabled\":%s,\"openDrainEnabled\":%s,\"pullupEnabled\":%s,\"pulldownEnabled\":%s,\"levelHigh\":%s,\"overrideActive\":%s,\"overrideMode\":",
+            (unsigned)pin->gpio_num,
+            (unsigned)pin->module_pin,
+            pin->output_capable ? "true" : "false",
+            pin->input_enabled ? "true" : "false",
+            pin->output_enabled ? "true" : "false",
+            pin->open_drain_enabled ? "true" : "false",
+            pin->pullup_enabled ? "true" : "false",
+            pin->pulldown_enabled ? "true" : "false",
+            pin->level_high ? "true" : "false",
+            pin->override_active ? "true" : "false");
+        laser_controller_comms_write_escaped_string(
+            buffer,
+            laser_controller_service_gpio_mode_name(pin->override_mode));
+        laser_controller_comms_buffer_append_fmt(
+            buffer,
+            ",\"overrideLevelHigh\":%s,\"overridePullupEnabled\":%s,\"overridePulldownEnabled\":%s}",
+            pin->override_level_high ? "true" : "false",
+            pin->override_pullup_enabled ? "true" : "false",
+            pin->override_pulldown_enabled ? "true" : "false");
+    }
+
+    laser_controller_comms_buffer_append_raw(buffer, "]},");
+}
+
 static uint8_t laser_controller_comms_expected_pd_profile_count(
     const laser_controller_service_pd_profile_t *profiles)
 {
@@ -632,6 +682,36 @@ static bool laser_controller_comms_wait_for_service_mode(
                       !laser_controller_comms_service_mode_active(status));
 }
 
+static bool laser_controller_comms_wait_for_haptic_enable(
+    bool enabled,
+    laser_controller_runtime_status_t *status)
+{
+    const TickType_t start_ticks = xTaskGetTickCount();
+    const TickType_t timeout_ticks =
+        pdMS_TO_TICKS(LASER_CONTROLLER_HAPTIC_GPIO_WAIT_MS);
+    const TickType_t poll_ticks =
+        pdMS_TO_TICKS(LASER_CONTROLLER_SERVICE_MODE_POLL_MS);
+
+    if (status == NULL) {
+        return false;
+    }
+
+    do {
+        if (!laser_controller_app_copy_status(status)) {
+            return false;
+        }
+
+        if (status->inputs.haptic_readback.enable_pin_high == enabled) {
+            return true;
+        }
+
+        vTaskDelay(poll_ticks);
+    } while ((xTaskGetTickCount() - start_ticks) < timeout_ticks);
+
+    return laser_controller_app_copy_status(status) &&
+           status->inputs.haptic_readback.enable_pin_high == enabled;
+}
+
 static void laser_controller_comms_write_snapshot_json(
     laser_controller_comms_buffer_t *buffer,
     const laser_controller_runtime_status_t *status)
@@ -796,6 +876,7 @@ static void laser_controller_comms_write_snapshot_json(
         status->inputs.tec_temp_good ? 0U : 1U);
 
     laser_controller_comms_write_peripheral_readback_json(buffer, status);
+    laser_controller_comms_write_gpio_inspector_json(buffer, status);
 
     laser_controller_comms_buffer_append_raw(buffer, "\"bench\":{");
     laser_controller_comms_buffer_append_raw(buffer, "\"targetMode\":");
@@ -1443,6 +1524,8 @@ static void laser_controller_comms_handle_command_line(const char *line)
          strcmp(command, "set_runtime_safety") == 0 ||
          strcmp(command, "set_supply_enable") == 0 ||
          strcmp(command, "set_haptic_enable") == 0 ||
+         strcmp(command, "set_gpio_override") == 0 ||
+         strcmp(command, "clear_gpio_overrides") == 0 ||
          strcmp(command, "pd_debug_config") == 0 ||
          strcmp(command, "pd_save_firmware_plan") == 0 ||
          strcmp(command, "pd_burn_nvm") == 0 ||
@@ -2045,6 +2128,75 @@ static void laser_controller_comms_handle_command_line(const char *line)
             "service",
             "ERM driver enable GPIO48 -> %s",
             enabled ? "high" : "low");
+        (void)laser_controller_comms_wait_for_haptic_enable(enabled, &status);
+        (void)laser_controller_app_copy_status(&status);
+        laser_controller_comms_emit_status_response(id, &status);
+        return;
+    }
+
+    if (strcmp(command, "set_gpio_override") == 0) {
+        laser_controller_service_gpio_mode_t mode;
+        uint32_t gpio_num = 0U;
+        bool level_high = false;
+        bool pullup_enabled = false;
+        bool pulldown_enabled = false;
+
+        if (!laser_controller_comms_extract_uint(line, "\"gpio\":", &gpio_num)) {
+            laser_controller_comms_emit_error_response(id, "Missing GPIO number.");
+            return;
+        }
+
+        if (!laser_controller_comms_extract_string(
+                line,
+                "\"mode\":\"",
+                text_arg,
+                sizeof(text_arg)) ||
+            !laser_controller_service_parse_gpio_mode(text_arg, &mode)) {
+            laser_controller_comms_emit_error_response(id, "Unknown GPIO override mode.");
+            return;
+        }
+
+        (void)laser_controller_comms_extract_bool(
+            line,
+            "\"level_high\":",
+            &level_high);
+        (void)laser_controller_comms_extract_bool(
+            line,
+            "\"pullup_enabled\":",
+            &pullup_enabled);
+        (void)laser_controller_comms_extract_bool(
+            line,
+            "\"pulldown_enabled\":",
+            &pulldown_enabled);
+
+        if (!laser_controller_service_set_gpio_override(
+                gpio_num,
+                mode,
+                level_high,
+                pullup_enabled,
+                pulldown_enabled,
+                now_ms)) {
+            laser_controller_comms_emit_error_response(id, "GPIO override rejected.");
+            return;
+        }
+
+        laser_controller_logger_logf(
+            now_ms,
+            "service",
+            "gpio %lu override -> %s",
+            (unsigned long)gpio_num,
+            laser_controller_service_gpio_mode_name(mode));
+        (void)laser_controller_app_copy_status(&status);
+        laser_controller_comms_emit_status_response(id, &status);
+        return;
+    }
+
+    if (strcmp(command, "clear_gpio_overrides") == 0) {
+        laser_controller_service_clear_gpio_overrides(now_ms);
+        laser_controller_logger_log(
+            now_ms,
+            "service",
+            "all gpio overrides cleared");
         (void)laser_controller_app_copy_status(&status);
         laser_controller_comms_emit_status_response(id, &status);
         return;

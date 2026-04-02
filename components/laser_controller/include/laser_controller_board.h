@@ -78,6 +78,32 @@ typedef struct {
     int32_t last_error;
 } laser_controller_board_tof_readback_t;
 
+#define LASER_CONTROLLER_BOARD_GPIO_INSPECTOR_PIN_COUNT 36U
+
+typedef struct {
+    uint8_t gpio_num;
+    uint8_t module_pin;
+    bool output_capable;
+    bool input_enabled;
+    bool output_enabled;
+    bool open_drain_enabled;
+    bool pullup_enabled;
+    bool pulldown_enabled;
+    bool level_high;
+    bool override_active;
+    laser_controller_service_gpio_mode_t override_mode;
+    bool override_level_high;
+    bool override_pullup_enabled;
+    bool override_pulldown_enabled;
+} laser_controller_board_gpio_pin_readback_t;
+
+typedef struct {
+    bool any_override_active;
+    uint32_t active_override_count;
+    laser_controller_board_gpio_pin_readback_t
+        pins[LASER_CONTROLLER_BOARD_GPIO_INSPECTOR_PIN_COUNT];
+} laser_controller_board_gpio_inspector_t;
+
 typedef struct {
     bool ld_rail_pgood;
     bool tec_rail_pgood;
@@ -116,6 +142,7 @@ typedef struct {
     laser_controller_board_imu_readback_t imu_readback;
     laser_controller_board_haptic_readback_t haptic_readback;
     laser_controller_board_tof_readback_t tof_readback;
+    laser_controller_board_gpio_inspector_t gpio_inspector;
 } laser_controller_board_inputs_t;
 
 void laser_controller_board_init_safe_defaults(void);
@@ -143,6 +170,8 @@ esp_err_t laser_controller_board_burn_pd_nvm(
     const laser_controller_service_pd_profile_t *profiles,
     size_t profile_count);
 void laser_controller_board_force_pd_refresh(void);
+bool laser_controller_board_gpio_inspector_has_pin(uint32_t gpio_num);
+void laser_controller_board_reset_gpio_debug_state(void);
 void laser_controller_board_get_shared_i2c_line_levels(
     bool *sda_high,
     bool *scl_high);

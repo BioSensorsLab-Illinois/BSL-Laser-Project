@@ -3,6 +3,7 @@ import {
   currentFromOpticalPowerW,
   makeDefaultBenchControlStatus,
 } from './bench-model'
+import { makeDefaultGpioInspectorStatus } from './gpio-layout'
 import {
   clampTecTempC,
   clampTecWavelengthNm,
@@ -57,6 +58,7 @@ type MockState = {
   hapticDriverEnabled: boolean
   safety: DeviceSnapshot['safety']
   bringup: DeviceSnapshot['bringup']
+  gpioInspector: DeviceSnapshot['gpioInspector']
 }
 
 const MOCK_TICK_MS = 100
@@ -254,6 +256,7 @@ export class MockTransport implements DeviceTransport {
       tempAdcVoltageV: 2.182,
     },
     bringup: makeDefaultBringupStatus(),
+    gpioInspector: makeDefaultGpioInspectorStatus(),
   }
 
   subscribe(listener: (message: TransportMessage) => void): () => void {
@@ -685,6 +688,53 @@ export class MockTransport implements DeviceTransport {
           )
         }
         break
+      case 'set_gpio_override':
+        if (
+          typeof command.args?.gpio === 'number' &&
+          typeof command.args?.mode === 'string'
+        ) {
+          const target = this.state.gpioInspector.pins.find(
+            (pin) => pin.gpioNum === command.args?.gpio,
+          )
+
+          if (target !== undefined) {
+            if (command.args.mode === 'firmware') {
+              target.overrideActive = false
+              target.overrideMode = 'firmware'
+              target.overrideLevelHigh = false
+              target.overridePullupEnabled = false
+              target.overridePulldownEnabled = false
+            } else {
+              target.overrideActive = true
+              target.overrideMode = command.args.mode as 'input' | 'output'
+              target.overrideLevelHigh = Boolean(command.args.level_high)
+              target.overridePullupEnabled = Boolean(command.args.pullup_enabled)
+              target.overridePulldownEnabled = Boolean(command.args.pulldown_enabled)
+            }
+          }
+
+          this.state.gpioInspector.anyOverrideActive = this.state.gpioInspector.pins.some(
+            (pin) => pin.overrideActive,
+          )
+          this.state.gpioInspector.activeOverrideCount = this.state.gpioInspector.pins.filter(
+            (pin) => pin.overrideActive,
+          ).length
+          this.state.bringup.tools.lastAction = `GPIO${String(command.args.gpio)} override ${String(command.args.mode)} staged in mock service mode.`
+        }
+        break
+      case 'clear_gpio_overrides':
+        for (const pin of this.state.gpioInspector.pins) {
+          pin.overrideActive = false
+          pin.overrideMode = 'firmware'
+          pin.overrideLevelHigh = false
+          pin.overridePullupEnabled = false
+          pin.overridePulldownEnabled = false
+        }
+        this.state.gpioInspector.anyOverrideActive = false
+        this.state.gpioInspector.activeOverrideCount = 0
+        this.state.bringup.tools.lastAction =
+          'All GPIO overrides cleared in the mock controller.'
+        break
       case 'save_bringup_profile':
         this.state.bringup.lastSaveOk = false
         this.state.bringup.persistenceDirty = true
@@ -1095,6 +1145,21 @@ export class MockTransport implements DeviceTransport {
   }
 
   private makeSnapshot(): DeviceSnapshot {
+    const gpioInspector = {
+      ...this.state.gpioInspector,
+      pins: this.state.gpioInspector.pins.map((pin) => ({
+        ...pin,
+      })),
+    }
+    const gpio4 = gpioInspector.pins.find((pin) => pin.gpioNum === 4)
+    const gpio5 = gpioInspector.pins.find((pin) => pin.gpioNum === 5)
+    const gpio15 = gpioInspector.pins.find((pin) => pin.gpioNum === 15)
+    const gpio16 = gpioInspector.pins.find((pin) => pin.gpioNum === 16)
+    const gpio17 = gpioInspector.pins.find((pin) => pin.gpioNum === 17)
+    const gpio18 = gpioInspector.pins.find((pin) => pin.gpioNum === 18)
+    const gpio37 = gpioInspector.pins.find((pin) => pin.gpioNum === 37)
+    const gpio48 = gpioInspector.pins.find((pin) => pin.gpioNum === 48)
+
     const tecReady = this.state.tecSettlingTicks <= 0.01
     const tecActualTemp =
       this.state.targetTempC -
@@ -1171,6 +1236,82 @@ export class MockTransport implements DeviceTransport {
       this.state.serviceMode
         ? serviceTecEnabled
         : this.state.powerTier === 'full'
+
+    if (gpio4 !== undefined) {
+      gpio4.inputEnabled = true
+      gpio4.outputEnabled = false
+      gpio4.openDrainEnabled = false
+      gpio4.pullupEnabled = true
+      gpio4.pulldownEnabled = false
+      if (gpio4.overrideActive) {
+        gpio4.levelHigh =
+          gpio4.overrideMode === 'output' ? gpio4.overrideLevelHigh : true
+      } else {
+        gpio4.levelHigh = true
+      }
+    }
+
+    if (gpio5 !== undefined) {
+      gpio5.inputEnabled = true
+      gpio5.outputEnabled = false
+      gpio5.openDrainEnabled = false
+      gpio5.pullupEnabled = true
+      gpio5.pulldownEnabled = false
+      if (gpio5.overrideActive) {
+        gpio5.levelHigh =
+          gpio5.overrideMode === 'output' ? gpio5.overrideLevelHigh : true
+      } else {
+        gpio5.levelHigh = true
+      }
+    }
+
+    if (gpio15 !== undefined) {
+      gpio15.inputEnabled = false
+      gpio15.outputEnabled = true
+      gpio15.levelHigh = gpio15.overrideActive && gpio15.overrideMode === 'output'
+        ? gpio15.overrideLevelHigh
+        : tecRailEnabled
+    }
+
+    if (gpio16 !== undefined) {
+      gpio16.inputEnabled = true
+      gpio16.outputEnabled = false
+      gpio16.levelHigh = gpio16.overrideActive && gpio16.overrideMode === 'output'
+        ? gpio16.overrideLevelHigh
+        : tecRailEnabled
+    }
+
+    if (gpio17 !== undefined) {
+      gpio17.inputEnabled = false
+      gpio17.outputEnabled = true
+      gpio17.levelHigh = gpio17.overrideActive && gpio17.overrideMode === 'output'
+        ? gpio17.overrideLevelHigh
+        : ldRailEnabled
+    }
+
+    if (gpio18 !== undefined) {
+      gpio18.inputEnabled = true
+      gpio18.outputEnabled = false
+      gpio18.levelHigh = gpio18.overrideActive && gpio18.overrideMode === 'output'
+        ? gpio18.overrideLevelHigh
+        : ldRailEnabled
+    }
+
+    if (gpio37 !== undefined) {
+      gpio37.inputEnabled = false
+      gpio37.outputEnabled = true
+      gpio37.levelHigh = gpio37.overrideActive && gpio37.overrideMode === 'output'
+        ? gpio37.overrideLevelHigh
+        : alignmentEnabled
+    }
+
+    if (gpio48 !== undefined) {
+      gpio48.inputEnabled = false
+      gpio48.outputEnabled = true
+      gpio48.levelHigh = gpio48.overrideActive && gpio48.overrideMode === 'output'
+        ? gpio48.overrideLevelHigh
+        : this.state.serviceMode && this.state.hapticDriverEnabled
+    }
 
     return {
       identity: {
@@ -1315,6 +1456,7 @@ export class MockTransport implements DeviceTransport {
           lastError: 'ESP_OK',
         },
       },
+      gpioInspector,
       bench: {
         ...benchDefaults,
         targetMode: this.state.targetMode,

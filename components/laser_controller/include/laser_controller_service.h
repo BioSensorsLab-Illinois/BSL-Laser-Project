@@ -12,6 +12,7 @@
 #define LASER_CONTROLLER_SERVICE_PROFILE_NAME_LEN 24U
 #define LASER_CONTROLLER_SERVICE_TEXT_LEN 96U
 #define LASER_CONTROLLER_SERVICE_PD_PROFILE_COUNT 3U
+#define LASER_CONTROLLER_SERVICE_GPIO_COUNT 49U
 
 typedef enum {
     LASER_CONTROLLER_MODULE_IMU = 0,
@@ -69,6 +70,20 @@ typedef enum {
     LASER_CONTROLLER_SERVICE_HAPTIC_ACTUATOR_LRA,
 } laser_controller_service_haptic_actuator_t;
 
+typedef enum {
+    LASER_CONTROLLER_SERVICE_GPIO_MODE_FIRMWARE = 0,
+    LASER_CONTROLLER_SERVICE_GPIO_MODE_INPUT,
+    LASER_CONTROLLER_SERVICE_GPIO_MODE_OUTPUT,
+} laser_controller_service_gpio_mode_t;
+
+typedef struct {
+    bool active;
+    laser_controller_service_gpio_mode_t mode;
+    bool level_high;
+    bool pullup_enabled;
+    bool pulldown_enabled;
+} laser_controller_service_gpio_override_t;
+
 typedef struct {
     bool service_mode_requested;
     bool persistence_dirty;
@@ -79,6 +94,9 @@ typedef struct {
     bool ld_rail_debug_enabled;
     bool tec_rail_debug_enabled;
     bool haptic_driver_enable_requested;
+    uint32_t gpio_override_count;
+    laser_controller_service_gpio_override_t
+        gpio_overrides[LASER_CONTROLLER_SERVICE_GPIO_COUNT];
     laser_controller_module_status_t modules[LASER_CONTROLLER_MODULE_COUNT];
     float dac_ld_channel_v;
     float dac_tec_channel_v;
@@ -202,6 +220,17 @@ void laser_controller_service_set_haptic_config(
     uint32_t rtp_level,
     laser_controller_time_ms_t now_ms);
 void laser_controller_service_fire_haptic_test(laser_controller_time_ms_t now_ms);
+bool laser_controller_service_set_gpio_override(
+    uint32_t gpio_num,
+    laser_controller_service_gpio_mode_t mode,
+    bool level_high,
+    bool pullup_enabled,
+    bool pulldown_enabled,
+    laser_controller_time_ms_t now_ms);
+void laser_controller_service_clear_gpio_overrides(laser_controller_time_ms_t now_ms);
+bool laser_controller_service_get_gpio_override(
+    uint32_t gpio_num,
+    laser_controller_service_gpio_override_t *override_config);
 void laser_controller_service_save_profile(laser_controller_time_ms_t now_ms);
 void laser_controller_service_i2c_scan(laser_controller_time_ms_t now_ms);
 void laser_controller_service_i2c_read(
@@ -251,3 +280,8 @@ bool laser_controller_service_parse_haptic_actuator(
     laser_controller_service_haptic_actuator_t *actuator);
 const char *laser_controller_service_haptic_actuator_name(
     laser_controller_service_haptic_actuator_t actuator);
+bool laser_controller_service_parse_gpio_mode(
+    const char *name,
+    laser_controller_service_gpio_mode_t *mode);
+const char *laser_controller_service_gpio_mode_name(
+    laser_controller_service_gpio_mode_t mode);

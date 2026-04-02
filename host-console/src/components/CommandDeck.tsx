@@ -8,6 +8,7 @@ import {
 } from 'lucide-react'
 
 import { ControllerBusyOverlay } from './ControllerBusyOverlay'
+import { GpioWorkbench } from './GpioWorkbench'
 import {
   decodeBusText,
   describeI2cSelection,
@@ -642,6 +643,12 @@ export function CommandDeck({
             </button>
           </div>
         </article>
+
+        <GpioWorkbench
+          snapshot={snapshot}
+          connected={connected}
+          onRunCommand={runBusCommand}
+        />
 
         <article className="panel-cutout tools-panel">
           <div className="cutout-head">

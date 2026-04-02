@@ -179,6 +179,7 @@ const BRINGUP_PD_APPLY_TIMEOUT_MS = 7000
 const BRINGUP_PD_NVM_TIMEOUT_MS = 12000
 const BRINGUP_SERVICE_MODE_WAIT_MS = 2200
 const BRINGUP_SUCCESS_DISMISS_MS = 260
+const BRINGUP_HAPTIC_ENABLE_WAIT_MS = 1200
 
 const bringupPages: PageDefinition[] = [
   {
@@ -2382,7 +2383,7 @@ export function BringupWorkbench({
   }
 
   async function setHapticEnable(enabled: boolean) {
-    await runCommandSequence(
+    const ok = await runCommandSequence(
       `${enabled ? 'Enable' : 'Disable'} ERM driver`,
       `GPIO48 ${enabled ? 'asserted' : 'cleared'} for the DRV2605/ERM driver enable path.`,
       [
@@ -2397,7 +2398,37 @@ export function BringupWorkbench({
           },
         },
       ],
+      {
+        refreshAfter: false,
+      },
     )
+
+    if (!ok) {
+      return
+    }
+
+    const waitStartedAt = window.performance.now()
+
+    for (;;) {
+      const liveEnable = latestSnapshotRef.current.peripherals.haptic.enablePinHigh
+      if (liveEnable === enabled) {
+        return
+      }
+
+      if (window.performance.now() - waitStartedAt >= BRINGUP_HAPTIC_ENABLE_WAIT_MS) {
+        setDraftNote(
+          `ERM EN request applied, but live GPIO48 readback is still ${liveEnable ? 'high' : 'low'}. Refresh status and verify service mode plus board wiring.`,
+        )
+        return
+      }
+
+      await pause(90)
+      const refreshResult = await pollLiveStatus(false)
+      if (!refreshResult.ok) {
+        setDraftNote(refreshResult.note)
+        return
+      }
+    }
   }
 
   function renderPowerPage() {
@@ -3521,28 +3552,6 @@ export function BringupWorkbench({
             <button
               type="button"
               className="action-button is-inline is-accent"
-              disabled={writesDisabled || snapshot.peripherals.haptic.enablePinHigh}
-              title="Assert the dedicated ERM driver enable pin on GPIO48 in service mode."
-              onClick={() => {
-                void setHapticEnable(true)
-              }}
-            >
-              Enable ERM EN
-            </button>
-            <button
-              type="button"
-              className="action-button is-inline"
-              disabled={writesDisabled || !snapshot.peripherals.haptic.enablePinHigh}
-              title="Force the dedicated ERM driver enable pin on GPIO48 low."
-              onClick={() => {
-                void setHapticEnable(false)
-              }}
-            >
-              Disable ERM EN
-            </button>
-            <button
-              type="button"
-              className="action-button is-inline is-accent"
               disabled={writesDisabled}
               title="Push the full DAC bring-up profile and both channel shadow voltages."
               onClick={() => {
@@ -3833,6 +3842,28 @@ export function BringupWorkbench({
           </div>
 
           <div className="button-row">
+            <button
+              type="button"
+              className="action-button is-inline is-accent"
+              disabled={writesDisabled || snapshot.peripherals.haptic.enablePinHigh}
+              title="Assert the dedicated ERM driver enable pin on GPIO48 in service mode."
+              onClick={() => {
+                void setHapticEnable(true)
+              }}
+            >
+              Enable ERM EN
+            </button>
+            <button
+              type="button"
+              className="action-button is-inline"
+              disabled={writesDisabled || !snapshot.peripherals.haptic.enablePinHigh}
+              title="Force the dedicated ERM driver enable pin on GPIO48 low."
+              onClick={() => {
+                void setHapticEnable(false)
+              }}
+            >
+              Disable ERM EN
+            </button>
             <button
               type="button"
               className="action-button is-inline is-accent"

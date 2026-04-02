@@ -245,6 +245,24 @@ static const struct {
     { 2.429f, 65.0f },
 };
 
+typedef struct {
+    uint8_t gpio_num;
+    uint8_t module_pin;
+} laser_controller_board_gpio_descriptor_t;
+
+static const laser_controller_board_gpio_descriptor_t kGpioInspectorPins[
+    LASER_CONTROLLER_BOARD_GPIO_INSPECTOR_PIN_COUNT] = {
+    { 4U, 4U },   { 5U, 5U },   { 6U, 6U },   { 7U, 7U },
+    { 15U, 8U },  { 16U, 9U },  { 17U, 10U }, { 18U, 11U },
+    { 8U, 12U },  { 19U, 13U }, { 20U, 14U }, { 3U, 15U },
+    { 46U, 16U }, { 9U, 17U },  { 10U, 18U }, { 11U, 19U },
+    { 12U, 20U }, { 13U, 21U }, { 14U, 22U }, { 21U, 23U },
+    { 47U, 24U }, { 48U, 25U }, { 45U, 26U }, { 0U, 27U },
+    { 35U, 28U }, { 36U, 29U }, { 37U, 30U }, { 38U, 31U },
+    { 39U, 32U }, { 40U, 33U }, { 41U, 34U }, { 42U, 35U },
+    { 44U, 36U }, { 43U, 37U }, { 2U, 38U },  { 1U, 39U },
+};
+
 static bool s_mock_override_enabled;
 static laser_controller_board_inputs_t s_mock_inputs;
 static laser_controller_board_outputs_t s_last_outputs = {
@@ -276,6 +294,7 @@ static laser_controller_board_pd_readback_t s_pd_readback;
 static laser_controller_board_imu_readback_t s_imu_readback;
 static laser_controller_board_haptic_readback_t s_haptic_readback;
 static laser_controller_board_tof_readback_t s_tof_readback;
+static laser_controller_board_gpio_inspector_t s_gpio_inspector;
 static laser_controller_time_ms_t s_tof_last_poll_ms;
 static esp_err_t s_tof_last_error;
 static SemaphoreHandle_t s_bus_mutex;
@@ -322,6 +341,99 @@ static uint32_t laser_controller_board_clamp_u32(
     }
 
     return value;
+}
+
+static const laser_controller_board_gpio_descriptor_t *
+laser_controller_board_find_gpio_descriptor(uint32_t gpio_num)
+{
+    for (size_t index = 0U;
+         index < LASER_CONTROLLER_BOARD_GPIO_INSPECTOR_PIN_COUNT;
+         ++index) {
+        if (kGpioInspectorPins[index].gpio_num == gpio_num) {
+            return &kGpioInspectorPins[index];
+        }
+    }
+
+    return NULL;
+}
+
+bool laser_controller_board_gpio_inspector_has_pin(uint32_t gpio_num)
+{
+    return laser_controller_board_find_gpio_descriptor(gpio_num) != NULL;
+}
+
+static void laser_controller_board_apply_gpio_overrides(void)
+{
+    gpio_config_t config = { 0 };
+    laser_controller_service_gpio_override_t override_config;
+
+    for (size_t index = 0U;
+         index < LASER_CONTROLLER_BOARD_GPIO_INSPECTOR_PIN_COUNT;
+         ++index) {
+        const uint32_t gpio_num = kGpioInspectorPins[index].gpio_num;
+
+        if (!laser_controller_service_get_gpio_override(gpio_num, &override_config) ||
+            !override_config.active) {
+            continue;
+        }
+
+        memset(&config, 0, sizeof(config));
+        config.pin_bit_mask = (1ULL << gpio_num);
+        config.mode = override_config.mode == LASER_CONTROLLER_SERVICE_GPIO_MODE_INPUT ?
+                          GPIO_MODE_INPUT :
+                          GPIO_MODE_OUTPUT;
+        config.pull_up_en =
+            override_config.pullup_enabled ? GPIO_PULLUP_ENABLE : GPIO_PULLUP_DISABLE;
+        config.pull_down_en =
+            override_config.pulldown_enabled ? GPIO_PULLDOWN_ENABLE : GPIO_PULLDOWN_DISABLE;
+        config.intr_type = GPIO_INTR_DISABLE;
+        (void)gpio_config(&config);
+
+        if (override_config.mode == LASER_CONTROLLER_SERVICE_GPIO_MODE_OUTPUT) {
+            (void)gpio_set_level(gpio_num, override_config.level_high ? 1 : 0);
+        }
+    }
+}
+
+static void laser_controller_board_capture_gpio_inspector(void)
+{
+    gpio_io_config_t io_config = { 0 };
+    laser_controller_service_gpio_override_t override_config;
+
+    memset(&s_gpio_inspector, 0, sizeof(s_gpio_inspector));
+
+    for (size_t index = 0U;
+         index < LASER_CONTROLLER_BOARD_GPIO_INSPECTOR_PIN_COUNT;
+         ++index) {
+        laser_controller_board_gpio_pin_readback_t *pin = &s_gpio_inspector.pins[index];
+        const uint32_t gpio_num = kGpioInspectorPins[index].gpio_num;
+
+        pin->gpio_num = (uint8_t)gpio_num;
+        pin->module_pin = kGpioInspectorPins[index].module_pin;
+        pin->output_capable = GPIO_IS_VALID_OUTPUT_GPIO((int)gpio_num);
+        pin->level_high = gpio_get_level(gpio_num) != 0;
+
+        if (gpio_get_io_config((gpio_num_t)gpio_num, &io_config) == ESP_OK) {
+            pin->input_enabled = io_config.ie;
+            pin->output_enabled = io_config.oe;
+            pin->open_drain_enabled = io_config.od;
+            pin->pullup_enabled = io_config.pu;
+            pin->pulldown_enabled = io_config.pd;
+        }
+
+        if (laser_controller_service_get_gpio_override(gpio_num, &override_config) &&
+            override_config.active) {
+            pin->override_active = true;
+            pin->override_mode = override_config.mode;
+            pin->override_level_high = override_config.level_high;
+            pin->override_pullup_enabled = override_config.pullup_enabled;
+            pin->override_pulldown_enabled = override_config.pulldown_enabled;
+            s_gpio_inspector.any_override_active = true;
+            s_gpio_inspector.active_override_count += 1U;
+        } else {
+            pin->override_mode = LASER_CONTROLLER_SERVICE_GPIO_MODE_FIRMWARE;
+        }
+    }
 }
 
 static void laser_controller_board_load_default_imu_config(
@@ -3398,6 +3510,7 @@ void laser_controller_board_init_safe_defaults(void)
     laser_controller_board_clear_haptic_readback();
     laser_controller_board_clear_tof_runtime();
     laser_controller_board_clear_tof_readback();
+    memset(&s_gpio_inspector, 0, sizeof(s_gpio_inspector));
     laser_controller_board_load_default_imu_config(&s_imu_runtime.config);
 
     if (s_bus_mutex == NULL) {
@@ -3514,6 +3627,8 @@ void laser_controller_board_read_inputs(
     inputs->imu_readback = s_imu_readback;
     inputs->haptic_readback = s_haptic_readback;
     inputs->tof_readback = s_tof_readback;
+    laser_controller_board_capture_gpio_inspector();
+    inputs->gpio_inspector = s_gpio_inspector;
 }
 
 void laser_controller_board_apply_outputs(const laser_controller_board_outputs_t *outputs)
@@ -3524,6 +3639,7 @@ void laser_controller_board_apply_outputs(const laser_controller_board_outputs_t
 
     s_last_outputs = *outputs;
     laser_controller_board_drive_safe_gpio_levels(outputs);
+    laser_controller_board_apply_gpio_overrides();
 }
 
 void laser_controller_board_get_last_outputs(laser_controller_board_outputs_t *outputs)
@@ -3823,6 +3939,41 @@ esp_err_t laser_controller_board_burn_pd_nvm(
 void laser_controller_board_force_pd_refresh(void)
 {
     s_pd_snapshot.updated_ms = 0U;
+}
+
+void laser_controller_board_reset_gpio_debug_state(void)
+{
+    if (s_i2c_ready && s_i2c_bus != NULL) {
+        (void)i2c_master_bus_wait_all_done(
+            s_i2c_bus,
+            LASER_CONTROLLER_I2C_TIMEOUT_MS);
+        (void)i2c_del_master_bus(s_i2c_bus);
+        s_i2c_bus = NULL;
+        s_i2c_ready = false;
+    }
+
+    if (s_spi_ready) {
+        if (s_imu_spi != NULL) {
+            (void)spi_bus_remove_device(s_imu_spi);
+            s_imu_spi = NULL;
+        }
+        (void)spi_bus_free(LASER_CONTROLLER_SPI_HOST);
+        s_spi_ready = false;
+    }
+
+    for (size_t index = 0U;
+         index < LASER_CONTROLLER_BOARD_GPIO_INSPECTOR_PIN_COUNT;
+         ++index) {
+        (void)gpio_reset_pin((gpio_num_t)kGpioInspectorPins[index].gpio_num);
+    }
+
+    s_gpio_ready = false;
+    (void)laser_controller_board_ensure_gpio_ready();
+    (void)laser_controller_board_ensure_i2c_ready();
+    (void)laser_controller_board_ensure_spi_ready();
+    laser_controller_board_drive_safe_gpio_levels(&s_last_outputs);
+    laser_controller_board_apply_gpio_overrides();
+    laser_controller_board_capture_gpio_inspector();
 }
 
 esp_err_t laser_controller_board_imu_spi_read(uint8_t reg, uint8_t *value)

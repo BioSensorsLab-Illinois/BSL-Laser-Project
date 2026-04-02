@@ -110,6 +110,8 @@ Required fields:
 | `haptic_debug_config` | stage DRV2605 mode, library, actuator, RTP level, and effect selection | service-only |
 | `set_haptic_enable` | assert or clear the dedicated ERM driver enable pin on `GPIO48` | service-only; direct bench GPIO control for the motor path |
 | `haptic_debug_fire` | fire a service-mode haptic pattern | service-only |
+| `set_gpio_override` | force a selected ESP32 pad into firmware/input/output service ownership with optional pull and drive level | service-only; hazardous on USB, boot, and debug pins |
+| `clear_gpio_overrides` | clear every GPIO override and return ownership to the original firmware logic | service-only; global recovery path for the GPIO inspector |
 | `i2c_scan` | probe declared I2C targets | read-only diagnostic; does not require service mode |
 | `i2c_read` | read an I2C register | read-only diagnostic; must be logged |
 | `i2c_write` | write an I2C register | service-only; must be logged |
@@ -125,6 +127,8 @@ Current bring-up-specific behavior:
 - `i2c_scan`, `i2c_read`, `spi_read`, and `refresh_pd_status` are intentionally allowed outside service mode because they are read-only probes.
 - `set_supply_enable` is intentionally separate from beam-control commands. In `SERVICE_MODE`, it only requests the LD or TEC MPM3530 VIN rail while alignment stays off and the laser driver stays in standby.
 - `set_haptic_enable` is intentionally separate from `haptic_debug_config`. It directly controls the dedicated ERM enable line on `GPIO48` during service bring-up so the operator can prove the motor power path independently from DRV2605 register writes.
+- `set_gpio_override` is intentionally separate from all module tools. It is the service-owned escape hatch for direct ESP32 pad control during controlled bench work.
+- `clear_gpio_overrides` is the required reset path for the GPIO inspector. It must clear every override, rebuild the board GPIO state, and return ownership to the original firmware logic.
 - `i2c_scan` now reports raw shared-bus line levels in failure text when the bus is unavailable, for example `Shared I2C unavailable (ESP_ERR_TIMEOUT, SDA=0, SCL=1).`
 - `pd_debug_config` now writes the runtime PDO registers, verifies the STUSB4500 readback, and sends a PD soft reset so the source renegotiates against the new PDO set.
 - `pd_save_firmware_plan` first applies the same runtime PDO update, then refreshes live STUSB4500 readback, and only saves the plan into MCU NVS if the live PDO table matches the requested plan.
@@ -197,6 +201,28 @@ Current bring-up-specific behavior:
     "tempAdcVoltageV": 1.115,
     "currentA": 0.3,
     "voltageV": 2.1
+  },
+  "gpioInspector": {
+    "anyOverrideActive": true,
+    "activeOverrideCount": 1,
+    "pins": [
+      {
+        "gpioNum": 48,
+        "modulePin": 25,
+        "outputCapable": true,
+        "inputEnabled": false,
+        "outputEnabled": true,
+        "openDrainEnabled": false,
+        "pullupEnabled": false,
+        "pulldownEnabled": false,
+        "levelHigh": true,
+        "overrideActive": true,
+        "overrideMode": "output",
+        "overrideLevelHigh": true,
+        "overridePullupEnabled": false,
+        "overridePulldownEnabled": false
+      }
+    ]
   },
   "bench": {
     "targetMode": "lambda",
@@ -299,6 +325,12 @@ Current bring-up-specific behavior:
   }
 }
 ```
+
+`gpioInspector` is live SoC pad truth from the board layer:
+
+- `inputEnabled`, `outputEnabled`, `openDrainEnabled`, `pullupEnabled`, `pulldownEnabled`, and `levelHigh` are actual controller readback.
+- `overrideActive`, `overrideMode`, and the `override*` fields describe only the service override path.
+- Host UI should always distinguish live readback from staged override draft values.
 
 Wireless transport notes:
 
