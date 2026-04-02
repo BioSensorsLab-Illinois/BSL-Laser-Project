@@ -180,10 +180,20 @@ type ProbeRequest = {
   args?: Record<string, number | string | boolean>
 }
 
+type ProbeCycleState = {
+  signature: string
+  nextIndex: number
+  initialSweepComplete: boolean
+  lastProbeAtMs: number
+}
+
 const HOST_DRAFT_STORAGE_KEY = 'bsl-bringup-draft-v6'
 const LEGACY_HOST_DRAFT_STORAGE_KEY = 'bsl-bringup-draft-v3'
 const BRINGUP_ACK_TIMEOUT_MS = 3200
-const BRINGUP_PROBE_INTERVAL_MS = 4500
+const BRINGUP_PROBE_INTERVAL_MS = 9000
+const BRINGUP_PROBE_SWEEP_INTERVAL_MS = 900
+const BRINGUP_PLAN_SYNC_INTERVAL_MS = 700
+const BRINGUP_AUTO_PROBE_TIMEOUT_MS = 1500
 const BRINGUP_PD_REFRESH_TIMEOUT_MS = 2600
 const BRINGUP_PD_APPLY_TIMEOUT_MS = 7000
 const BRINGUP_PD_NVM_TIMEOUT_MS = 12000
@@ -194,6 +204,8 @@ const BRINGUP_HAPTIC_PATTERN_MAX_PULSES = 12
 const BRINGUP_HAPTIC_PATTERN_MIN_MS = 10
 const BRINGUP_HAPTIC_PATTERN_MAX_MS = 600
 const TOF_ILLUMINATION_PWM_HZ = 5000
+const DAC80502_BOARD_SPAN_V = 2.5
+const DAC80502_CODE_MAX = 0xffff
 
 const bringupPages: PageDefinition[] = [
   {
@@ -269,6 +281,15 @@ function parseNumber(value: string, fallback: number): number {
 
 function formatRegisterHex(value: number, width = 4): string {
   return `0x${Math.max(0, Math.trunc(value)).toString(16).toUpperCase().padStart(width, '0')}`
+}
+
+function dacRegisterCodeToVoltage(value: number): number {
+  const code = Math.max(0, Math.min(DAC80502_CODE_MAX, Math.trunc(value)))
+  return (code / DAC80502_CODE_MAX) * DAC80502_BOARD_SPAN_V
+}
+
+function formatDacRegisterEquivalent(value: number): string {
+  return `${formatNumber(dacRegisterCodeToVoltage(value), 3)} V`
 }
 
 function clampInteger(value: number, minimum: number, maximum: number): number {
@@ -527,50 +548,145 @@ function loadHostDraftState(snapshot: DeviceSnapshot): BringupStoredState {
 }
 
 function mergePlannedAndLiveModules(
+  snapshot: DeviceSnapshot,
   planned: BringupModuleMap,
   live: BringupModuleMap,
+  connected: boolean,
 ): BringupModuleMap {
+  function mergeModuleStatus(
+    module: ModuleKey,
+    plannedStatus: BringupModuleStatus,
+    liveStatus: BringupModuleStatus,
+  ): BringupModuleStatus {
+    const merged: BringupModuleStatus = {
+      ...liveStatus,
+      expectedPresent: plannedStatus.expectedPresent,
+      debugEnabled: plannedStatus.debugEnabled,
+    }
+
+    if (!connected) {
+      return merged
+    }
+
+    const observed = observeModuleStatus(module, snapshot)
+    return {
+      ...merged,
+      detected: merged.detected || observed.detected,
+      healthy: merged.healthy || observed.healthy,
+    }
+  }
+
   return {
-    imu: {
-      ...live.imu,
-      expectedPresent: planned.imu.expectedPresent,
-      debugEnabled: planned.imu.debugEnabled,
-    },
-    dac: {
-      ...live.dac,
-      expectedPresent: planned.dac.expectedPresent,
-      debugEnabled: planned.dac.debugEnabled,
-    },
-    haptic: {
-      ...live.haptic,
-      expectedPresent: planned.haptic.expectedPresent,
-      debugEnabled: planned.haptic.debugEnabled,
-    },
-    tof: {
-      ...live.tof,
-      expectedPresent: planned.tof.expectedPresent,
-      debugEnabled: planned.tof.debugEnabled,
-    },
-    buttons: {
-      ...live.buttons,
-      expectedPresent: planned.buttons.expectedPresent,
-      debugEnabled: planned.buttons.debugEnabled,
-    },
-    pd: {
-      ...live.pd,
-      expectedPresent: planned.pd.expectedPresent,
-      debugEnabled: planned.pd.debugEnabled,
-    },
-    laserDriver: {
-      ...live.laserDriver,
-      expectedPresent: planned.laserDriver.expectedPresent,
-      debugEnabled: planned.laserDriver.debugEnabled,
-    },
-    tec: {
-      ...live.tec,
-      expectedPresent: planned.tec.expectedPresent,
-      debugEnabled: planned.tec.debugEnabled,
-    },
+    imu: mergeModuleStatus('imu', planned.imu, live.imu),
+    dac: mergeModuleStatus('dac', planned.dac, live.dac),
+    haptic: mergeModuleStatus('haptic', planned.haptic, live.haptic),
+    tof: mergeModuleStatus('tof', planned.tof, live.tof),
+    buttons: mergeModuleStatus('buttons', planned.buttons, live.buttons),
+    pd: mergeModuleStatus('pd', planned.pd, live.pd),
+    laserDriver: mergeModuleStatus('laserDriver', planned.laserDriver, live.laserDriver),
+    tec: mergeModuleStatus('tec', planned.tec, live.tec),
+  }
+}
+
+function observeModuleStatus(
+  module: ModuleKey,
+  snapshot: DeviceSnapshot,
+): Pick<BringupModuleStatus, 'detected' | 'healthy'> {
+  switch (module) {
+    case 'imu': {
+      const peripheral = snapshot.peripherals.imu
+      const detected =
+        peripheral.reachable ||
+        peripheral.configured ||
+        peripheral.whoAmI === 0x6c ||
+        snapshot.imu.valid ||
+        snapshot.imu.fresh
+      const healthy =
+        snapshot.imu.valid ||
+        snapshot.imu.fresh ||
+        (peripheral.reachable && peripheral.configured)
+      return { detected, healthy }
+    }
+    case 'dac': {
+      const peripheral = snapshot.peripherals.dac
+      const registerReadbackSeen =
+        peripheral.syncReg !== 0 ||
+        peripheral.configReg !== 0 ||
+        peripheral.gainReg !== 0 ||
+        peripheral.statusReg !== 0 ||
+        peripheral.dataAReg !== 0 ||
+        peripheral.dataBReg !== 0
+      const detected = peripheral.reachable || peripheral.configured || registerReadbackSeen
+      const healthy = peripheral.reachable && (peripheral.configured || registerReadbackSeen)
+      return { detected, healthy }
+    }
+    case 'haptic': {
+      const peripheral = snapshot.peripherals.haptic
+      const registerReadbackSeen =
+        peripheral.modeReg !== 0 ||
+        peripheral.libraryReg !== 0 ||
+        peripheral.feedbackReg !== 0 ||
+        peripheral.goReg !== 0
+      const detected =
+        peripheral.reachable ||
+        peripheral.enablePinHigh ||
+        peripheral.triggerPinHigh ||
+        registerReadbackSeen
+      return { detected, healthy: peripheral.reachable }
+    }
+    case 'tof': {
+      const peripheral = snapshot.peripherals.tof
+      const detected =
+        peripheral.reachable ||
+        peripheral.configured ||
+        peripheral.sensorId !== 0 ||
+        peripheral.dataReady ||
+        snapshot.tof.valid ||
+        snapshot.tof.fresh
+      const healthy =
+        snapshot.tof.valid ||
+        snapshot.tof.fresh ||
+        (peripheral.reachable && (peripheral.configured || peripheral.sensorId !== 0))
+      return { detected, healthy }
+    }
+    case 'pd': {
+      const peripheral = snapshot.peripherals.pd
+      const detected =
+        peripheral.reachable ||
+        peripheral.attached ||
+        snapshot.pd.contractValid ||
+        snapshot.pd.sourceVoltageV > 0 ||
+        snapshot.pd.sourceCurrentA > 0
+      const healthy = peripheral.reachable || snapshot.pd.contractValid
+      return { detected, healthy }
+    }
+    case 'buttons': {
+      const detected =
+        snapshot.buttons.stage1Pressed ||
+        snapshot.buttons.stage2Pressed ||
+        snapshot.buttons.stage1Edge ||
+        snapshot.buttons.stage2Edge
+      return { detected, healthy: detected }
+    }
+    case 'laserDriver': {
+      const detected =
+        snapshot.rails.ld.enabled ||
+        snapshot.rails.ld.pgood ||
+        snapshot.laser.measuredCurrentA > 0 ||
+        snapshot.laser.driverTempC !== 0
+      const healthy = snapshot.rails.ld.pgood || snapshot.laser.loopGood
+      return { detected, healthy }
+    }
+    case 'tec': {
+      const detected =
+        snapshot.rails.tec.enabled ||
+        snapshot.rails.tec.pgood ||
+        snapshot.tec.tempC !== 0 ||
+        snapshot.tec.currentA !== 0 ||
+        snapshot.tec.voltageV !== 0
+      const healthy = snapshot.rails.tec.pgood || snapshot.tec.tempGood
+      return { detected, healthy }
+    }
   }
 }
 
@@ -583,7 +699,10 @@ function pause(ms: number): Promise<void> {
 function buildProbeQueue(modules: BringupModuleMap): ProbeRequest[] {
   const probes: ProbeRequest[] = []
 
-  if (modules.imu.expectedPresent || modules.imu.debugEnabled) {
+  if (
+    moduleMeta.imu.validationMode === 'probe' &&
+    (modules.imu.expectedPresent || modules.imu.debugEnabled)
+  ) {
     probes.push({
       id: 'imu-whoami',
       cmd: 'spi_read',
@@ -595,7 +714,10 @@ function buildProbeQueue(modules: BringupModuleMap): ProbeRequest[] {
     })
   }
 
-  if (modules.pd.expectedPresent || modules.pd.debugEnabled) {
+  if (
+    moduleMeta.pd.validationMode === 'probe' &&
+    (modules.pd.expectedPresent || modules.pd.debugEnabled)
+  ) {
     probes.push({
       id: 'pd-status',
       cmd: 'i2c_read',
@@ -607,7 +729,10 @@ function buildProbeQueue(modules: BringupModuleMap): ProbeRequest[] {
     })
   }
 
-  if (modules.dac.expectedPresent || modules.dac.debugEnabled) {
+  if (
+    moduleMeta.dac.validationMode === 'probe' &&
+    (modules.dac.expectedPresent || modules.dac.debugEnabled)
+  ) {
     probes.push({
       id: 'dac-config',
       cmd: 'i2c_read',
@@ -619,7 +744,10 @@ function buildProbeQueue(modules: BringupModuleMap): ProbeRequest[] {
     })
   }
 
-  if (modules.haptic.expectedPresent || modules.haptic.debugEnabled) {
+  if (
+    moduleMeta.haptic.validationMode === 'probe' &&
+    (modules.haptic.expectedPresent || modules.haptic.debugEnabled)
+  ) {
     probes.push({
       id: 'haptic-mode',
       cmd: 'i2c_read',
@@ -631,15 +759,56 @@ function buildProbeQueue(modules: BringupModuleMap): ProbeRequest[] {
     })
   }
 
+  if (
+    moduleMeta.tof.validationMode === 'probe' &&
+    (modules.tof.expectedPresent || modules.tof.debugEnabled)
+  ) {
+    probes.push({
+      id: 'tof-live-status',
+      cmd: 'get_status',
+      note: 'Background ToF live-status refresh.',
+    })
+  }
+
   return probes
 }
 
-function moduleScore(status: BringupModuleStatus): ModuleScore {
+function moduleScore(
+  module: ModuleKey,
+  status: BringupModuleStatus,
+  connected: boolean,
+): ModuleScore {
+  const meta = moduleMeta[module]
+
   if (!status.expectedPresent) {
     return {
       progress: 0,
       tone: 'critical',
       label: status.detected ? 'Unexpected response' : 'Not installed',
+    }
+  }
+
+  if (!connected) {
+    return {
+      progress: status.debugEnabled ? 38 : 22,
+      tone: 'warning',
+      label: 'Offline plan',
+    }
+  }
+
+  if (meta.validationMode === 'monitored') {
+    if (!status.debugEnabled) {
+      return {
+        progress: 82,
+        tone: 'warning',
+        label: 'Declared, tools off',
+      }
+    }
+
+    return {
+      progress: 100,
+      tone: 'steady',
+      label: 'Live monitored',
     }
   }
 
@@ -675,9 +844,12 @@ function moduleScore(status: BringupModuleStatus): ModuleScore {
 }
 
 function moduleSummary(
+  module: ModuleKey,
   status: BringupModuleStatus,
   connected: boolean,
 ): { headline: string; detail: string } {
+  const meta = moduleMeta[module]
+
   if (!status.expectedPresent) {
     return {
       headline: status.detected ? 'Unexpected response on undeclared hardware' : 'Not part of this bench build',
@@ -689,8 +861,19 @@ function moduleSummary(
 
   if (!connected) {
     return {
-      headline: 'Planned, not probed yet',
-      detail: 'This is only a bench plan until the board is connected and you run a probe.',
+      headline:
+        meta.validationMode === 'probe' ? 'Planned, not probed yet' : 'Planned, not monitored yet',
+      detail:
+        meta.validationMode === 'probe'
+          ? 'This is only a bench plan until the board is connected and you run a probe.'
+          : 'This path does not have a digital identity probe. The controller only validates it once live GPIO and analog readback are available.',
+    }
+  }
+
+  if (meta.validationMode === 'monitored') {
+    return {
+      headline: status.debugEnabled ? 'Live electrical monitoring active' : 'Declared hardware, tools disabled',
+      detail: meta.validationDetail,
     }
   }
 
@@ -714,14 +897,19 @@ function moduleSummary(
   }
 }
 
-function overallBringupPercent(modules: BringupModuleMap): number {
+function overallBringupPercent(
+  modules: BringupModuleMap,
+  connected: boolean,
+): number {
   const plannedModules = moduleKeys.filter((module) => modules[module].expectedPresent)
 
   if (plannedModules.length === 0) {
     return 0
   }
 
-  const scores = plannedModules.map((module) => moduleScore(modules[module]).progress)
+  const scores = plannedModules.map((module) =>
+    moduleScore(module, modules[module], connected).progress,
+  )
   return Math.round(
     scores.reduce((total, progress) => total + progress, 0) / scores.length,
   )
@@ -824,11 +1012,11 @@ export function BringupWorkbench({
   const writesDisabled = !connected || operation !== null
   const liveModules = connected ? snapshot.bringup.modules : form.modules
   const displayModules = useMemo(
-    () => mergePlannedAndLiveModules(form.modules, liveModules),
-    [form.modules, liveModules],
+    () => mergePlannedAndLiveModules(snapshot, form.modules, liveModules, connected),
+    [connected, form.modules, liveModules, snapshot],
   )
   const livePdProfiles = snapshot.bringup.tuning.pdProfiles ?? makeDefaultPdProfiles()
-  const overallProgress = overallBringupPercent(displayModules)
+  const overallProgress = overallBringupPercent(displayModules, connected)
   const powerPageScore = powerSupplyScore(snapshot, connected)
   const livePageModule =
     activePage !== 'workflow' && activePage !== 'power'
@@ -839,25 +1027,41 @@ export function BringupWorkbench({
       ? powerPageScore
       : livePageModule === null
         ? null
-        : moduleScore(livePageModule)
+        : moduleScore(activePage as ModuleKey, livePageModule, connected)
   const operationBusyRef = useRef(false)
   const operationConfirmResolveRef = useRef<(() => void) | null>(null)
   const probeBusyRef = useRef(false)
   const moduleSyncBusyRef = useRef(false)
-  const probeIndexRef = useRef(0)
   const latestSnapshotRef = useRef(snapshot)
+  const probeCycleRef = useRef<ProbeCycleState>({
+    signature: '',
+    nextIndex: 0,
+    initialSweepComplete: false,
+    lastProbeAtMs: 0,
+  })
+  const lastModuleSyncFailureRef = useRef('')
   const desiredModulePlanSignature = useMemo(
     () => modulePlanSignature(form.modules),
     [form.modules],
-  )
-  const liveModulePlanSignature = useMemo(
-    () => modulePlanSignature(snapshot.bringup.modules),
-    [snapshot.bringup.modules],
   )
 
   useEffect(() => {
     latestSnapshotRef.current = snapshot
   }, [snapshot])
+
+  useEffect(() => {
+    if (!connected) {
+      moduleSyncBusyRef.current = false
+      probeBusyRef.current = false
+      probeCycleRef.current = {
+        signature: '',
+        nextIndex: 0,
+        initialSweepComplete: false,
+        lastProbeAtMs: 0,
+      }
+      lastModuleSyncFailureRef.current = ''
+    }
+  }, [connected])
 
   useEffect(() => {
     const liveDuty = snapshot.bringup.illumination.tof.dutyCyclePct
@@ -868,6 +1072,70 @@ export function BringupWorkbench({
     snapshot.bringup.illumination.tof.dutyCyclePct,
     snapshot.bringup.illumination.tof.enabled,
   ])
+
+  useEffect(() => {
+    if (!connected) {
+      return
+    }
+
+    const timerId = window.setInterval(() => {
+      if (moduleSyncBusyRef.current || operationBusyRef.current || probeBusyRef.current) {
+        return
+      }
+
+      const livePlan = latestSnapshotRef.current.bringup.modules
+      const nextModule = moduleKeys.find((module) => {
+        const desired = form.modules[module]
+        const live = livePlan[module]
+        return (
+          desired.expectedPresent !== live.expectedPresent ||
+          desired.debugEnabled !== live.debugEnabled
+        )
+      })
+
+      if (nextModule === undefined) {
+        lastModuleSyncFailureRef.current = ''
+        return
+      }
+
+      const desired = form.modules[nextModule]
+      moduleSyncBusyRef.current = true
+
+      void onIssueCommandAwaitAck(
+        'set_module_state',
+        'write',
+        `Auto-sync the ${moduleMeta[nextModule].label} module plan before background validation.`,
+        {
+          module: toFirmwareModuleName(nextModule),
+          expected_present: desired.expectedPresent,
+          debug_enabled: desired.debugEnabled,
+        },
+        {
+          logHistory: false,
+          timeoutMs: BRINGUP_ACK_TIMEOUT_MS,
+        },
+      )
+        .then((result) => {
+          if (result.ok) {
+            lastModuleSyncFailureRef.current = ''
+            return
+          }
+
+          const failureNote = `${moduleMeta[nextModule].label} plan auto-sync is retrying. ${result.note}`
+          if (lastModuleSyncFailureRef.current !== failureNote) {
+            setDraftNote(failureNote)
+            lastModuleSyncFailureRef.current = failureNote
+          }
+        })
+        .finally(() => {
+          moduleSyncBusyRef.current = false
+        })
+    }, BRINGUP_PLAN_SYNC_INTERVAL_MS)
+
+    return () => {
+      window.clearInterval(timerId)
+    }
+  }, [connected, form.modules, onIssueCommandAwaitAck])
 
   function dismissOperation() {
     const resolve = operationConfirmResolveRef.current
@@ -1034,100 +1302,6 @@ export function BringupWorkbench({
     spiValue,
   ])
 
-  useEffect(() => {
-    if (!connected || desiredModulePlanSignature === liveModulePlanSignature) {
-      return
-    }
-
-    let cancelled = false
-
-    const syncModulePlan = async () => {
-      if (
-        cancelled ||
-        operationBusyRef.current ||
-        probeBusyRef.current ||
-        moduleSyncBusyRef.current
-      ) {
-        return
-      }
-
-      moduleSyncBusyRef.current = true
-      probeBusyRef.current = true
-
-      let syncedCount = 0
-
-      try {
-        const liveModulesSnapshot = latestSnapshotRef.current.bringup.modules
-
-        for (const module of moduleKeys) {
-          const planned = form.modules[module]
-          const live = liveModulesSnapshot[module]
-
-          if (
-            planned.expectedPresent === live.expectedPresent &&
-            planned.debugEnabled === live.debugEnabled
-          ) {
-            continue
-          }
-
-          const result = await onIssueCommandAwaitAck(
-            'set_module_state',
-            'write',
-            `Auto-sync bring-up plan for ${moduleMeta[module].label}.`,
-            {
-              module: toFirmwareModuleName(module),
-              expected_present: planned.expectedPresent,
-              debug_enabled: planned.debugEnabled,
-            },
-            {
-              logHistory: false,
-              timeoutMs: BRINGUP_ACK_TIMEOUT_MS,
-            },
-          )
-
-          if (!result.ok) {
-            setDraftNote(
-              `${moduleMeta[module].label} plan did not auto-sync: ${result.note}`,
-            )
-            return
-          }
-
-          syncedCount += 1
-        }
-
-        if (syncedCount > 0) {
-          void pollLiveStatus(false)
-          setDraftNote(
-            syncedCount === 1
-              ? 'One module plan auto-synced to the controller.'
-              : `${syncedCount} module plans auto-synced to the controller.`,
-          )
-        }
-      } finally {
-        probeBusyRef.current = false
-        moduleSyncBusyRef.current = false
-      }
-    }
-
-    void syncModulePlan()
-
-    const timerId = window.setInterval(() => {
-      void syncModulePlan()
-    }, 320)
-
-    return () => {
-      cancelled = true
-      window.clearInterval(timerId)
-    }
-  }, [
-    connected,
-    desiredModulePlanSignature,
-    form.modules,
-    liveModulePlanSignature,
-    onIssueCommandAwaitAck,
-    pollLiveStatus,
-  ])
-
   function syncFormFromSnapshot() {
     setForm(makeFormState(snapshot))
     setDraftNote('Live device bring-up values loaded into the local bench plan.')
@@ -1275,7 +1449,7 @@ export function BringupWorkbench({
     setOperation({
       label,
       detail: serviceModeRequested
-        ? 'Write session requested. Refreshing live status...'
+        ? 'Write session already requested. Waiting for controller acknowledgement...'
         : 'Requesting service mode for controller writes...',
       percent: 22,
       tone: 'warning',
@@ -1296,38 +1470,26 @@ export function BringupWorkbench({
         await holdOperationError(label, enterResult.note)
         return false
       }
-    }
-
-    await pause(120)
-    const waitStartedAt = window.performance.now()
-
-    for (;;) {
-      const refreshResult = await pollLiveStatus(false)
-      if (!refreshResult.ok) {
-        await holdOperationError(label, refreshResult.note)
-        return false
-      }
 
       if (latestSnapshotRef.current.bringup.serviceModeActive) {
         return true
       }
-
-      if (window.performance.now() - waitStartedAt >= BRINGUP_SERVICE_MODE_WAIT_MS) {
-        await holdOperationError(
-          label,
-          'Service mode did not become active before the write timeout expired.',
-        )
-        return false
-      }
-
-      setOperation({
-        label,
-        detail: 'Waiting for the controller to enter write-safe service mode...',
-        percent: 46,
-        tone: 'warning',
-      })
-      await pause(140)
     }
+
+    const waitStartedAt = window.performance.now()
+
+    while (window.performance.now() - waitStartedAt < BRINGUP_SERVICE_MODE_WAIT_MS) {
+      if (latestSnapshotRef.current.bringup.serviceModeActive) {
+        return true
+      }
+      await pause(80)
+    }
+
+    await holdOperationError(
+      label,
+      'Service mode did not become active before the write timeout expired.',
+    )
+    return false
   }
 
   async function runCommandSequence(
@@ -1364,7 +1526,7 @@ export function BringupWorkbench({
     }
 
     operationBusyRef.current = true
-    const refreshAfter = options?.refreshAfter ?? true
+    const refreshAfter = options?.refreshAfter ?? false
     const needsService = steps.some((step) => step.requireService)
     const totalSteps = steps.length + (needsService ? 1 : 0) + (refreshAfter ? 1 : 0)
     let completedSteps = 0
@@ -1754,13 +1916,6 @@ export function BringupWorkbench({
             expected_present: preparedForm.modules.dac.expectedPresent,
             debug_enabled: preparedForm.modules.dac.debugEnabled,
           },
-        },
-        {
-          detail: 'Refreshing live DAC module state before write...',
-          cmd: 'get_status',
-          risk: 'read',
-          note: 'Refresh the live bring-up snapshot after arming DAC writes.',
-          logHistory: false,
         },
         {
           detail: 'Applying DAC reference and update policy...',
@@ -2300,24 +2455,62 @@ export function BringupWorkbench({
       return
     }
 
-    const probeQueue = buildProbeQueue(form.modules)
-    if (probeQueue.length === 0) {
-      return
-    }
-
     const timerId = window.setInterval(() => {
+      if (operationBusyRef.current || probeBusyRef.current || moduleSyncBusyRef.current) {
+        return
+      }
+
+      const livePlanSignature = modulePlanSignature(latestSnapshotRef.current.bringup.modules)
+      if (desiredModulePlanSignature !== livePlanSignature) {
+        probeCycleRef.current = {
+          signature: '',
+          nextIndex: 0,
+          initialSweepComplete: false,
+          lastProbeAtMs: 0,
+        }
+        return
+      }
+
+      const probeQueue = buildProbeQueue(form.modules)
+      if (probeQueue.length === 0) {
+        probeCycleRef.current = {
+          signature: '',
+          nextIndex: 0,
+          initialSweepComplete: false,
+          lastProbeAtMs: 0,
+        }
+        return
+      }
+
+      const cycleSignature = `${desiredModulePlanSignature}|${probeQueue
+        .map((probe) => probe.id)
+        .join(',')}`
+
+      if (probeCycleRef.current.signature !== cycleSignature) {
+        probeCycleRef.current = {
+          signature: cycleSignature,
+          nextIndex: 0,
+          initialSweepComplete: false,
+          lastProbeAtMs: 0,
+        }
+      }
+
+      const nowMs = window.performance.now()
+      const minimumDelayMs = probeCycleRef.current.initialSweepComplete
+        ? BRINGUP_PROBE_INTERVAL_MS
+        : BRINGUP_PROBE_SWEEP_INTERVAL_MS
+
       if (
-        desiredModulePlanSignature !== liveModulePlanSignature ||
-        operationBusyRef.current ||
-        probeBusyRef.current ||
-        moduleSyncBusyRef.current
+        probeCycleRef.current.lastProbeAtMs > 0 &&
+        nowMs - probeCycleRef.current.lastProbeAtMs < minimumDelayMs
       ) {
         return
       }
 
-      const probe = probeQueue[probeIndexRef.current % probeQueue.length]
-      probeIndexRef.current += 1
+      const probe =
+        probeQueue[probeCycleRef.current.nextIndex % probeQueue.length]
       probeBusyRef.current = true
+      probeCycleRef.current.lastProbeAtMs = nowMs
 
       void onIssueCommandAwaitAck(
         probe.cmd,
@@ -2326,12 +2519,24 @@ export function BringupWorkbench({
         probe.args,
         {
           logHistory: false,
-          timeoutMs: 1400,
+          timeoutMs: BRINGUP_AUTO_PROBE_TIMEOUT_MS,
         },
       ).finally(() => {
+        if (probeCycleRef.current.signature === cycleSignature) {
+          if (!probeCycleRef.current.initialSweepComplete) {
+            const nextIndex = probeCycleRef.current.nextIndex + 1
+            probeCycleRef.current.nextIndex = nextIndex
+            probeCycleRef.current.initialSweepComplete =
+              nextIndex >= probeQueue.length
+          } else {
+            probeCycleRef.current.nextIndex =
+              (probeCycleRef.current.nextIndex + 1) % probeQueue.length
+          }
+          probeCycleRef.current.lastProbeAtMs = window.performance.now()
+        }
         probeBusyRef.current = false
       })
-    }, BRINGUP_PROBE_INTERVAL_MS)
+    }, 220)
 
     return () => {
       window.clearInterval(timerId)
@@ -2340,15 +2545,14 @@ export function BringupWorkbench({
     connected,
     desiredModulePlanSignature,
     form.modules,
-    liveModulePlanSignature,
     onIssueCommandAwaitAck,
   ])
 
   function renderModuleSettings(module: ModuleKey) {
     const liveStatus = displayModules[module]
     const plannedStatus = form.modules[module]
-    const score = moduleScore(liveStatus)
-    const summary = moduleSummary(liveStatus, connected)
+    const score = moduleScore(module, liveStatus, connected)
+    const summary = moduleSummary(module, liveStatus, connected)
     const meta = moduleMeta[module]
 
     return (
@@ -2365,11 +2569,17 @@ export function BringupWorkbench({
                   planned {plannedStatus.expectedPresent ? 'yes' : 'no'}
                 </span>
                 {plannedStatus.expectedPresent ? (
-                  <span className={liveStatus.detected ? 'status-badge is-on' : 'status-badge is-warn'}>
-                    probe {liveStatus.detected ? 'seen' : 'not yet'}
-                  </span>
+                  meta.validationMode === 'probe' ? (
+                    <span className={liveStatus.detected ? 'status-badge is-on' : 'status-badge is-warn'}>
+                      probe {liveStatus.detected ? 'seen' : 'not yet'}
+                    </span>
+                  ) : (
+                    <span className="status-badge is-on">
+                      readback monitored
+                    </span>
+                  )
                 ) : null}
-                {liveStatus.detected ? (
+                {meta.validationMode === 'probe' && liveStatus.detected ? (
                   <span className={liveStatus.healthy ? 'status-badge is-on' : 'status-badge is-warn'}>
                     health {liveStatus.healthy ? 'ok' : 'check'}
                   </span>
@@ -2502,26 +2712,12 @@ export function BringupWorkbench({
       return
     }
 
-    const waitStartedAt = window.performance.now()
-
-    for (;;) {
-      const liveEnable = latestSnapshotRef.current.peripherals.haptic.enablePinHigh
-      if (liveEnable === enabled) {
-        return
-      }
-
-      if (window.performance.now() - waitStartedAt >= BRINGUP_HAPTIC_ENABLE_WAIT_MS) {
+    if (latestSnapshotRef.current.peripherals.haptic.enablePinHigh !== enabled) {
+      await pause(Math.min(BRINGUP_HAPTIC_ENABLE_WAIT_MS, 140))
+      if (latestSnapshotRef.current.peripherals.haptic.enablePinHigh !== enabled) {
         setDraftNote(
-          `ERM EN request applied, but live GPIO48 readback is still ${liveEnable ? 'high' : 'low'}. Refresh status and verify service mode plus board wiring.`,
+          `ERM EN request applied, but live GPIO48 readback is still ${latestSnapshotRef.current.peripherals.haptic.enablePinHigh ? 'high' : 'low'}. Verify service mode plus board wiring.`,
         )
-        return
-      }
-
-      await pause(90)
-      const refreshResult = await pollLiveStatus(false)
-      if (!refreshResult.ok) {
-        setDraftNote(refreshResult.note)
-        return
       }
     }
   }
@@ -3210,13 +3406,13 @@ export function BringupWorkbench({
             <strong>Choose a module</strong>
           </div>
           <p className="panel-note">
-            Start with the subsystem you actually have wired. A module is only marked detected after a successful probe.
+            Start with the subsystem you actually have wired. Bus peripherals validate through direct probes, while analog and GPIO paths stay live through readback monitoring instead of fake probe stages.
           </p>
           <div className="bringup-roster">
             {moduleKeys.map((module) => {
               const meta = moduleMeta[module]
-              const score = moduleScore(displayModules[module])
-              const summary = moduleSummary(displayModules[module], connected)
+              const score = moduleScore(module, displayModules[module], connected)
+              const summary = moduleSummary(module, displayModules[module], connected)
 
               return (
                 <button
@@ -3895,17 +4091,24 @@ export function BringupWorkbench({
             </div>
             <div>
               <span>DATA A / LD</span>
-              <strong>{formatRegisterHex(snapshot.peripherals.dac.dataAReg)}</strong>
+              <strong>
+                {formatDacRegisterEquivalent(snapshot.peripherals.dac.dataAReg)} ·{' '}
+                {formatRegisterHex(snapshot.peripherals.dac.dataAReg)}
+              </strong>
             </div>
             <div>
               <span>DATA B / TEC</span>
-              <strong>{formatRegisterHex(snapshot.peripherals.dac.dataBReg)}</strong>
+              <strong>
+                {formatDacRegisterEquivalent(snapshot.peripherals.dac.dataBReg)} ·{' '}
+                {formatRegisterHex(snapshot.peripherals.dac.dataBReg)}
+              </strong>
             </div>
           </div>
 
           <p className="inline-help">
-            These DAC fields are actual readback from DAC80502 registers. They are the
-            controller&apos;s live peripheral truth, separate from the staged form above.
+            These DAC fields are actual readback from DAC80502 registers. The voltage
+            figures decode the register code against this board&apos;s `0.0-2.5 V` DAC
+            span; they show the commanded DAC code, not a downstream analog measurement.
           </p>
           <p className="inline-help">{snapshot.bringup.tools.lastI2cOp}</p>
         </article>
@@ -3923,11 +4126,11 @@ export function BringupWorkbench({
           </p>
           <div className="bringup-fact-grid">
             <div>
-              <span>Requested LD output</span>
+              <span>Staged LD setpoint</span>
               <strong>{formatNumber(snapshot.bringup.tuning.dacLdChannelV, 3)} V</strong>
             </div>
             <div>
-              <span>Requested TEC output</span>
+              <span>Staged TEC setpoint</span>
               <strong>{formatNumber(snapshot.bringup.tuning.dacTecChannelV, 3)} V</strong>
             </div>
           </div>
@@ -5408,7 +5611,7 @@ export function BringupWorkbench({
                     }
                   : page.id === 'power'
                     ? powerPageScore
-                    : moduleScore(displayModules[page.id])
+                    : moduleScore(page.id, displayModules[page.id], connected)
 
               return (
                 <button

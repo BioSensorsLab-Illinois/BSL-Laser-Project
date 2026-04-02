@@ -190,6 +190,28 @@ function mergeRealtimeTelemetry(
   }
 }
 
+function patchDiffers(current: unknown, patch: unknown): boolean {
+  if (patch === undefined) {
+    return false
+  }
+
+  if (patch === null || typeof patch !== 'object' || Array.isArray(patch)) {
+    return !Object.is(current, patch)
+  }
+
+  if (current === null || typeof current !== 'object' || Array.isArray(current)) {
+    return true
+  }
+
+  for (const [key, value] of Object.entries(patch as Record<string, unknown>)) {
+    if (patchDiffers((current as Record<string, unknown>)[key], value)) {
+      return true
+    }
+  }
+
+  return false
+}
+
 export function createRealtimeTelemetryStore(
   initialSnapshot: DeviceSnapshot,
 ): RealtimeTelemetryController {
@@ -213,6 +235,9 @@ export function createRealtimeTelemetryStore(
       }
     },
     publish(telemetry: RealtimeTelemetryPatch) {
+      if (!patchDiffers(current, telemetry)) {
+        return
+      }
       current = mergeRealtimeTelemetry(current, telemetry)
       notify()
     },
@@ -221,7 +246,11 @@ export function createRealtimeTelemetryStore(
       notify()
     },
     syncFromSnapshot(snapshot: DeviceSnapshot) {
-      current = makeRealtimeTelemetryFromSnapshot(snapshot)
+      const next = makeRealtimeTelemetryFromSnapshot(snapshot)
+      if (!patchDiffers(current, next)) {
+        return
+      }
+      current = next
       notify()
     },
   }

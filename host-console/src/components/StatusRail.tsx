@@ -6,6 +6,7 @@ import { deriveBenchEstimate } from '../lib/bench-model'
 import { formatNumber } from '../lib/format'
 import type { RealtimeTelemetryStore } from '../lib/live-telemetry'
 import {
+  computePitchMarginDeg,
   computeDistanceWindowPercent,
   computePitchMarginPercent,
   computePowerHeadroomPercent,
@@ -15,6 +16,7 @@ import {
   formatTofWindowSummary,
   formatTofValidityLabel,
   getTofDisplayDistanceM,
+  getHorizonPitchLimitDeg,
 } from '../lib/presentation'
 import { useLiveSnapshot } from '../hooks/use-live-snapshot'
 import type { BringupModuleStatus, DeviceSnapshot } from '../types'
@@ -71,6 +73,8 @@ export function StatusRail({ snapshot, telemetryStore }: StatusRailProps) {
   const powerPercent = computePowerHeadroomPercent(liveSnapshot)
   const distancePercent = computeDistanceWindowPercent(liveSnapshot)
   const pitchPercent = computePitchMarginPercent(liveSnapshot)
+  const pitchMarginDeg = computePitchMarginDeg(liveSnapshot)
+  const pitchLimitDeg = getHorizonPitchLimitDeg(liveSnapshot)
   const tecPercent = computeTecSettlePercent(liveSnapshot)
   const pdAvailability = describeStripAvailability(liveSnapshot.bringup.modules.pd, 'USB-PD')
   const tofAvailability = describeStripAvailability(liveSnapshot.bringup.modules.tof, 'ToF range sensing')
@@ -83,6 +87,10 @@ export function StatusRail({ snapshot, telemetryStore }: StatusRailProps) {
     tofDisplayDistance !== null &&
     tofDisplayDistance >= liveSnapshot.safety.tofMinRangeM &&
     tofDisplayDistance <= liveSnapshot.safety.tofMaxRangeM
+  const horizonWarningBandDeg = Math.max(
+    1.5,
+    liveSnapshot.safety.horizonHysteresisDeg * 2,
+  )
 
   const stats = [
     {
@@ -136,20 +144,26 @@ export function StatusRail({ snapshot, telemetryStore }: StatusRailProps) {
       label: 'Horizon margin',
       icon: ShieldAlert,
       value: imuAvailability.available
-        ? `${formatNumber(liveSnapshot.imu.beamPitchLimitDeg - liveSnapshot.imu.beamPitchDeg, 1)}°`
+        ? pitchMarginDeg !== null
+          ? `${formatNumber(pitchMarginDeg, 1)}°`
+          : 'Waiting'
         : imuAvailability.value,
       detail: imuAvailability.available
-        ? `${formatNumber(liveSnapshot.imu.beamPitchDeg, 1)}° vs ${formatNumber(liveSnapshot.imu.beamPitchLimitDeg, 1)}° limit`
+        ? pitchLimitDeg > 0
+          ? `${formatNumber(liveSnapshot.imu.beamPitchDeg, 1)}° pitch vs ${formatNumber(pitchLimitDeg, 1)}° trip`
+          : 'Horizon trip threshold is not available yet.'
         : imuAvailability.detail,
       progress: imuAvailability.available ? pitchPercent : 0,
       tone:
         !imuAvailability.available
           ? 'steady'
-          : liveSnapshot.imu.valid && liveSnapshot.imu.fresh && pitchPercent >= 55
-          ? 'steady'
-          : liveSnapshot.imu.valid && liveSnapshot.imu.fresh && pitchPercent > 0
+          : !liveSnapshot.imu.valid || !liveSnapshot.imu.fresh || pitchMarginDeg === null
+          ? 'critical'
+          : liveSnapshot.safety.horizonBlocked || pitchMarginDeg <= 0
+          ? 'critical'
+          : pitchMarginDeg <= horizonWarningBandDeg
             ? 'warning'
-            : 'critical',
+            : 'steady',
       disabled: !imuAvailability.available,
     },
     {

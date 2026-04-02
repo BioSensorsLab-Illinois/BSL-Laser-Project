@@ -386,6 +386,7 @@ code {
   display: grid;
   grid-template-columns: minmax(0, 1.4fr) minmax(300px, 0.95fr);
   gap: 16px;
+  align-items: start;
   background:
     linear-gradient(135deg, var(--surface-elevated), var(--surface-strong)),
     linear-gradient(145deg, rgba(22, 86, 64, 0.09), rgba(16, 33, 29, 0.02));
@@ -537,14 +538,21 @@ code {
   gap: 12px;
 }
 
+.hero-facts--wide {
+  grid-column: 1 / -1;
+}
+
 .hero-facts__grid {
   display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(168px, 1fr));
   gap: 10px;
 }
 
 .hero-facts__item {
-  border-top: 1px solid var(--line);
-  padding-top: 10px;
+  padding: 12px;
+  border-radius: 16px;
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--surface-elevated) 88%, transparent);
 }
 
 .hero-facts__item span {
@@ -687,10 +695,139 @@ code {
   line-height: 1.45;
 }
 
-.field-block input[type='text'] {
+.field-block input[type='text'],
+.field-block input[type='password'],
+.field-block select {
   min-height: 42px;
   border-radius: 12px;
   padding: 0 12px;
+}
+
+.field-stack {
+  display: grid;
+  gap: 14px;
+}
+
+.panel-cutout--compact {
+  padding: 16px;
+}
+
+.controller-wireless-status-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.controller-wireless-status-card {
+  padding: 11px 12px;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--surface-elevated) 84%, transparent);
+}
+
+.controller-wireless-status-card span {
+  display: block;
+  font-family: var(--mono);
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-soft);
+}
+
+.controller-wireless-status-card strong {
+  display: block;
+  margin-top: 4px;
+  font-size: 0.95rem;
+}
+
+.controller-wireless-status-card small {
+  display: block;
+  margin-top: 4px;
+  color: var(--text-soft);
+  line-height: 1.42;
+}
+
+.controller-wireless-feedback {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  align-items: flex-start;
+  padding: 12px 14px;
+  border-radius: 16px;
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--surface-elevated) 84%, transparent);
+}
+
+.controller-wireless-feedback span {
+  display: block;
+  font-family: var(--mono);
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-soft);
+}
+
+.controller-wireless-feedback strong {
+  display: block;
+  margin-top: 4px;
+  font-size: 0.98rem;
+}
+
+.controller-wireless-feedback small {
+  display: block;
+  margin-top: 4px;
+  color: var(--text-soft);
+  line-height: 1.45;
+}
+
+.controller-wireless-feedback.is-warning {
+  border-color: color-mix(in srgb, var(--warning) 26%, var(--line));
+  background: color-mix(in srgb, var(--warning-soft) 28%, var(--surface-elevated));
+}
+
+.controller-wireless-feedback.is-critical {
+  border-color: color-mix(in srgb, var(--critical) 30%, var(--line));
+  background: color-mix(in srgb, var(--critical-soft) 26%, var(--surface-elevated));
+}
+
+.controller-wireless-feedback.is-steady {
+  border-color: color-mix(in srgb, var(--accent) 24%, var(--line));
+  background: color-mix(in srgb, var(--accent-soft) 24%, var(--surface-elevated));
+}
+
+.controller-wireless-meter {
+  display: grid;
+  gap: 8px;
+  padding: 12px 14px;
+  border-radius: 16px;
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--surface-elevated) 82%, transparent);
+}
+
+.controller-wireless-meter__label {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: baseline;
+}
+
+.controller-wireless-meter__label span {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-soft);
+}
+
+.controller-wireless-meter__label strong {
+  font-size: 0.95rem;
+}
+
+.controller-wireless-note {
+  margin: 0;
+  color: var(--text-soft);
+  font-size: 0.86rem;
+  line-height: 1.45;
 }
 
 .segmented {
@@ -800,10 +937,14 @@ code {
   line-height: 1.35;
 }
 
-.action-button:disabled {
+.action-button:disabled,
+.segmented__button:disabled,
+.nav-link:disabled {
   opacity: 0.45;
   transform: none;
   box-shadow: none;
+  cursor: not-allowed;
+  pointer-events: auto;
 }
 
 .action-button:active,
@@ -1298,6 +1439,47 @@ code {
   border-color: color-mix(in srgb, var(--warning) 34%, var(--line));
 }
 
+.gpio-pin-button.is-driven-high {
+  border-color: color-mix(in srgb, var(--gpio-signal) 56%, var(--line));
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--gpio-signal) 20%, var(--gpio-surface)),
+      color-mix(in srgb, var(--gpio-signal) 10%, var(--surface-strong))
+    ),
+    var(--surface-soft);
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--gpio-signal) 18%, transparent),
+    0 0 0 1px color-mix(in srgb, var(--gpio-signal) 10%, transparent);
+}
+
+.gpio-pin-button.is-driven-high:not(.is-selected) .gpio-pin-button__label,
+.gpio-pin-button.is-driven-high:not(.is-selected) .gpio-pin-button__head strong {
+  color: color-mix(in srgb, var(--gpio-signal) 78%, var(--text));
+}
+
+.gpio-pin-button.is-driven-low {
+  border-color: color-mix(in srgb, var(--gpio-signal) 28%, var(--line));
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--gpio-surface) 82%, var(--surface-elevated)),
+      color-mix(in srgb, var(--surface-strong) 84%, var(--gpio-signal))
+    ),
+    var(--surface-soft);
+}
+
+.gpio-pin-button.is-sensed-high {
+  border-color: color-mix(in srgb, var(--gpio-signal) 36%, var(--line));
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--gpio-signal) 12%, var(--gpio-surface)),
+      color-mix(in srgb, var(--gpio-surface) 92%, var(--surface-strong))
+    ),
+    var(--surface-soft);
+}
+
 .gpio-pin-button.is-risky {
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
 }
@@ -1724,6 +1906,10 @@ code {
 }
 
 .field-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.field-grid--two {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
@@ -3527,10 +3713,22 @@ code {
     0 22px 42px rgba(17, 24, 38, 0.08);
 }
 
-.imu-posture-card__canvas {
+.imu-posture-card[data-tone='critical'] .imu-posture-card__viewport {
+  border-color: color-mix(in srgb, var(--critical) 32%, var(--line-strong));
+}
+
+.imu-posture-card[data-tone='warning'] .imu-posture-card__viewport {
+  border-color: color-mix(in srgb, var(--warning) 28%, var(--line-strong));
+}
+
+.imu-posture-card__svg {
   display: block;
   width: 100%;
   height: 340px;
+}
+
+.imu-posture-card__reticle {
+  filter: drop-shadow(0 8px 18px rgba(15, 28, 32, 0.18));
 }
 
 .haptic-pattern-lab__facts div {
@@ -3638,6 +3836,40 @@ code {
   color: var(--text-soft);
   background: rgba(17, 26, 45, 0.06);
   cursor: help;
+}
+
+.help-hint:hover,
+.help-hint:focus-visible {
+  color: var(--text);
+  background: rgba(17, 26, 45, 0.12);
+  outline: none;
+}
+
+.global-hover-help-tooltip {
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: 4000;
+  max-width: min(320px, calc(100vw - 28px));
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(17, 26, 45, 0.16);
+  background: color-mix(in srgb, var(--surface-elevated) 94%, white 6%);
+  box-shadow: 0 16px 34px rgba(13, 28, 39, 0.18);
+  color: var(--text);
+  font-size: 0.83rem;
+  line-height: 1.45;
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(4px);
+  transition:
+    opacity 120ms ease,
+    transform 120ms ease;
+}
+
+.global-hover-help-tooltip.is-visible {
+  opacity: 1;
+  transform: translateY(0);
 }
 
 .field-label {
@@ -4303,10 +4535,15 @@ code {
     align-items: stretch;
   }
 
+  .controller-wireless-feedback {
+    flex-direction: column;
+  }
+
   .control-module__body--split,
   .metric-grid.is-two,
   .inspector-link-summary,
-  .panel-section__head {
+  .panel-section__head,
+  .controller-wireless-status-grid {
     grid-template-columns: 1fr;
   }
 

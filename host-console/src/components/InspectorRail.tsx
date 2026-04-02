@@ -7,7 +7,12 @@ import {
   formatEnumLabel,
   summarizeSafetyChecks,
 } from '../lib/presentation'
-import { controllerBenchAp, transportLabel } from '../lib/wireless'
+import {
+  controllerBenchAp,
+  preferredWirelessUrl,
+  transportLabel,
+  wirelessModeLabel,
+} from '../lib/wireless'
 import type {
   CommandHistoryEntry,
   DeviceSnapshot,
@@ -196,13 +201,17 @@ export function InspectorRail({
               type="text"
               value={wifiUrl}
               onChange={(event) => onSetWifiUrl(event.target.value)}
-              placeholder={controllerBenchAp.wsUrl}
+              placeholder={preferredWirelessUrl(snapshot.wireless)}
             />
             <small>
-              Join <code>{controllerBenchAp.ssid}</code> with <code>{controllerBenchAp.password}</code>
+              Controller network: <code>{wirelessModeLabel(snapshot.wireless)}</code>
             </small>
             <small>
-              Firmware AP: <code>{snapshot.wireless.ssid}</code> • {snapshot.wireless.apReady ? 'ready' : 'offline'} • {snapshot.wireless.clientCount} client{snapshot.wireless.clientCount === 1 ? '' : 's'}
+              {snapshot.wireless.mode === 'station'
+                ? snapshot.wireless.stationConnected
+                  ? `Controller joined ${snapshot.wireless.ssid} at ${snapshot.wireless.ipAddress}`
+                  : snapshot.wireless.lastError || `Saved station SSID ${snapshot.wireless.stationSsid || 'unset'}`
+                : `Bench AP ${controllerBenchAp.ssid} • ${snapshot.wireless.apReady ? 'ready' : 'offline'} • ${snapshot.wireless.clientCount} client${snapshot.wireless.clientCount === 1 ? '' : 's'}`}
             </small>
           </label>
         ) : null}

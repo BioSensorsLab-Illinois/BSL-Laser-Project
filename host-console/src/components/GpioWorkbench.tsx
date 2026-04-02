@@ -357,6 +357,13 @@ export function GpioWorkbench({
     const isSelected = gpioNum === selectedGpio
     const actualMode = formatCompactMode(pin)
     const analogReading = deriveAnalogReading(meta, snapshot)
+    const pinStateClass = pin.outputEnabled
+      ? pin.levelHigh
+        ? 'is-driven-high'
+        : 'is-driven-low'
+      : pin.levelHigh
+        ? 'is-sensed-high'
+        : 'is-sensed-low'
 
     return (
       <button
@@ -368,6 +375,7 @@ export function GpioWorkbench({
           isSelected ? 'is-selected' : '',
           pin.overrideActive ? 'is-overridden' : '',
           pin.levelHigh ? 'is-high' : 'is-low',
+          pinStateClass,
           meta.riskNote !== undefined ? 'is-risky' : '',
         ]
           .filter(Boolean)

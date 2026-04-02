@@ -358,6 +358,32 @@ static uint32_t laser_controller_board_clamp_u32(
     return value;
 }
 
+static bool laser_controller_board_is_shared_i2c_gpio(uint32_t gpio_num)
+{
+    return gpio_num == LASER_CONTROLLER_GPIO_SHARED_I2C_SDA ||
+           gpio_num == LASER_CONTROLLER_GPIO_SHARED_I2C_SCL;
+}
+
+static bool laser_controller_board_is_imu_spi_gpio(uint32_t gpio_num)
+{
+    return gpio_num == LASER_CONTROLLER_GPIO_IMU_SDI ||
+           gpio_num == LASER_CONTROLLER_GPIO_IMU_CS ||
+           gpio_num == LASER_CONTROLLER_GPIO_IMU_SCLK ||
+           gpio_num == LASER_CONTROLLER_GPIO_IMU_SDO;
+}
+
+static bool laser_controller_board_is_transport_or_strap_gpio(uint32_t gpio_num)
+{
+    return gpio_num == LASER_CONTROLLER_GPIO_USB_D_N ||
+           gpio_num == LASER_CONTROLLER_GPIO_USB_D_P ||
+           gpio_num == LASER_CONTROLLER_GPIO_UART0_RX ||
+           gpio_num == LASER_CONTROLLER_GPIO_UART0_TX ||
+           gpio_num == LASER_CONTROLLER_GPIO_BOOT_BUTTON ||
+           gpio_num == LASER_CONTROLLER_GPIO_BOOT_OPTION ||
+           gpio_num == LASER_CONTROLLER_GPIO_JTAG_STRAP_OPEN ||
+           gpio_num == LASER_CONTROLLER_GPIO_VDD_SPI_STRAP_OPEN;
+}
+
 static const laser_controller_board_gpio_descriptor_t *
 laser_controller_board_find_gpio_descriptor(uint32_t gpio_num)
 {
@@ -833,18 +859,29 @@ static void laser_controller_board_get_shared_i2c_levels_internal(
     }
 }
 
-static void laser_controller_board_recover_shared_i2c_bus(void)
+static void laser_controller_board_recover_shared_i2c_bus_locked(void)
 {
     gpio_config_t config = { 0 };
+    bool bus_detached = true;
 
     if (s_i2c_ready && s_i2c_bus != NULL) {
+        esp_err_t detach_err = ESP_OK;
+
         (void)i2c_master_bus_wait_all_done(
             s_i2c_bus,
             LASER_CONTROLLER_I2C_TIMEOUT_MS);
         (void)i2c_master_bus_reset(s_i2c_bus);
-        (void)i2c_del_master_bus(s_i2c_bus);
-        s_i2c_bus = NULL;
-        s_i2c_ready = false;
+        detach_err = i2c_del_master_bus(s_i2c_bus);
+        if (detach_err == ESP_OK) {
+            s_i2c_bus = NULL;
+            s_i2c_ready = false;
+        } else {
+            bus_detached = false;
+        }
+    }
+
+    if (!bus_detached) {
+        return;
     }
 
     config.pin_bit_mask =
@@ -874,6 +911,13 @@ static void laser_controller_board_recover_shared_i2c_bus(void)
     esp_rom_delay_us(5U);
     (void)gpio_set_level(LASER_CONTROLLER_GPIO_SHARED_I2C_SDA, 1);
     esp_rom_delay_us(5U);
+}
+
+static void laser_controller_board_recover_shared_i2c_bus(void)
+{
+    laser_controller_board_lock_bus();
+    laser_controller_board_recover_shared_i2c_bus_locked();
+    laser_controller_board_unlock_bus();
 }
 
 static bool laser_controller_board_i2c_error_needs_recovery(esp_err_t err)
@@ -4041,36 +4085,68 @@ void laser_controller_board_force_pd_refresh(void)
 
 void laser_controller_board_reset_gpio_debug_state(void)
 {
+    bool preserve_i2c_pins = false;
+    bool preserve_spi_pins = false;
+
     laser_controller_board_stop_tof_illumination_pwm();
+    laser_controller_board_lock_bus();
 
     if (s_i2c_ready && s_i2c_bus != NULL) {
+        esp_err_t detach_err = ESP_OK;
+
         (void)i2c_master_bus_wait_all_done(
             s_i2c_bus,
             LASER_CONTROLLER_I2C_TIMEOUT_MS);
-        (void)i2c_del_master_bus(s_i2c_bus);
-        s_i2c_bus = NULL;
-        s_i2c_ready = false;
+        (void)i2c_master_bus_reset(s_i2c_bus);
+        detach_err = i2c_del_master_bus(s_i2c_bus);
+        if (detach_err == ESP_OK) {
+            s_i2c_bus = NULL;
+            s_i2c_ready = false;
+        } else {
+            preserve_i2c_pins = true;
+        }
     }
 
     if (s_spi_ready) {
+        esp_err_t free_err = ESP_OK;
+
         if (s_imu_spi != NULL) {
             (void)spi_bus_remove_device(s_imu_spi);
             s_imu_spi = NULL;
         }
-        (void)spi_bus_free(LASER_CONTROLLER_SPI_HOST);
-        s_spi_ready = false;
+        free_err = spi_bus_free(LASER_CONTROLLER_SPI_HOST);
+        if (free_err == ESP_OK) {
+            s_spi_ready = false;
+        } else {
+            preserve_spi_pins = true;
+        }
     }
 
     for (size_t index = 0U;
          index < LASER_CONTROLLER_BOARD_GPIO_INSPECTOR_PIN_COUNT;
          ++index) {
-        (void)gpio_reset_pin((gpio_num_t)kGpioInspectorPins[index].gpio_num);
+        const uint32_t gpio_num = kGpioInspectorPins[index].gpio_num;
+
+        if (laser_controller_board_is_transport_or_strap_gpio(gpio_num) ||
+            (preserve_i2c_pins &&
+             laser_controller_board_is_shared_i2c_gpio(gpio_num)) ||
+            (preserve_spi_pins &&
+             laser_controller_board_is_imu_spi_gpio(gpio_num))) {
+            continue;
+        }
+
+        (void)gpio_reset_pin((gpio_num_t)gpio_num);
     }
 
     s_gpio_ready = false;
     (void)laser_controller_board_ensure_gpio_ready();
-    (void)laser_controller_board_ensure_i2c_ready();
-    (void)laser_controller_board_ensure_spi_ready();
+    if (!preserve_i2c_pins) {
+        (void)laser_controller_board_ensure_i2c_ready();
+    }
+    if (!preserve_spi_pins) {
+        (void)laser_controller_board_ensure_spi_ready();
+    }
+    laser_controller_board_unlock_bus();
     laser_controller_board_drive_safe_gpio_levels(&s_last_outputs);
     laser_controller_board_apply_gpio_overrides();
     laser_controller_board_apply_tof_sideband_state(

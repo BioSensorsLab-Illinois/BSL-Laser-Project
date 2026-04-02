@@ -458,7 +458,6 @@ static void laser_controller_publish_runtime_status(
     portEXIT_CRITICAL(&s_context_lock);
 
     portENTER_CRITICAL(&s_runtime_status_lock);
-    memset(&s_runtime_status, 0, sizeof(s_runtime_status));
     s_runtime_status.started = context->started;
     s_runtime_status.boot_complete = context->boot_complete;
     s_runtime_status.config_valid = context->config_valid;
@@ -475,8 +474,6 @@ static void laser_controller_publish_runtime_status(
     s_runtime_status.outputs = context->last_outputs;
     s_runtime_status.decision = context->last_decision;
     s_runtime_status.config = config_snapshot;
-    laser_controller_bench_copy_status(&s_runtime_status.bench);
-    laser_controller_service_copy_status(&s_runtime_status.bringup);
     portEXIT_CRITICAL(&s_runtime_status_lock);
 }
 

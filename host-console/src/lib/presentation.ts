@@ -161,13 +161,40 @@ export function computeDistanceWindowPercent(snapshot: DeviceSnapshot): number {
   return clampPercent((margin / halfWindow) * 100)
 }
 
+export function getHorizonPitchLimitDeg(snapshot: DeviceSnapshot): number {
+  if (snapshot.imu.beamPitchLimitDeg > 0) {
+    return snapshot.imu.beamPitchLimitDeg
+  }
+
+  if (snapshot.safety.horizonThresholdDeg > 0) {
+    return snapshot.safety.horizonThresholdDeg
+  }
+
+  return 0
+}
+
+export function computePitchMarginDeg(snapshot: DeviceSnapshot): number | null {
+  if (!snapshot.imu.valid || !snapshot.imu.fresh) {
+    return null
+  }
+
+  const pitchLimitDeg = getHorizonPitchLimitDeg(snapshot)
+  if (pitchLimitDeg <= 0) {
+    return null
+  }
+
+  return pitchLimitDeg - snapshot.imu.beamPitchDeg
+}
+
 export function computePitchMarginPercent(snapshot: DeviceSnapshot): number {
-  if (!snapshot.imu.valid || !snapshot.imu.fresh || snapshot.imu.beamPitchLimitDeg <= 0) {
+  const pitchLimitDeg = getHorizonPitchLimitDeg(snapshot)
+  const margin = computePitchMarginDeg(snapshot)
+
+  if (margin === null || pitchLimitDeg <= 0) {
     return 0
   }
 
-  const margin = snapshot.imu.beamPitchLimitDeg - snapshot.imu.beamPitchDeg
-  return clampPercent((margin / snapshot.imu.beamPitchLimitDeg) * 100)
+  return clampPercent((margin / pitchLimitDeg) * 100)
 }
 
 export function computeTecSettlePercent(snapshot: DeviceSnapshot): number {
@@ -197,6 +224,8 @@ export function buildSafetyChecks(snapshot: DeviceSnapshot): SafetyCheck[] {
   const tecProgress = computeTecSettlePercent(snapshot)
   const tofDisplayDistance = getTofDisplayDistanceM(snapshot)
   const tofWindowDetail = formatTofWindowSummary(snapshot)
+  const pitchLimitDeg = getHorizonPitchLimitDeg(snapshot)
+  const pitchMarginDeg = computePitchMarginDeg(snapshot)
   const tofPass =
     snapshot.tof.valid &&
     snapshot.tof.fresh &&
@@ -256,14 +285,17 @@ export function buildSafetyChecks(snapshot: DeviceSnapshot): SafetyCheck[] {
       pass:
         snapshot.imu.valid &&
         snapshot.imu.fresh &&
-        snapshot.imu.beamPitchDeg < snapshot.imu.beamPitchLimitDeg,
+        pitchLimitDeg > 0 &&
+        snapshot.imu.beamPitchDeg < pitchLimitDeg,
       detail: `${formatNumber(snapshot.imu.beamPitchDeg, 1)}° measured`,
       progress: pitchProgress,
       tone: toneFromProgress(
         pitchProgress,
         snapshot.imu.valid &&
           snapshot.imu.fresh &&
-          snapshot.imu.beamPitchDeg < snapshot.imu.beamPitchLimitDeg,
+          pitchMarginDeg !== null &&
+          pitchLimitDeg > 0 &&
+          pitchMarginDeg > 0,
       ),
     },
     {

@@ -27,6 +27,8 @@ export const moduleMeta: Record<
     transport: string
     detail: string
     datasheetStatus: string
+    validationMode: 'probe' | 'monitored'
+    validationDetail: string
   }
 > = {
   imu: {
@@ -34,48 +36,64 @@ export const moduleMeta: Record<
     transport: 'SPI',
     detail: 'LSM6DSO orientation source and horizon interlock input.',
     datasheetStatus: 'SPI production path defined in datasheet and board recon.',
+    validationMode: 'probe',
+    validationDetail: 'Health comes from live SPI identity and runtime sample freshness.',
   },
   dac: {
     label: 'DAC',
     transport: 'I2C 0x48',
     detail: 'DAC80502 actuator shadow for LD and TEC command channels.',
     datasheetStatus: 'I2C-mode register set is present in the local datasheet.',
+    validationMode: 'probe',
+    validationDetail: 'Health comes from direct I2C register access and DAC status readback.',
   },
   haptic: {
     label: 'Haptic',
     transport: 'I2C 0x5A',
     detail: 'DRV2605 operator feedback path and motor test surface.',
     datasheetStatus: 'Register map and mode selection are documented locally.',
+    validationMode: 'probe',
+    validationDetail: 'Health comes from direct I2C register access and enable-trigger readback.',
   },
   tof: {
     label: 'ToF',
     transport: 'I2C 0x29 + GPIO7/GPIO6',
     detail: 'VL53L1X distance interlock board on the shared I2C bus, with GPIO7 interrupt in and GPIO6 LED-control out.',
     datasheetStatus: 'VL53L1X board mapping is now known. XSHUT is not exported on this board revision, so firmware must use shared-I2C probe plus optional GPIO1 interrupt assist.',
+    validationMode: 'probe',
+    validationDetail: 'Health comes from direct sensor traffic plus live distance freshness.',
   },
   buttons: {
     label: 'Buttons',
     transport: 'GPIO',
     detail: 'Two-stage trigger and local operator input stack.',
     datasheetStatus: 'Board-only feature. No dedicated programmable peripheral.',
+    validationMode: 'monitored',
+    validationDetail: 'This path is GPIO-monitored rather than bus-probed, so it should stay declared live without an identity probe.',
   },
   pd: {
     label: 'USB-PD',
     transport: 'I2C 0x28',
     detail: 'STUSB4500 sink-planning page for PDO priorities and runtime power-tier thresholds.',
     datasheetStatus: 'Autonomous sink controller. Bench writes stage a planned policy and host runtime thresholds, not hidden live bypasses.',
+    validationMode: 'probe',
+    validationDetail: 'Health comes from direct STUSB4500 I2C transactions and contract refreshes.',
   },
   laserDriver: {
     label: 'Laser driver',
     transport: 'Mixed',
     detail: 'ATLS6A214 path, standby gating, and current supervision.',
     datasheetStatus: 'Analog path with fast shutdown on SBDN and PCN current selection.',
+    validationMode: 'monitored',
+    validationDetail: 'This is an analog/electrical path. Presence is supervised through rail and signal readback, not a digital probe exchange.',
   },
   tec: {
     label: 'TEC loop',
     transport: 'Mixed',
     detail: 'TEC controller supervision and wavelength-settle path.',
     datasheetStatus: 'Analog controller; firmware supervises TMS, TEMPGD, ITEC, and VTEC.',
+    validationMode: 'monitored',
+    validationDetail: 'This is an analog/electrical path. Presence is supervised through temperature/current/rail readback, not a digital probe exchange.',
   },
 }
 

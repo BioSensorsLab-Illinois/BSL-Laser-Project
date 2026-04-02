@@ -30,10 +30,11 @@
 #define LASER_CONTROLLER_COMMS_TX_PRIORITY    4U
 #define LASER_CONTROLLER_COMMS_RX_PRIORITY    3U
 #define LASER_CONTROLLER_COMMS_CMD_PRIORITY   3U
-#define LASER_CONTROLLER_COMMS_TX_PERIOD_MS   40U
-#define LASER_CONTROLLER_COMMS_FAST_TELEMETRY_PERIOD_MS 50U
-#define LASER_CONTROLLER_COMMS_LIVE_TELEMETRY_PERIOD_MS 250U
-#define LASER_CONTROLLER_COMMS_STATUS_PERIOD_MS    1000U
+#define LASER_CONTROLLER_COMMS_TX_PERIOD_MS   20U
+#define LASER_CONTROLLER_COMMS_FAST_TELEMETRY_PERIOD_MS 60U
+#define LASER_CONTROLLER_COMMS_LIVE_TELEMETRY_PERIOD_MS 1000U
+#define LASER_CONTROLLER_COMMS_STATUS_PERIOD_MS    10000U
+#define LASER_CONTROLLER_COMMS_WIRELESS_POST_COMMAND_QUIET_MS 400U
 #define LASER_CONTROLLER_COMMS_MAX_LINE_LEN   768U
 #define LASER_CONTROLLER_COMMS_FRAME_BUFFER_BYTES 32768U
 #define LASER_CONTROLLER_COMMS_QUEUE_DEPTH    8U
@@ -49,6 +50,9 @@
 #define LASER_CONTROLLER_SERVICE_MODE_POLL_MS  20U
 #define LASER_CONTROLLER_HAPTIC_GPIO_WAIT_MS   400U
 #define LASER_CONTROLLER_GPIO_OVERRIDE_WAIT_MS 400U
+#define LASER_CONTROLLER_STUSB4500_ADDR        0x28U
+#define LASER_CONTROLLER_DAC80502_ADDR         0x48U
+#define LASER_CONTROLLER_DRV2605_ADDR          0x5AU
 
 static StaticTask_t s_tx_task_tcb;
 static StackType_t s_tx_task_stack[LASER_CONTROLLER_COMMS_TX_STACK_BYTES];
@@ -74,6 +78,8 @@ static StaticQueue_t s_command_queue_buffer;
 static uint8_t s_command_queue_storage[
     LASER_CONTROLLER_COMMS_QUEUE_DEPTH * sizeof(laser_controller_comms_line_t)];
 static QueueHandle_t s_command_queue;
+static volatile bool s_command_in_flight;
+static volatile laser_controller_time_ms_t s_wireless_telemetry_quiet_until_ms;
 
 typedef struct {
     char *data;
@@ -81,6 +87,15 @@ typedef struct {
     size_t length;
     bool truncated;
 } laser_controller_comms_buffer_t;
+
+typedef enum {
+    LASER_CONTROLLER_COMMS_PERIPHERAL_NONE = 0,
+    LASER_CONTROLLER_COMMS_PERIPHERAL_DAC = (1U << 0),
+    LASER_CONTROLLER_COMMS_PERIPHERAL_PD = (1U << 1),
+    LASER_CONTROLLER_COMMS_PERIPHERAL_IMU = (1U << 2),
+    LASER_CONTROLLER_COMMS_PERIPHERAL_HAPTIC = (1U << 3),
+    LASER_CONTROLLER_COMMS_PERIPHERAL_TOF = (1U << 4),
+} laser_controller_comms_peripheral_mask_t;
 
 static bool laser_controller_comms_extract_float(
     const char *line,
@@ -196,8 +211,15 @@ static void laser_controller_comms_emit_text_locked(const char *text)
     }
 
     fputs(text, stdout);
-    fflush(stdout);
     laser_controller_wireless_broadcast_text(text);
+}
+
+static bool laser_controller_comms_should_pause_wireless_telemetry(
+    laser_controller_time_ms_t now_ms)
+{
+    return laser_controller_wireless_has_clients() &&
+           (s_command_in_flight ||
+            now_ms < s_wireless_telemetry_quiet_until_ms);
 }
 
 static void laser_controller_comms_emit_buffer_locked(
@@ -362,6 +384,141 @@ static void laser_controller_comms_write_escaped_string(
     laser_controller_comms_buffer_append_raw(buffer, "\"");
 }
 
+static int32_t laser_controller_comms_encode_centi(float value)
+{
+    return (int32_t)lroundf(value * 100.0f);
+}
+
+static uint32_t laser_controller_comms_encode_imu_flags(
+    const laser_controller_runtime_status_t *status)
+{
+    uint32_t flags = 0U;
+
+    if (status == NULL) {
+        return flags;
+    }
+
+    if (status->inputs.imu_data_valid) {
+        flags |= (1U << 0);
+    }
+    if (status->inputs.imu_data_fresh) {
+        flags |= (1U << 1);
+    }
+    flags |= (1U << 2);
+
+    return flags;
+}
+
+static uint32_t laser_controller_comms_encode_tof_flags(
+    const laser_controller_runtime_status_t *status)
+{
+    uint32_t flags = 0U;
+
+    if (status == NULL) {
+        return flags;
+    }
+
+    if (status->inputs.tof_data_valid) {
+        flags |= (1U << 0);
+    }
+    if (status->inputs.tof_data_fresh) {
+        flags |= (1U << 1);
+    }
+
+    return flags;
+}
+
+static uint32_t laser_controller_comms_encode_laser_flags(
+    const laser_controller_runtime_status_t *status)
+{
+    uint32_t flags = 0U;
+
+    if (status == NULL) {
+        return flags;
+    }
+
+    if (status->outputs.enable_alignment_laser) {
+        flags |= (1U << 0);
+    }
+    if (status->decision.nir_output_enable) {
+        flags |= (1U << 1);
+    }
+    if (status->outputs.assert_driver_standby) {
+        flags |= (1U << 2);
+    }
+    if (status->inputs.driver_loop_good) {
+        flags |= (1U << 3);
+    }
+
+    return flags;
+}
+
+static uint32_t laser_controller_comms_encode_tec_flags(
+    const laser_controller_runtime_status_t *status)
+{
+    uint32_t flags = 0U;
+
+    if (status == NULL) {
+        return flags;
+    }
+
+    if (status->inputs.tec_temp_good) {
+        flags |= (1U << 0);
+    }
+
+    return flags;
+}
+
+static uint32_t laser_controller_comms_encode_safety_flags(
+    const laser_controller_runtime_status_t *status)
+{
+    uint32_t flags = 0U;
+
+    if (status == NULL) {
+        return flags;
+    }
+
+    if (status->decision.allow_alignment) {
+        flags |= (1U << 0);
+    }
+    if (status->decision.allow_nir) {
+        flags |= (1U << 1);
+    }
+    if (status->decision.horizon_blocked) {
+        flags |= (1U << 2);
+    }
+    if (status->decision.distance_blocked) {
+        flags |= (1U << 3);
+    }
+    if (status->decision.lambda_drift_blocked) {
+        flags |= (1U << 4);
+    }
+    if (status->decision.tec_temp_adc_blocked) {
+        flags |= (1U << 5);
+    }
+
+    return flags;
+}
+
+static uint32_t laser_controller_comms_encode_button_flags(
+    const laser_controller_runtime_status_t *status)
+{
+    uint32_t flags = 0U;
+
+    if (status == NULL) {
+        return flags;
+    }
+
+    if (status->inputs.button.stage1_pressed) {
+        flags |= (1U << 0);
+    }
+    if (status->inputs.button.stage2_pressed) {
+        flags |= (1U << 1);
+    }
+
+    return flags;
+}
+
 static void laser_controller_comms_write_module_json(
     laser_controller_comms_buffer_t *buffer,
     const laser_controller_module_status_t *module)
@@ -380,6 +537,97 @@ static void laser_controller_comms_write_module_json(
         module->debug_enabled ? "true" : "false",
         module->detected ? "true" : "false",
         module->healthy ? "true" : "false");
+}
+
+static void laser_controller_comms_write_wireless_scan_results_json(
+    laser_controller_comms_buffer_t *buffer,
+    const laser_controller_wireless_status_t *wireless)
+{
+    uint8_t result_count = 0U;
+
+    laser_controller_comms_buffer_append_raw(buffer, "[");
+    if (wireless != NULL) {
+        result_count = wireless->scan_result_count;
+        if (result_count > LASER_CONTROLLER_WIRELESS_SCAN_RESULT_COUNT) {
+            result_count = LASER_CONTROLLER_WIRELESS_SCAN_RESULT_COUNT;
+        }
+    }
+
+    for (uint8_t index = 0U; index < result_count; ++index) {
+        const laser_controller_wireless_scan_result_t *result =
+            &wireless->scan_results[index];
+
+        if (index > 0U) {
+            laser_controller_comms_buffer_append_raw(buffer, ",");
+        }
+        laser_controller_comms_buffer_append_raw(
+            buffer,
+            "{\"ssid\":");
+        laser_controller_comms_write_escaped_string(buffer, result->ssid);
+        laser_controller_comms_buffer_append_fmt(
+            buffer,
+            ",\"rssiDbm\":%d,\"channel\":%u,\"secure\":%s}",
+            (int)result->rssi_dbm,
+            (unsigned int)result->channel,
+            result->secure ? "true" : "false");
+    }
+    laser_controller_comms_buffer_append_raw(buffer, "]");
+}
+
+static void laser_controller_comms_write_wireless_json(
+    laser_controller_comms_buffer_t *buffer,
+    const laser_controller_wireless_status_t *wireless)
+{
+    if (wireless == NULL) {
+        laser_controller_comms_buffer_append_raw(
+            buffer,
+            "{\"started\":false,\"mode\":\"softap\",\"apReady\":false,"
+            "\"stationConfigured\":false,\"stationConnecting\":false,"
+            "\"stationConnected\":false,\"clientCount\":0,\"ssid\":\"\","
+            "\"stationSsid\":\"\",\"stationRssiDbm\":0,"
+            "\"stationChannel\":0,\"scanInProgress\":false,"
+            "\"scannedNetworks\":[],\"ipAddress\":\"\",\"wsUrl\":\"\","
+            "\"lastError\":\"\"}");
+        return;
+    }
+
+    laser_controller_comms_buffer_append_fmt(
+        buffer,
+        "{\"started\":%s,\"mode\":",
+        wireless->started ? "true" : "false");
+    laser_controller_comms_write_escaped_string(
+        buffer,
+        wireless->mode == LASER_CONTROLLER_WIRELESS_MODE_STATION ?
+            "station" :
+            "softap");
+    laser_controller_comms_buffer_append_fmt(
+        buffer,
+        ",\"apReady\":%s,\"stationConfigured\":%s,"
+        "\"stationConnecting\":%s,\"stationConnected\":%s,"
+        "\"clientCount\":%u,\"ssid\":",
+        wireless->ap_ready ? "true" : "false",
+        wireless->station_configured ? "true" : "false",
+        wireless->station_connecting ? "true" : "false",
+        wireless->station_connected ? "true" : "false",
+        (unsigned int)wireless->client_count);
+    laser_controller_comms_write_escaped_string(buffer, wireless->ssid);
+    laser_controller_comms_buffer_append_raw(buffer, ",\"stationSsid\":");
+    laser_controller_comms_write_escaped_string(buffer, wireless->station_ssid);
+    laser_controller_comms_buffer_append_fmt(
+        buffer,
+        ",\"stationRssiDbm\":%d,\"stationChannel\":%u,"
+        "\"scanInProgress\":%s,\"scannedNetworks\":",
+        (int)wireless->station_rssi_dbm,
+        (unsigned int)wireless->station_channel,
+        wireless->scan_in_progress ? "true" : "false");
+    laser_controller_comms_write_wireless_scan_results_json(buffer, wireless);
+    laser_controller_comms_buffer_append_raw(buffer, ",\"ipAddress\":");
+    laser_controller_comms_write_escaped_string(buffer, wireless->ip_address);
+    laser_controller_comms_buffer_append_raw(buffer, ",\"wsUrl\":");
+    laser_controller_comms_write_escaped_string(buffer, wireless->ws_url);
+    laser_controller_comms_buffer_append_raw(buffer, ",\"lastError\":");
+    laser_controller_comms_write_escaped_string(buffer, wireless->last_error);
+    laser_controller_comms_buffer_append_raw(buffer, "}");
 }
 
 static void laser_controller_comms_write_pd_profile_json(
@@ -587,6 +835,182 @@ static void laser_controller_comms_write_gpio_inspector_json(
     }
 
     laser_controller_comms_buffer_append_raw(buffer, "]},");
+}
+
+static void laser_controller_comms_write_modules_only_json(
+    laser_controller_comms_buffer_t *buffer,
+    const laser_controller_runtime_status_t *status)
+{
+    laser_controller_comms_buffer_append_raw(buffer, "\"modules\":{");
+    laser_controller_comms_buffer_append_raw(buffer, "\"imu\":");
+    laser_controller_comms_write_module_json(
+        buffer,
+        &status->bringup.modules[LASER_CONTROLLER_MODULE_IMU]);
+    laser_controller_comms_buffer_append_raw(buffer, ",\"dac\":");
+    laser_controller_comms_write_module_json(
+        buffer,
+        &status->bringup.modules[LASER_CONTROLLER_MODULE_DAC]);
+    laser_controller_comms_buffer_append_raw(buffer, ",\"haptic\":");
+    laser_controller_comms_write_module_json(
+        buffer,
+        &status->bringup.modules[LASER_CONTROLLER_MODULE_HAPTIC]);
+    laser_controller_comms_buffer_append_raw(buffer, ",\"tof\":");
+    laser_controller_comms_write_module_json(
+        buffer,
+        &status->bringup.modules[LASER_CONTROLLER_MODULE_TOF]);
+    laser_controller_comms_buffer_append_raw(buffer, ",\"buttons\":");
+    laser_controller_comms_write_module_json(
+        buffer,
+        &status->bringup.modules[LASER_CONTROLLER_MODULE_BUTTONS]);
+    laser_controller_comms_buffer_append_raw(buffer, ",\"pd\":");
+    laser_controller_comms_write_module_json(
+        buffer,
+        &status->bringup.modules[LASER_CONTROLLER_MODULE_PD]);
+    laser_controller_comms_buffer_append_raw(buffer, ",\"laserDriver\":");
+    laser_controller_comms_write_module_json(
+        buffer,
+        &status->bringup.modules[LASER_CONTROLLER_MODULE_LASER_DRIVER]);
+    laser_controller_comms_buffer_append_raw(buffer, ",\"tec\":");
+    laser_controller_comms_write_module_json(
+        buffer,
+        &status->bringup.modules[LASER_CONTROLLER_MODULE_TEC]);
+    laser_controller_comms_buffer_append_raw(buffer, "}");
+}
+
+static void laser_controller_comms_write_tools_only_json(
+    laser_controller_comms_buffer_t *buffer,
+    const laser_controller_runtime_status_t *status)
+{
+    laser_controller_comms_buffer_append_raw(buffer, "\"tools\":{\"lastI2cScan\":");
+    laser_controller_comms_write_escaped_string(buffer, status->bringup.last_i2c_scan);
+    laser_controller_comms_buffer_append_raw(buffer, ",\"lastI2cOp\":");
+    laser_controller_comms_write_escaped_string(buffer, status->bringup.last_i2c_op);
+    laser_controller_comms_buffer_append_raw(buffer, ",\"lastSpiOp\":");
+    laser_controller_comms_write_escaped_string(buffer, status->bringup.last_spi_op);
+    laser_controller_comms_buffer_append_raw(buffer, ",\"lastAction\":");
+    laser_controller_comms_write_escaped_string(buffer, status->bringup.last_action);
+    laser_controller_comms_buffer_append_raw(buffer, "}");
+}
+
+static void laser_controller_comms_write_peripheral_subset_json(
+    laser_controller_comms_buffer_t *buffer,
+    const laser_controller_runtime_status_t *status,
+    uint32_t peripheral_mask)
+{
+    bool first = true;
+
+    laser_controller_comms_buffer_append_raw(buffer, "\"peripherals\":{");
+
+    if ((peripheral_mask & LASER_CONTROLLER_COMMS_PERIPHERAL_DAC) != 0U) {
+        const laser_controller_board_dac_readback_t *dac = &status->inputs.dac;
+
+        laser_controller_comms_buffer_append_fmt(
+            buffer,
+            "\"dac\":{\"reachable\":%s,\"configured\":%s,\"refAlarm\":%s,\"syncReg\":%u,\"configReg\":%u,\"gainReg\":%u,\"statusReg\":%u,\"dataAReg\":%u,\"dataBReg\":%u,\"lastErrorCode\":%ld,\"lastError\":",
+            dac->reachable ? "true" : "false",
+            dac->configured ? "true" : "false",
+            dac->ref_alarm ? "true" : "false",
+            (unsigned)dac->sync_reg,
+            (unsigned)dac->config_reg,
+            (unsigned)dac->gain_reg,
+            (unsigned)dac->status_reg,
+            (unsigned)dac->data_a_reg,
+            (unsigned)dac->data_b_reg,
+            (long)dac->last_error);
+        laser_controller_comms_write_error_name_json(buffer, dac->last_error);
+        laser_controller_comms_buffer_append_raw(buffer, "}");
+        first = false;
+    }
+
+    if ((peripheral_mask & LASER_CONTROLLER_COMMS_PERIPHERAL_PD) != 0U) {
+        const laser_controller_board_pd_readback_t *pd = &status->inputs.pd_readback;
+
+        if (!first) {
+            laser_controller_comms_buffer_append_raw(buffer, ",");
+        }
+        laser_controller_comms_buffer_append_fmt(
+            buffer,
+            "\"pd\":{\"reachable\":%s,\"attached\":%s,\"ccStatusReg\":%u,\"pdoCountReg\":%u,\"rdoStatusRaw\":%lu}",
+            pd->reachable ? "true" : "false",
+            pd->attached ? "true" : "false",
+            (unsigned)pd->cc_status_reg,
+            (unsigned)pd->pdo_count_reg,
+            (unsigned long)pd->rdo_status_raw);
+        first = false;
+    }
+
+    if ((peripheral_mask & LASER_CONTROLLER_COMMS_PERIPHERAL_IMU) != 0U) {
+        const laser_controller_board_imu_readback_t *imu = &status->inputs.imu_readback;
+
+        if (!first) {
+            laser_controller_comms_buffer_append_raw(buffer, ",");
+        }
+        laser_controller_comms_buffer_append_fmt(
+            buffer,
+            "\"imu\":{\"reachable\":%s,\"configured\":%s,\"whoAmI\":%u,\"statusReg\":%u,\"ctrl1XlReg\":%u,\"ctrl2GReg\":%u,\"ctrl3CReg\":%u,\"ctrl4CReg\":%u,\"ctrl10CReg\":%u,\"lastErrorCode\":%ld,\"lastError\":",
+            imu->reachable ? "true" : "false",
+            imu->configured ? "true" : "false",
+            (unsigned)imu->who_am_i,
+            (unsigned)imu->status_reg,
+            (unsigned)imu->ctrl1_xl_reg,
+            (unsigned)imu->ctrl2_g_reg,
+            (unsigned)imu->ctrl3_c_reg,
+            (unsigned)imu->ctrl4_c_reg,
+            (unsigned)imu->ctrl10_c_reg,
+            (long)imu->last_error);
+        laser_controller_comms_write_error_name_json(buffer, imu->last_error);
+        laser_controller_comms_buffer_append_raw(buffer, "}");
+        first = false;
+    }
+
+    if ((peripheral_mask & LASER_CONTROLLER_COMMS_PERIPHERAL_HAPTIC) != 0U) {
+        const laser_controller_board_haptic_readback_t *haptic =
+            &status->inputs.haptic_readback;
+
+        if (!first) {
+            laser_controller_comms_buffer_append_raw(buffer, ",");
+        }
+        laser_controller_comms_buffer_append_fmt(
+            buffer,
+            "\"haptic\":{\"reachable\":%s,\"enablePinHigh\":%s,\"triggerPinHigh\":%s,\"modeReg\":%u,\"libraryReg\":%u,\"goReg\":%u,\"feedbackReg\":%u,\"lastErrorCode\":%ld,\"lastError\":",
+            haptic->reachable ? "true" : "false",
+            haptic->enable_pin_high ? "true" : "false",
+            haptic->trigger_pin_high ? "true" : "false",
+            (unsigned)haptic->mode_reg,
+            (unsigned)haptic->library_reg,
+            (unsigned)haptic->go_reg,
+            (unsigned)haptic->feedback_reg,
+            (long)haptic->last_error);
+        laser_controller_comms_write_error_name_json(buffer, haptic->last_error);
+        laser_controller_comms_buffer_append_raw(buffer, "}");
+        first = false;
+    }
+
+    if ((peripheral_mask & LASER_CONTROLLER_COMMS_PERIPHERAL_TOF) != 0U) {
+        const laser_controller_board_tof_readback_t *tof =
+            &status->inputs.tof_readback;
+
+        if (!first) {
+            laser_controller_comms_buffer_append_raw(buffer, ",");
+        }
+        laser_controller_comms_buffer_append_fmt(
+            buffer,
+            "\"tof\":{\"reachable\":%s,\"configured\":%s,\"interruptLineHigh\":%s,\"ledCtrlAsserted\":%s,\"dataReady\":%s,\"bootState\":%u,\"rangeStatus\":%u,\"sensorId\":%u,\"distanceMm\":%u,\"lastErrorCode\":%ld,\"lastError\":",
+            tof->reachable ? "true" : "false",
+            tof->configured ? "true" : "false",
+            tof->interrupt_line_high ? "true" : "false",
+            tof->led_ctrl_asserted ? "true" : "false",
+            tof->data_ready ? "true" : "false",
+            (unsigned)tof->boot_state,
+            (unsigned)tof->range_status,
+            (unsigned)tof->sensor_id,
+            (unsigned)tof->distance_mm,
+            (long)tof->last_error);
+        laser_controller_comms_write_error_name_json(buffer, tof->last_error);
+        laser_controller_comms_buffer_append_raw(buffer, "}");
+    }
+
+    laser_controller_comms_buffer_append_raw(buffer, "}");
 }
 
 static uint8_t laser_controller_comms_expected_pd_profile_count(
@@ -1000,16 +1424,9 @@ static void laser_controller_comms_write_snapshot_json(
         buffer,
         ",\"connectedAtIso\":\"1970-01-01T00:00:00Z\"},");
 
-    laser_controller_comms_buffer_append_fmt(
-        buffer,
-        "\"wireless\":{\"started\":%s,\"apReady\":%s,\"clientCount\":%u,\"ssid\":",
-        wireless.started ? "true" : "false",
-        wireless.ap_ready ? "true" : "false",
-        (unsigned int)wireless.client_count);
-    laser_controller_comms_write_escaped_string(buffer, wireless.ssid);
-    laser_controller_comms_buffer_append_raw(buffer, ",\"wsUrl\":");
-    laser_controller_comms_write_escaped_string(buffer, wireless.ws_url);
-    laser_controller_comms_buffer_append_raw(buffer, "},");
+    laser_controller_comms_buffer_append_raw(buffer, "\"wireless\":");
+    laser_controller_comms_write_wireless_json(buffer, &wireless);
+    laser_controller_comms_buffer_append_raw(buffer, ",");
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
@@ -1334,16 +1751,9 @@ static void laser_controller_comms_write_command_snapshot_json(
         buffer,
         ",\"connectedAtIso\":\"1970-01-01T00:00:00Z\"},");
 
-    laser_controller_comms_buffer_append_fmt(
-        buffer,
-        "\"wireless\":{\"started\":%s,\"apReady\":%s,\"clientCount\":%u,\"ssid\":",
-        wireless.started ? "true" : "false",
-        wireless.ap_ready ? "true" : "false",
-        (unsigned int)wireless.client_count);
-    laser_controller_comms_write_escaped_string(buffer, wireless.ssid);
-    laser_controller_comms_buffer_append_raw(buffer, ",\"wsUrl\":");
-    laser_controller_comms_write_escaped_string(buffer, wireless.ws_url);
-    laser_controller_comms_buffer_append_raw(buffer, "},");
+    laser_controller_comms_buffer_append_raw(buffer, "\"wireless\":");
+    laser_controller_comms_write_wireless_json(buffer, &wireless);
+    laser_controller_comms_buffer_append_raw(buffer, ",");
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
@@ -1565,14 +1975,11 @@ static void laser_controller_comms_write_live_telemetry_json(
     laser_controller_comms_buffer_t *buffer,
     const laser_controller_runtime_status_t *status)
 {
-    const float beam_pitch_deg =
-        status->inputs.beam_pitch_rad * LASER_CONTROLLER_DEG_PER_RAD;
-    const float beam_roll_deg =
-        status->inputs.beam_roll_rad * LASER_CONTROLLER_DEG_PER_RAD;
-    const float beam_yaw_deg =
-        status->inputs.beam_yaw_rad * LASER_CONTROLLER_DEG_PER_RAD;
-    const float beam_pitch_limit_deg =
-        status->config.thresholds.horizon_threshold_rad * LASER_CONTROLLER_DEG_PER_RAD;
+    const float actual_lambda_nm = laser_controller_comms_lambda_from_temp(
+        &status->config,
+        status->inputs.tec_temp_c);
+    const float lambda_drift_nm =
+        fabsf(actual_lambda_nm - status->bench.target_lambda_nm);
 
     laser_controller_comms_buffer_append_raw(buffer, "{");
     laser_controller_comms_buffer_append_fmt(
@@ -1608,56 +2015,29 @@ static void laser_controller_comms_write_live_telemetry_json(
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        "\"imu\":{\"valid\":%s,\"fresh\":%s,\"beamPitchDeg\":%.2f,\"beamRollDeg\":%.2f,\"beamYawDeg\":%.2f,\"beamYawRelative\":true,\"beamPitchLimitDeg\":%.2f},",
-        status->inputs.imu_data_valid ? "true" : "false",
-        status->inputs.imu_data_fresh ? "true" : "false",
-        beam_pitch_deg,
-        beam_roll_deg,
-        beam_yaw_deg,
-        beam_pitch_limit_deg);
+        "\"laser\":{\"commandedCurrentA\":%.3f},",
+        status->bench.high_state_current_a);
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        "\"tof\":{\"valid\":%s,\"fresh\":%s,\"distanceM\":%.3f},",
-        status->inputs.tof_data_valid ? "true" : "false",
-        status->inputs.tof_data_fresh ? "true" : "false",
-        status->inputs.tof_distance_m);
+        "\"tec\":{\"targetTempC\":%.2f,\"targetLambdaNm\":%.2f,\"actualLambdaNm\":%.2f},",
+        status->bench.target_temp_c,
+        status->bench.target_lambda_nm,
+        actual_lambda_nm);
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        "\"laser\":{\"alignmentEnabled\":%s,\"nirEnabled\":%s,\"driverStandby\":%s,\"measuredCurrentA\":%.3f,\"loopGood\":%s,\"driverTempC\":%.2f},",
-        status->outputs.enable_alignment_laser ? "true" : "false",
-        status->decision.nir_output_enable ? "true" : "false",
-        status->outputs.assert_driver_standby ? "true" : "false",
-        status->inputs.measured_laser_current_a,
-        status->inputs.driver_loop_good ? "true" : "false",
-        status->inputs.laser_driver_temp_c);
-
-    laser_controller_comms_buffer_append_fmt(
-        buffer,
-        "\"tec\":{\"tempGood\":%s,\"tempC\":%.2f,\"tempAdcVoltageV\":%.3f,\"currentA\":%.2f,\"voltageV\":%.2f,\"settlingSecondsRemaining\":%u},",
-        status->inputs.tec_temp_good ? "true" : "false",
-        status->inputs.tec_temp_c,
-        status->inputs.tec_temp_adc_voltage_v,
-        status->inputs.tec_current_a,
-        status->inputs.tec_voltage_v,
-        status->inputs.tec_temp_good ? 0U : 1U);
-
-    laser_controller_comms_buffer_append_fmt(
-        buffer,
-        "\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s},",
+        "\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f},",
         status->decision.allow_alignment ? "true" : "false",
         status->decision.allow_nir ? "true" : "false",
         status->decision.horizon_blocked ? "true" : "false",
         status->decision.distance_blocked ? "true" : "false",
         status->decision.lambda_drift_blocked ? "true" : "false",
-        status->decision.tec_temp_adc_blocked ? "true" : "false");
-
-    laser_controller_comms_buffer_append_fmt(
-        buffer,
-        "\"buttons\":{\"stage1Pressed\":%s,\"stage2Pressed\":%s},",
-        status->inputs.button.stage1_pressed ? "true" : "false",
-        status->inputs.button.stage2_pressed ? "true" : "false");
+        status->decision.tec_temp_adc_blocked ? "true" : "false",
+        actual_lambda_nm,
+        status->bench.target_lambda_nm,
+        lambda_drift_nm,
+        status->inputs.tec_temp_adc_voltage_v);
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
@@ -1680,90 +2060,44 @@ static void laser_controller_comms_write_fast_telemetry_json(
     laser_controller_comms_buffer_t *buffer,
     const laser_controller_runtime_status_t *status)
 {
-    const float beam_pitch_deg =
-        status->inputs.beam_pitch_rad * LASER_CONTROLLER_DEG_PER_RAD;
-    const float beam_roll_deg =
-        status->inputs.beam_roll_rad * LASER_CONTROLLER_DEG_PER_RAD;
-    const float beam_yaw_deg =
-        status->inputs.beam_yaw_rad * LASER_CONTROLLER_DEG_PER_RAD;
-    const float beam_pitch_limit_deg =
-        status->config.thresholds.horizon_threshold_rad * LASER_CONTROLLER_DEG_PER_RAD;
-
-    laser_controller_comms_buffer_append_raw(buffer, "{");
-    laser_controller_comms_buffer_append_fmt(
-        buffer,
-        "\"session\":{\"uptimeSeconds\":%lu,\"state\":",
-        (unsigned long)(status->uptime_ms / 1000U));
-    laser_controller_comms_write_escaped_string(
-        buffer,
-        laser_controller_state_name(status->state));
-    laser_controller_comms_buffer_append_raw(buffer, ",\"powerTier\":");
-    laser_controller_comms_write_escaped_string(
-        buffer,
-        laser_controller_comms_power_tier_name(status->power_tier));
-    laser_controller_comms_buffer_append_raw(buffer, "},");
+    const uint32_t imu_flags =
+        laser_controller_comms_encode_imu_flags(status);
+    const uint32_t tof_flags =
+        laser_controller_comms_encode_tof_flags(status);
+    const uint32_t laser_flags =
+        laser_controller_comms_encode_laser_flags(status);
+    const uint32_t tec_flags =
+        laser_controller_comms_encode_tec_flags(status);
+    const uint32_t safety_flags =
+        laser_controller_comms_encode_safety_flags(status);
+    const uint32_t button_flags =
+        laser_controller_comms_encode_button_flags(status);
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        "\"imu\":{\"valid\":%s,\"fresh\":%s,\"beamPitchDeg\":%.2f,\"beamRollDeg\":%.2f,\"beamYawDeg\":%.2f,\"beamYawRelative\":true,\"beamPitchLimitDeg\":%.2f},",
-        status->inputs.imu_data_valid ? "true" : "false",
-        status->inputs.imu_data_fresh ? "true" : "false",
-        beam_pitch_deg,
-        beam_roll_deg,
-        beam_yaw_deg,
-        beam_pitch_limit_deg);
-
-    laser_controller_comms_buffer_append_fmt(
-        buffer,
-        "\"tof\":{\"valid\":%s,\"fresh\":%s,\"distanceM\":%.3f},",
-        status->inputs.tof_data_valid ? "true" : "false",
-        status->inputs.tof_data_fresh ? "true" : "false",
-        status->inputs.tof_distance_m);
-
-    laser_controller_comms_buffer_append_fmt(
-        buffer,
-        "\"laser\":{\"alignmentEnabled\":%s,\"nirEnabled\":%s,\"driverStandby\":%s,\"measuredCurrentA\":%.3f,\"loopGood\":%s,\"driverTempC\":%.2f},",
-        status->outputs.enable_alignment_laser ? "true" : "false",
-        status->decision.nir_output_enable ? "true" : "false",
-        status->outputs.assert_driver_standby ? "true" : "false",
-        status->inputs.measured_laser_current_a,
-        status->inputs.driver_loop_good ? "true" : "false",
-        status->inputs.laser_driver_temp_c);
-
-    laser_controller_comms_buffer_append_fmt(
-        buffer,
-        "\"tec\":{\"tempGood\":%s,\"tempC\":%.2f,\"tempAdcVoltageV\":%.3f,\"currentA\":%.2f,\"voltageV\":%.2f,\"settlingSecondsRemaining\":%u},",
-        status->inputs.tec_temp_good ? "true" : "false",
-        status->inputs.tec_temp_c,
-        status->inputs.tec_temp_adc_voltage_v,
-        status->inputs.tec_current_a,
-        status->inputs.tec_voltage_v,
-        status->inputs.tec_temp_good ? 0U : 1U);
-
-    laser_controller_comms_buffer_append_fmt(
-        buffer,
-        "\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s},",
-        status->decision.allow_alignment ? "true" : "false",
-        status->decision.allow_nir ? "true" : "false",
-        status->decision.horizon_blocked ? "true" : "false",
-        status->decision.distance_blocked ? "true" : "false",
-        status->decision.lambda_drift_blocked ? "true" : "false",
-        status->decision.tec_temp_adc_blocked ? "true" : "false");
-
-    laser_controller_comms_buffer_append_fmt(
-        buffer,
-        "\"buttons\":{\"stage1Pressed\":%s,\"stage2Pressed\":%s},",
-        status->inputs.button.stage1_pressed ? "true" : "false",
-        status->inputs.button.stage2_pressed ? "true" : "false");
-
-    laser_controller_comms_buffer_append_fmt(
-        buffer,
-        "\"fault\":{\"latched\":%s,\"activeCode\":",
-        status->fault_latched ? "true" : "false");
-    laser_controller_comms_write_escaped_string(
-        buffer,
-        laser_controller_fault_code_name(status->active_fault_code));
-    laser_controller_comms_buffer_append_raw(buffer, "}}");
+        "{\"v\":1,\"m\":[%lu,%ld,%ld,%ld,%ld,%lu,%ld,%lu,%ld,%ld,%lu,%ld,%ld,%ld,%ld,%lu,%lu]}",
+        (unsigned long)imu_flags,
+        (long)laser_controller_comms_encode_centi(
+            status->inputs.beam_pitch_rad * LASER_CONTROLLER_DEG_PER_RAD),
+        (long)laser_controller_comms_encode_centi(
+            status->inputs.beam_roll_rad * LASER_CONTROLLER_DEG_PER_RAD),
+        (long)laser_controller_comms_encode_centi(
+            status->inputs.beam_yaw_rad * LASER_CONTROLLER_DEG_PER_RAD),
+        (long)laser_controller_comms_encode_centi(
+            status->config.thresholds.horizon_threshold_rad *
+            LASER_CONTROLLER_DEG_PER_RAD),
+        (unsigned long)tof_flags,
+        (long)lroundf(status->inputs.tof_distance_m * 1000.0f),
+        (unsigned long)laser_flags,
+        (long)lroundf(status->inputs.measured_laser_current_a * 1000.0f),
+        (long)laser_controller_comms_encode_centi(status->inputs.laser_driver_temp_c),
+        (unsigned long)tec_flags,
+        (long)laser_controller_comms_encode_centi(status->inputs.tec_temp_c),
+        (long)lroundf(status->inputs.tec_temp_adc_voltage_v * 1000.0f),
+        (long)lroundf(status->inputs.tec_current_a * 100.0f),
+        (long)lroundf(status->inputs.tec_voltage_v * 100.0f),
+        (unsigned long)safety_flags,
+        (unsigned long)button_flags);
 }
 
 static void laser_controller_comms_write_live_snapshot_json(
@@ -2194,6 +2528,398 @@ static void laser_controller_comms_emit_faults_response(
     laser_controller_comms_output_unlock();
 }
 
+static void laser_controller_comms_emit_io_status_response(
+    uint32_t id,
+    const laser_controller_runtime_status_t *status,
+    bool include_rails,
+    bool include_haptic,
+    bool include_gpio,
+    bool include_power,
+    bool include_illumination)
+{
+    laser_controller_comms_buffer_t buffer;
+    bool bringup_open = false;
+
+    laser_controller_comms_output_lock();
+    laser_controller_comms_buffer_reset(
+        &buffer,
+        s_frame_buffer,
+        sizeof(s_frame_buffer));
+    laser_controller_comms_buffer_append_fmt(
+        &buffer,
+        "{\"type\":\"resp\",\"id\":%lu,\"ok\":true,\"result\":{",
+        (unsigned long)id);
+    laser_controller_comms_buffer_append_fmt(
+        &buffer,
+        "\"session\":{\"uptimeSeconds\":%lu,\"state\":",
+        (unsigned long)(status->uptime_ms / 1000U));
+    laser_controller_comms_write_escaped_string(
+        &buffer,
+        laser_controller_state_name(status->state));
+    laser_controller_comms_buffer_append_raw(&buffer, ",\"powerTier\":");
+    laser_controller_comms_write_escaped_string(
+        &buffer,
+        laser_controller_comms_power_tier_name(status->power_tier));
+    laser_controller_comms_buffer_append_raw(&buffer, "}");
+
+    if (include_rails) {
+        laser_controller_comms_buffer_append_fmt(
+            &buffer,
+            ",\"rails\":{\"ld\":{\"enabled\":%s,\"pgood\":%s},\"tec\":{\"enabled\":%s,\"pgood\":%s}}",
+            status->outputs.enable_ld_vin ? "true" : "false",
+            status->inputs.ld_rail_pgood ? "true" : "false",
+            status->outputs.enable_tec_vin ? "true" : "false",
+            status->inputs.tec_rail_pgood ? "true" : "false");
+    }
+
+    if (include_haptic) {
+        laser_controller_comms_buffer_append_raw(&buffer, ",");
+        laser_controller_comms_write_peripheral_subset_json(
+            &buffer,
+            status,
+            LASER_CONTROLLER_COMMS_PERIPHERAL_HAPTIC);
+    }
+
+    if (include_gpio) {
+        laser_controller_comms_buffer_append_raw(&buffer, ",");
+        laser_controller_comms_write_gpio_inspector_json(&buffer, status);
+        if (buffer.length > 0U && buffer.data[buffer.length - 1U] == ',') {
+            buffer.data[--buffer.length] = '\0';
+        }
+    }
+
+    if (include_power || include_illumination || status->bringup.service_mode_requested ||
+        status->state == LASER_CONTROLLER_STATE_SERVICE_MODE) {
+        laser_controller_comms_buffer_append_raw(
+            &buffer,
+            ",\"bringup\":{");
+        bringup_open = true;
+        laser_controller_comms_buffer_append_fmt(
+            &buffer,
+            "\"serviceModeRequested\":%s,\"serviceModeActive\":%s",
+            status->bringup.service_mode_requested ? "true" : "false",
+            status->state == LASER_CONTROLLER_STATE_SERVICE_MODE ? "true" : "false");
+        if (include_power) {
+            laser_controller_comms_buffer_append_fmt(
+                &buffer,
+                ",\"power\":{\"ldRequested\":%s,\"tecRequested\":%s}",
+                status->bringup.ld_rail_debug_enabled ? "true" : "false",
+                status->bringup.tec_rail_debug_enabled ? "true" : "false");
+        }
+        if (include_illumination) {
+            laser_controller_comms_buffer_append_fmt(
+                &buffer,
+                ",\"illumination\":{\"tof\":{\"enabled\":%s,\"dutyCyclePct\":%lu,\"frequencyHz\":%lu}}",
+                status->bringup.tof_illumination_enabled ? "true" : "false",
+                (unsigned long)status->bringup.tof_illumination_duty_cycle_pct,
+                (unsigned long)status->bringup.tof_illumination_frequency_hz);
+        }
+    }
+
+    if (bringup_open) {
+        laser_controller_comms_buffer_append_raw(&buffer, "}");
+    }
+
+    laser_controller_comms_buffer_append_fmt(
+        &buffer,
+        ",\"fault\":{\"latched\":%s,\"activeCode\":",
+        status->fault_latched ? "true" : "false");
+    laser_controller_comms_write_escaped_string(
+        &buffer,
+        laser_controller_fault_code_name(status->active_fault_code));
+    laser_controller_comms_buffer_append_fmt(
+        &buffer,
+        ",\"activeCount\":%lu,\"tripCounter\":%lu}}}\n",
+        (unsigned long)status->active_fault_count,
+        (unsigned long)status->trip_counter);
+    laser_controller_comms_emit_buffer_locked(&buffer, "io_status_response");
+    laser_controller_comms_output_unlock();
+}
+
+static void laser_controller_comms_emit_tool_status_response(
+    uint32_t id,
+    const laser_controller_runtime_status_t *status,
+    uint32_t peripheral_mask,
+    bool include_pd,
+    bool include_modules,
+    bool include_tools)
+{
+    laser_controller_comms_buffer_t buffer;
+    bool bringup_open = false;
+
+    laser_controller_comms_output_lock();
+    laser_controller_comms_buffer_reset(
+        &buffer,
+        s_frame_buffer,
+        sizeof(s_frame_buffer));
+    laser_controller_comms_buffer_append_fmt(
+        &buffer,
+        "{\"type\":\"resp\",\"id\":%lu,\"ok\":true,\"result\":{",
+        (unsigned long)id);
+    laser_controller_comms_buffer_append_fmt(
+        &buffer,
+        "\"session\":{\"uptimeSeconds\":%lu,\"state\":",
+        (unsigned long)(status->uptime_ms / 1000U));
+    laser_controller_comms_write_escaped_string(
+        &buffer,
+        laser_controller_state_name(status->state));
+    laser_controller_comms_buffer_append_raw(&buffer, ",\"powerTier\":");
+    laser_controller_comms_write_escaped_string(
+        &buffer,
+        laser_controller_comms_power_tier_name(status->power_tier));
+    laser_controller_comms_buffer_append_raw(&buffer, "}");
+
+    if (include_pd) {
+        laser_controller_comms_buffer_append_fmt(
+            &buffer,
+            ",\"pd\":{\"contractValid\":%s,\"negotiatedPowerW\":%.2f,\"sourceVoltageV\":%.2f,\"sourceCurrentA\":%.2f,\"operatingCurrentA\":%.2f,\"sourceIsHostOnly\":%s}",
+            status->inputs.pd_contract_valid ? "true" : "false",
+            status->inputs.pd_negotiated_power_w,
+            status->inputs.pd_source_voltage_v,
+            status->inputs.pd_source_current_a,
+            status->inputs.pd_operating_current_a,
+            status->inputs.pd_source_is_host_only ? "true" : "false");
+    }
+
+    if (peripheral_mask != LASER_CONTROLLER_COMMS_PERIPHERAL_NONE) {
+        laser_controller_comms_buffer_append_raw(&buffer, ",");
+        laser_controller_comms_write_peripheral_subset_json(
+            &buffer,
+            status,
+            peripheral_mask);
+    }
+
+    if (include_modules || include_tools ||
+        status->bringup.service_mode_requested ||
+        status->state == LASER_CONTROLLER_STATE_SERVICE_MODE) {
+        laser_controller_comms_buffer_append_raw(&buffer, ",\"bringup\":{");
+        bringup_open = true;
+        laser_controller_comms_buffer_append_fmt(
+            &buffer,
+            "\"serviceModeRequested\":%s,\"serviceModeActive\":%s",
+            status->bringup.service_mode_requested ? "true" : "false",
+            status->state == LASER_CONTROLLER_STATE_SERVICE_MODE ? "true" : "false");
+        if (include_modules) {
+            laser_controller_comms_buffer_append_raw(&buffer, ",");
+            laser_controller_comms_write_modules_only_json(&buffer, status);
+        }
+        if (include_tools) {
+            laser_controller_comms_buffer_append_raw(&buffer, ",");
+            laser_controller_comms_write_tools_only_json(&buffer, status);
+        }
+    }
+
+    if (bringup_open) {
+        laser_controller_comms_buffer_append_raw(&buffer, "}");
+    }
+
+    laser_controller_comms_buffer_append_fmt(
+        &buffer,
+        ",\"fault\":{\"latched\":%s,\"activeCode\":",
+        status->fault_latched ? "true" : "false");
+    laser_controller_comms_write_escaped_string(
+        &buffer,
+        laser_controller_fault_code_name(status->active_fault_code));
+    laser_controller_comms_buffer_append_fmt(
+        &buffer,
+        ",\"activeCount\":%lu,\"tripCounter\":%lu}}}\n",
+        (unsigned long)status->active_fault_count,
+        (unsigned long)status->trip_counter);
+    laser_controller_comms_emit_buffer_locked(&buffer, "tool_status_response");
+    laser_controller_comms_output_unlock();
+}
+
+static void laser_controller_comms_emit_profile_status_response(
+    uint32_t id,
+    const laser_controller_runtime_status_t *status)
+{
+    laser_controller_comms_buffer_t buffer;
+
+    laser_controller_comms_output_lock();
+    laser_controller_comms_buffer_reset(
+        &buffer,
+        s_frame_buffer,
+        sizeof(s_frame_buffer));
+    laser_controller_comms_buffer_append_fmt(
+        &buffer,
+        "{\"type\":\"resp\",\"id\":%lu,\"ok\":true,\"result\":{",
+        (unsigned long)id);
+    laser_controller_comms_buffer_append_fmt(
+        &buffer,
+        "\"session\":{\"uptimeSeconds\":%lu,\"state\":",
+        (unsigned long)(status->uptime_ms / 1000U));
+    laser_controller_comms_write_escaped_string(
+        &buffer,
+        laser_controller_state_name(status->state));
+    laser_controller_comms_buffer_append_raw(&buffer, ",\"powerTier\":");
+    laser_controller_comms_write_escaped_string(
+        &buffer,
+        laser_controller_comms_power_tier_name(status->power_tier));
+    laser_controller_comms_buffer_append_fmt(
+        &buffer,
+        "},\"bringup\":{\"serviceModeRequested\":%s,\"serviceModeActive\":%s,\"persistenceDirty\":%s,\"persistenceAvailable\":%s,\"lastSaveOk\":%s,\"profileRevision\":%lu,\"profileName\":",
+        status->bringup.service_mode_requested ? "true" : "false",
+        status->state == LASER_CONTROLLER_STATE_SERVICE_MODE ? "true" : "false",
+        status->bringup.persistence_dirty ? "true" : "false",
+        status->bringup.persistence_available ? "true" : "false",
+        status->bringup.last_save_ok ? "true" : "false",
+        (unsigned long)status->bringup.profile_revision);
+    laser_controller_comms_write_escaped_string(
+        &buffer,
+        status->bringup.profile_name);
+    laser_controller_comms_buffer_append_fmt(
+        &buffer,
+        "},\"fault\":{\"latched\":%s,\"activeCode\":",
+        status->fault_latched ? "true" : "false");
+    laser_controller_comms_write_escaped_string(
+        &buffer,
+        laser_controller_fault_code_name(status->active_fault_code));
+    laser_controller_comms_buffer_append_fmt(
+        &buffer,
+        ",\"activeCount\":%lu,\"tripCounter\":%lu}}}\n",
+        (unsigned long)status->active_fault_count,
+        (unsigned long)status->trip_counter);
+    laser_controller_comms_emit_buffer_locked(&buffer, "profile_status_response");
+    laser_controller_comms_output_unlock();
+}
+
+static void laser_controller_comms_emit_bench_status_response(
+    uint32_t id,
+    const laser_controller_runtime_status_t *status,
+    bool include_tec,
+    bool include_bench,
+    bool include_safety)
+{
+    laser_controller_comms_buffer_t buffer;
+    const float beam_pitch_limit_deg =
+        status->config.thresholds.horizon_threshold_rad * LASER_CONTROLLER_DEG_PER_RAD;
+    const float beam_pitch_hysteresis_deg =
+        status->config.thresholds.horizon_hysteresis_rad * LASER_CONTROLLER_DEG_PER_RAD;
+    const float actual_lambda_nm = laser_controller_comms_lambda_from_temp(
+        &status->config,
+        status->inputs.tec_temp_c);
+    const float lambda_drift_nm =
+        fabsf(actual_lambda_nm - status->bench.target_lambda_nm);
+
+    laser_controller_comms_output_lock();
+    laser_controller_comms_buffer_reset(
+        &buffer,
+        s_frame_buffer,
+        sizeof(s_frame_buffer));
+    laser_controller_comms_buffer_append_fmt(
+        &buffer,
+        "{\"type\":\"resp\",\"id\":%lu,\"ok\":true,\"result\":{",
+        (unsigned long)id);
+    laser_controller_comms_buffer_append_fmt(
+        &buffer,
+        "\"session\":{\"uptimeSeconds\":%lu,\"state\":",
+        (unsigned long)(status->uptime_ms / 1000U));
+    laser_controller_comms_write_escaped_string(
+        &buffer,
+        laser_controller_state_name(status->state));
+    laser_controller_comms_buffer_append_raw(&buffer, ",\"powerTier\":");
+    laser_controller_comms_write_escaped_string(
+        &buffer,
+        laser_controller_comms_power_tier_name(status->power_tier));
+    laser_controller_comms_buffer_append_fmt(
+        &buffer,
+        "},\"rails\":{\"ld\":{\"enabled\":%s,\"pgood\":%s},\"tec\":{\"enabled\":%s,\"pgood\":%s}},"
+        "\"laser\":{\"alignmentEnabled\":%s,\"nirEnabled\":%s,\"driverStandby\":%s,\"measuredCurrentA\":%.3f,\"commandedCurrentA\":%.3f,\"loopGood\":%s,\"driverTempC\":%.2f}",
+        status->outputs.enable_ld_vin ? "true" : "false",
+        status->inputs.ld_rail_pgood ? "true" : "false",
+        status->outputs.enable_tec_vin ? "true" : "false",
+        status->inputs.tec_rail_pgood ? "true" : "false",
+        status->outputs.enable_alignment_laser ? "true" : "false",
+        status->decision.nir_output_enable ? "true" : "false",
+        status->outputs.assert_driver_standby ? "true" : "false",
+        status->inputs.measured_laser_current_a,
+        status->bench.high_state_current_a,
+        status->inputs.driver_loop_good ? "true" : "false",
+        status->inputs.laser_driver_temp_c);
+
+    if (include_tec) {
+        laser_controller_comms_buffer_append_fmt(
+            &buffer,
+            ",\"tec\":{\"targetTempC\":%.2f,\"targetLambdaNm\":%.2f,\"actualLambdaNm\":%.2f,\"tempGood\":%s,\"tempC\":%.2f,\"tempAdcVoltageV\":%.3f,\"currentA\":%.2f,\"voltageV\":%.2f,\"settlingSecondsRemaining\":%u}",
+            status->bench.target_temp_c,
+            status->bench.target_lambda_nm,
+            actual_lambda_nm,
+            status->inputs.tec_temp_good ? "true" : "false",
+            status->inputs.tec_temp_c,
+            status->inputs.tec_temp_adc_voltage_v,
+            status->inputs.tec_current_a,
+            status->inputs.tec_voltage_v,
+            status->inputs.tec_temp_good ? 0U : 1U);
+    }
+
+    if (include_bench) {
+        laser_controller_comms_buffer_append_raw(&buffer, ",\"bench\":{\"targetMode\":");
+        laser_controller_comms_write_escaped_string(
+            &buffer,
+            laser_controller_bench_target_mode_name(status->bench.target_mode));
+        laser_controller_comms_buffer_append_fmt(
+            &buffer,
+            ",\"requestedNirEnabled\":%s,\"modulationEnabled\":%s,\"modulationFrequencyHz\":%lu,\"modulationDutyCyclePct\":%lu,\"lowStateCurrentA\":%.3f}",
+            status->bench.requested_nir ? "true" : "false",
+            status->bench.modulation_enabled ? "true" : "false",
+            (unsigned long)status->bench.modulation_frequency_hz,
+            (unsigned long)status->bench.modulation_duty_cycle_pct,
+            status->bench.low_state_current_a);
+    }
+
+    if (include_safety) {
+        laser_controller_comms_buffer_append_fmt(
+            &buffer,
+            ",\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"horizonThresholdDeg\":%.2f,\"horizonHysteresisDeg\":%.2f,\"tofMinRangeM\":%.3f,\"tofMaxRangeM\":%.3f,\"tofHysteresisM\":%.3f,\"imuStaleMs\":%lu,\"tofStaleMs\":%lu,\"railGoodTimeoutMs\":%lu,\"lambdaDriftLimitNm\":%.2f,\"lambdaDriftHysteresisNm\":%.2f,\"lambdaDriftHoldMs\":%lu,\"ldOvertempLimitC\":%.2f,\"tecTempAdcTripV\":%.3f,\"tecTempAdcHysteresisV\":%.3f,\"tecTempAdcHoldMs\":%lu,\"tecMinCommandC\":%.2f,\"tecMaxCommandC\":%.2f,\"tecReadyToleranceC\":%.2f,\"maxLaserCurrentA\":%.2f,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f}",
+            status->decision.allow_alignment ? "true" : "false",
+            status->decision.allow_nir ? "true" : "false",
+            status->decision.horizon_blocked ? "true" : "false",
+            status->decision.distance_blocked ? "true" : "false",
+            status->decision.lambda_drift_blocked ? "true" : "false",
+            status->decision.tec_temp_adc_blocked ? "true" : "false",
+            beam_pitch_limit_deg,
+            beam_pitch_hysteresis_deg,
+            status->config.thresholds.tof_min_range_m,
+            status->config.thresholds.tof_max_range_m,
+            status->config.thresholds.tof_hysteresis_m,
+            (unsigned long)status->config.timeouts.imu_stale_ms,
+            (unsigned long)status->config.timeouts.tof_stale_ms,
+            (unsigned long)status->config.timeouts.rail_good_timeout_ms,
+            status->config.thresholds.lambda_drift_limit_nm,
+            status->config.thresholds.lambda_drift_hysteresis_nm,
+            (unsigned long)status->config.timeouts.lambda_drift_hold_ms,
+            status->config.thresholds.ld_overtemp_limit_c,
+            status->config.thresholds.tec_temp_adc_trip_v,
+            status->config.thresholds.tec_temp_adc_hysteresis_v,
+            (unsigned long)status->config.timeouts.tec_temp_adc_hold_ms,
+            status->config.thresholds.tec_min_command_c,
+            status->config.thresholds.tec_max_command_c,
+            status->config.thresholds.tec_ready_tolerance_c,
+            status->config.thresholds.max_laser_current_a,
+            actual_lambda_nm,
+            status->bench.target_lambda_nm,
+            lambda_drift_nm,
+            status->inputs.tec_temp_adc_voltage_v);
+    }
+
+    laser_controller_comms_buffer_append_fmt(
+        &buffer,
+        ",\"bringup\":{\"serviceModeRequested\":%s,\"serviceModeActive\":%s},\"fault\":{\"latched\":%s,\"activeCode\":",
+        status->bringup.service_mode_requested ? "true" : "false",
+        status->state == LASER_CONTROLLER_STATE_SERVICE_MODE ? "true" : "false",
+        status->fault_latched ? "true" : "false");
+    laser_controller_comms_write_escaped_string(
+        &buffer,
+        laser_controller_fault_code_name(status->active_fault_code));
+    laser_controller_comms_buffer_append_fmt(
+        &buffer,
+        ",\"activeCount\":%lu,\"tripCounter\":%lu}}}\n",
+        (unsigned long)status->active_fault_count,
+        (unsigned long)status->trip_counter);
+    laser_controller_comms_emit_buffer_locked(&buffer, "bench_status_response");
+    laser_controller_comms_output_unlock();
+}
+
 static const char *laser_controller_comms_find_value_start(
     const char *line,
     const char *key,
@@ -2372,16 +3098,22 @@ static void laser_controller_comms_handle_command_line(const char *line)
             "\"type\":\"",
             envelope_type,
             sizeof(envelope_type)) &&
-        strcmp(envelope_type, "cmd") != 0) {
+        strcmp(envelope_type, "cmd") != 0 &&
+        strcmp(envelope_type, "command") != 0) {
         return;
     }
 
     if (!laser_controller_comms_extract_uint(line, "\"id\":", &id) ||
-        !laser_controller_comms_extract_string(
-            line,
-            "\"cmd\":\"",
-            command,
-            sizeof(command))) {
+        (!laser_controller_comms_extract_string(
+             line,
+             "\"cmd\":\"",
+             command,
+             sizeof(command)) &&
+         !laser_controller_comms_extract_string(
+             line,
+             "\"command\":\"",
+             command,
+             sizeof(command)))) {
         laser_controller_comms_emit_error_response(id, "Malformed command envelope.");
         return;
     }
@@ -2422,7 +3154,14 @@ static void laser_controller_comms_handle_command_line(const char *line)
         }
 
         (void)laser_controller_app_copy_status(&status);
-        laser_controller_comms_emit_status_response(id, &status);
+        laser_controller_comms_emit_io_status_response(
+            id,
+            &status,
+            true,
+            false,
+            false,
+            true,
+            true);
         return;
     }
 
@@ -2435,7 +3174,14 @@ static void laser_controller_comms_handle_command_line(const char *line)
                 "Service mode request timed out before the controller entered write-safe state.");
             return;
         }
-        laser_controller_comms_emit_status_response(id, &status);
+        laser_controller_comms_emit_io_status_response(
+            id,
+            &status,
+            true,
+            false,
+            false,
+            true,
+            true);
         return;
     }
 
@@ -2449,7 +3195,14 @@ static void laser_controller_comms_handle_command_line(const char *line)
                 "Service mode exit timed out before the controller returned to normal supervision.");
             return;
         }
-        laser_controller_comms_emit_status_response(id, &status);
+        laser_controller_comms_emit_io_status_response(
+            id,
+            &status,
+            true,
+            false,
+            false,
+            true,
+            true);
         return;
     }
 
@@ -2462,6 +3215,84 @@ static void laser_controller_comms_handle_command_line(const char *line)
     if (strcmp(command, "refresh_pd_status") == 0) {
         laser_controller_board_force_pd_refresh();
         vTaskDelay(pdMS_TO_TICKS(LASER_CONTROLLER_PD_REFRESH_WAIT_MS));
+        (void)laser_controller_app_copy_status(&status);
+        laser_controller_comms_emit_tool_status_response(
+            id,
+            &status,
+            LASER_CONTROLLER_COMMS_PERIPHERAL_PD,
+            true,
+            true,
+            false);
+        return;
+    }
+
+    if (strcmp(command, "scan_wireless_networks") == 0) {
+        const esp_err_t wireless_err =
+            laser_controller_wireless_scan_networks();
+        if (wireless_err != ESP_OK) {
+            laser_controller_comms_emit_error_response(
+                id,
+                "Controller Wi-Fi scan failed before the network list could be refreshed.");
+            return;
+        }
+
+        (void)laser_controller_app_copy_status(&status);
+        laser_controller_comms_emit_full_status_response(id, &status);
+        return;
+    }
+
+    if (strcmp(command, "configure_wireless") == 0) {
+        char mode_name[16] = { 0 };
+        char station_ssid[33] = { 0 };
+        char station_password[65] = { 0 };
+        laser_controller_wireless_mode_t mode =
+            LASER_CONTROLLER_WIRELESS_MODE_SOFTAP;
+        const bool has_station_ssid = laser_controller_comms_extract_string(
+            line,
+            "\"ssid\":\"",
+            station_ssid,
+            sizeof(station_ssid));
+        const bool has_station_password = laser_controller_comms_extract_string(
+            line,
+            "\"password\":\"",
+            station_password,
+            sizeof(station_password));
+        esp_err_t wireless_err = ESP_OK;
+
+        if (!laser_controller_comms_extract_string(
+                line,
+                "\"mode\":\"",
+                mode_name,
+                sizeof(mode_name))) {
+            laser_controller_comms_emit_error_response(id, "Missing wireless mode.");
+            return;
+        }
+
+        if (strcmp(mode_name, "softap") == 0 ||
+            strcmp(mode_name, "ap") == 0) {
+            mode = LASER_CONTROLLER_WIRELESS_MODE_SOFTAP;
+        } else if (strcmp(mode_name, "station") == 0) {
+            mode = LASER_CONTROLLER_WIRELESS_MODE_STATION;
+        } else {
+            laser_controller_comms_emit_error_response(
+                id,
+                "Wireless mode must be softap or station.");
+            return;
+        }
+
+        wireless_err = laser_controller_wireless_configure(
+            mode,
+            has_station_ssid ? station_ssid : NULL,
+            has_station_password ? station_password : NULL);
+        if (wireless_err != ESP_OK) {
+            laser_controller_comms_emit_error_response(
+                id,
+                wireless_err == ESP_ERR_INVALID_ARG ?
+                    "Station mode needs a saved or provided SSID before the controller can join existing Wi-Fi." :
+                    "Wireless reconfiguration failed before the controller could apply the requested network mode.");
+            return;
+        }
+
         (void)laser_controller_app_copy_status(&status);
         laser_controller_comms_emit_status_response(id, &status);
         return;
@@ -2516,7 +3347,12 @@ static void laser_controller_comms_handle_command_line(const char *line)
             "bench laser current staged -> %.3f A",
             current_a);
         (void)laser_controller_app_copy_status(&status);
-        laser_controller_comms_emit_status_response(id, &status);
+        laser_controller_comms_emit_bench_status_response(
+            id,
+            &status,
+            false,
+            true,
+            true);
         return;
     }
 
@@ -2836,7 +3672,12 @@ static void laser_controller_comms_handle_command_line(const char *line)
             "config",
             "runtime safety policy updated from host");
         (void)laser_controller_app_copy_status(&status);
-        laser_controller_comms_emit_status_response(id, &status);
+        laser_controller_comms_emit_bench_status_response(
+            id,
+            &status,
+            true,
+            false,
+            true);
         return;
     }
 
@@ -2855,7 +3696,12 @@ static void laser_controller_comms_handle_command_line(const char *line)
             "bench tec target staged -> %.2f C",
             target_temp_c);
         (void)laser_controller_app_copy_status(&status);
-        laser_controller_comms_emit_status_response(id, &status);
+        laser_controller_comms_emit_bench_status_response(
+            id,
+            &status,
+            true,
+            true,
+            true);
         return;
     }
 
@@ -2874,7 +3720,12 @@ static void laser_controller_comms_handle_command_line(const char *line)
             "bench wavelength target staged -> %.2f nm",
             target_lambda_nm);
         (void)laser_controller_app_copy_status(&status);
-        laser_controller_comms_emit_status_response(id, &status);
+        laser_controller_comms_emit_bench_status_response(
+            id,
+            &status,
+            true,
+            true,
+            true);
         return;
     }
 
@@ -2882,7 +3733,12 @@ static void laser_controller_comms_handle_command_line(const char *line)
         laser_controller_bench_set_alignment_requested(true, now_ms);
         laser_controller_logger_log(now_ms, "bench", "alignment request staged");
         (void)laser_controller_app_copy_status(&status);
-        laser_controller_comms_emit_status_response(id, &status);
+        laser_controller_comms_emit_bench_status_response(
+            id,
+            &status,
+            false,
+            false,
+            true);
         return;
     }
 
@@ -2890,7 +3746,12 @@ static void laser_controller_comms_handle_command_line(const char *line)
         laser_controller_bench_set_alignment_requested(false, now_ms);
         laser_controller_logger_log(now_ms, "bench", "alignment request cleared");
         (void)laser_controller_app_copy_status(&status);
-        laser_controller_comms_emit_status_response(id, &status);
+        laser_controller_comms_emit_bench_status_response(
+            id,
+            &status,
+            false,
+            false,
+            true);
         return;
     }
 
@@ -2898,7 +3759,12 @@ static void laser_controller_comms_handle_command_line(const char *line)
         laser_controller_bench_set_nir_requested(true, now_ms);
         laser_controller_logger_log(now_ms, "bench", "nir request staged");
         (void)laser_controller_app_copy_status(&status);
-        laser_controller_comms_emit_status_response(id, &status);
+        laser_controller_comms_emit_bench_status_response(
+            id,
+            &status,
+            false,
+            true,
+            true);
         return;
     }
 
@@ -2906,7 +3772,12 @@ static void laser_controller_comms_handle_command_line(const char *line)
         laser_controller_bench_set_nir_requested(false, now_ms);
         laser_controller_logger_log(now_ms, "bench", "nir request cleared");
         (void)laser_controller_app_copy_status(&status);
-        laser_controller_comms_emit_status_response(id, &status);
+        laser_controller_comms_emit_bench_status_response(
+            id,
+            &status,
+            false,
+            true,
+            true);
         return;
     }
 
@@ -2939,7 +3810,12 @@ static void laser_controller_comms_handle_command_line(const char *line)
             (unsigned long)duty_cycle_pct,
             low_state_current_a);
         (void)laser_controller_app_copy_status(&status);
-        laser_controller_comms_emit_status_response(id, &status);
+        laser_controller_comms_emit_bench_status_response(
+            id,
+            &status,
+            false,
+            true,
+            true);
         return;
     }
 
@@ -2977,7 +3853,7 @@ static void laser_controller_comms_handle_command_line(const char *line)
         }
         laser_controller_logger_logf(now_ms, "service", "bring-up profile renamed: %s", text_arg);
         (void)laser_controller_app_copy_status(&status);
-        laser_controller_comms_emit_status_response(id, &status);
+        laser_controller_comms_emit_profile_status_response(id, &status);
         return;
     }
 
@@ -3021,7 +3897,13 @@ static void laser_controller_comms_handle_command_line(const char *line)
             expected_present,
             debug_enabled);
         (void)laser_controller_app_copy_status(&status);
-        laser_controller_comms_emit_status_response(id, &status);
+        laser_controller_comms_emit_tool_status_response(
+            id,
+            &status,
+            LASER_CONTROLLER_COMMS_PERIPHERAL_NONE,
+            false,
+            true,
+            false);
         return;
     }
 
@@ -3059,7 +3941,14 @@ static void laser_controller_comms_handle_command_line(const char *line)
             laser_controller_service_supply_name(supply),
             enabled ? "enabled" : "disabled");
         (void)laser_controller_app_copy_status(&status);
-        laser_controller_comms_emit_status_response(id, &status);
+        laser_controller_comms_emit_io_status_response(
+            id,
+            &status,
+            true,
+            false,
+            false,
+            true,
+            false);
         return;
     }
 
@@ -3081,7 +3970,14 @@ static void laser_controller_comms_handle_command_line(const char *line)
             enabled ? "high" : "low");
         (void)laser_controller_comms_wait_for_haptic_enable(enabled, &status);
         (void)laser_controller_app_copy_status(&status);
-        laser_controller_comms_emit_status_response(id, &status);
+        laser_controller_comms_emit_io_status_response(
+            id,
+            &status,
+            false,
+            true,
+            false,
+            false,
+            false);
         return;
     }
 
@@ -3145,7 +4041,14 @@ static void laser_controller_comms_handle_command_line(const char *line)
             pulldown_enabled,
             &status);
         (void)laser_controller_app_copy_status(&status);
-        laser_controller_comms_emit_status_response(id, &status);
+        laser_controller_comms_emit_io_status_response(
+            id,
+            &status,
+            false,
+            false,
+            true,
+            false,
+            false);
         return;
     }
 
@@ -3157,7 +4060,14 @@ static void laser_controller_comms_handle_command_line(const char *line)
             "all gpio overrides cleared");
         (void)laser_controller_comms_wait_for_gpio_override_clear(&status);
         (void)laser_controller_app_copy_status(&status);
-        laser_controller_comms_emit_status_response(id, &status);
+        laser_controller_comms_emit_io_status_response(
+            id,
+            &status,
+            false,
+            false,
+            true,
+            false,
+            false);
         return;
     }
 
@@ -3168,7 +4078,7 @@ static void laser_controller_comms_handle_command_line(const char *line)
             "service",
             "device-side bring-up profile save requested");
         (void)laser_controller_app_copy_status(&status);
-        laser_controller_comms_emit_status_response(id, &status);
+        laser_controller_comms_emit_profile_status_response(id, &status);
         return;
     }
 
@@ -3447,7 +4357,14 @@ static void laser_controller_comms_handle_command_line(const char *line)
             (unsigned long)duty_cycle_pct,
             (unsigned long)frequency_hz);
         (void)laser_controller_app_copy_status(&status);
-        laser_controller_comms_emit_status_response(id, &status);
+        laser_controller_comms_emit_io_status_response(
+            id,
+            &status,
+            false,
+            false,
+            false,
+            false,
+            true);
         return;
     }
 
@@ -3502,7 +4419,14 @@ static void laser_controller_comms_handle_command_line(const char *line)
         laser_controller_service_fire_haptic_test(now_ms);
         laser_controller_logger_log(now_ms, "service", "haptic test fired");
         (void)laser_controller_app_copy_status(&status);
-        laser_controller_comms_emit_status_response(id, &status);
+        laser_controller_comms_emit_io_status_response(
+            id,
+            &status,
+            false,
+            true,
+            false,
+            false,
+            false);
         return;
     }
 
@@ -3551,7 +4475,14 @@ static void laser_controller_comms_handle_command_line(const char *line)
             (unsigned long)low_ms,
             release_after ? 1 : 0);
         (void)laser_controller_app_copy_status(&status);
-        laser_controller_comms_emit_status_response(id, &status);
+        laser_controller_comms_emit_io_status_response(
+            id,
+            &status,
+            false,
+            true,
+            false,
+            false,
+            false);
         return;
     }
 
@@ -3571,7 +4502,13 @@ static void laser_controller_comms_handle_command_line(const char *line)
         laser_controller_service_i2c_scan(now_ms);
         laser_controller_logger_log(now_ms, "service", "i2c scan requested");
         (void)laser_controller_app_copy_status(&status);
-        laser_controller_comms_emit_status_response(id, &status);
+        laser_controller_comms_emit_tool_status_response(
+            id,
+            &status,
+            LASER_CONTROLLER_COMMS_PERIPHERAL_NONE,
+            false,
+            true,
+            true);
         return;
     }
 
@@ -3593,7 +4530,19 @@ static void laser_controller_comms_handle_command_line(const char *line)
             (unsigned long)address,
             (unsigned long)reg);
         (void)laser_controller_app_copy_status(&status);
-        laser_controller_comms_emit_status_response(id, &status);
+        laser_controller_comms_emit_tool_status_response(
+            id,
+            &status,
+            address == LASER_CONTROLLER_DAC80502_ADDR ?
+                LASER_CONTROLLER_COMMS_PERIPHERAL_DAC :
+            address == LASER_CONTROLLER_STUSB4500_ADDR ?
+                LASER_CONTROLLER_COMMS_PERIPHERAL_PD :
+            address == LASER_CONTROLLER_DRV2605_ADDR ?
+                LASER_CONTROLLER_COMMS_PERIPHERAL_HAPTIC :
+                LASER_CONTROLLER_COMMS_PERIPHERAL_NONE,
+            false,
+            true,
+            true);
         return;
     }
 
@@ -3618,7 +4567,19 @@ static void laser_controller_comms_handle_command_line(const char *line)
             (unsigned long)reg,
             (unsigned long)(value & 0xFFU));
         (void)laser_controller_app_copy_status(&status);
-        laser_controller_comms_emit_status_response(id, &status);
+        laser_controller_comms_emit_tool_status_response(
+            id,
+            &status,
+            address == LASER_CONTROLLER_DAC80502_ADDR ?
+                LASER_CONTROLLER_COMMS_PERIPHERAL_DAC :
+            address == LASER_CONTROLLER_STUSB4500_ADDR ?
+                LASER_CONTROLLER_COMMS_PERIPHERAL_PD :
+            address == LASER_CONTROLLER_DRV2605_ADDR ?
+                LASER_CONTROLLER_COMMS_PERIPHERAL_HAPTIC :
+                LASER_CONTROLLER_COMMS_PERIPHERAL_NONE,
+            false,
+            true,
+            true);
         return;
     }
 
@@ -3643,7 +4604,13 @@ static void laser_controller_comms_handle_command_line(const char *line)
             text_arg,
             (unsigned long)reg);
         (void)laser_controller_app_copy_status(&status);
-        laser_controller_comms_emit_status_response(id, &status);
+        laser_controller_comms_emit_tool_status_response(
+            id,
+            &status,
+            LASER_CONTROLLER_COMMS_PERIPHERAL_IMU,
+            false,
+            true,
+            true);
         return;
     }
 
@@ -3671,7 +4638,13 @@ static void laser_controller_comms_handle_command_line(const char *line)
             (unsigned long)reg,
             (unsigned long)(value & 0xFFU));
         (void)laser_controller_app_copy_status(&status);
-        laser_controller_comms_emit_status_response(id, &status);
+        laser_controller_comms_emit_tool_status_response(
+            id,
+            &status,
+            LASER_CONTROLLER_COMMS_PERIPHERAL_IMU,
+            false,
+            true,
+            true);
         return;
     }
 
@@ -3710,7 +4683,12 @@ static void laser_controller_comms_command_task(void *argument)
 
     for (;;) {
         if (xQueueReceive(s_command_queue, &item, portMAX_DELAY) == pdTRUE) {
+            s_command_in_flight = true;
             laser_controller_comms_handle_command_line(item.line);
+            s_command_in_flight = false;
+            s_wireless_telemetry_quiet_until_ms =
+                laser_controller_board_uptime_ms() +
+                LASER_CONTROLLER_COMMS_WIRELESS_POST_COMMAND_QUIET_MS;
         }
     }
 }
@@ -3730,18 +4708,23 @@ static void laser_controller_comms_tx_task(void *argument)
 
         if (laser_controller_app_copy_status(&status)) {
             const laser_controller_time_ms_t now_ms = status.uptime_ms;
+            const bool pause_wireless_telemetry =
+                laser_controller_comms_should_pause_wireless_telemetry(now_ms);
             const bool emit_fast_telemetry =
-                last_fast_telemetry_ms == 0U ||
+                !pause_wireless_telemetry &&
+                (last_fast_telemetry_ms == 0U ||
                 (now_ms - last_fast_telemetry_ms) >=
-                    LASER_CONTROLLER_COMMS_FAST_TELEMETRY_PERIOD_MS;
+                    LASER_CONTROLLER_COMMS_FAST_TELEMETRY_PERIOD_MS);
             const bool emit_live_telemetry =
-                last_live_telemetry_ms == 0U ||
+                !pause_wireless_telemetry &&
+                (last_live_telemetry_ms == 0U ||
                 (now_ms - last_live_telemetry_ms) >=
-                    LASER_CONTROLLER_COMMS_LIVE_TELEMETRY_PERIOD_MS;
+                    LASER_CONTROLLER_COMMS_LIVE_TELEMETRY_PERIOD_MS);
             const bool emit_status =
-                last_status_ms == 0U ||
+                !pause_wireless_telemetry &&
+                (last_status_ms == 0U ||
                 (now_ms - last_status_ms) >=
-                    LASER_CONTROLLER_COMMS_STATUS_PERIOD_MS;
+                    LASER_CONTROLLER_COMMS_STATUS_PERIOD_MS);
 
             if (emit_fast_telemetry) {
                 laser_controller_comms_emit_fast_telemetry_event(&status);
@@ -3872,6 +4855,8 @@ void laser_controller_comms_start(void)
             s_command_queue_storage,
             &s_command_queue_buffer);
     }
+
+    (void)setvbuf(stdout, NULL, _IOLBF, 0);
 
 #if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG_ENABLED
     {

@@ -437,14 +437,14 @@ static void laser_controller_service_refresh_modules_locked(void)
         laser_controller_module_status_t *module = &s_service.status.modules[index];
 
         /*
-         * Do not infer runtime detection or health from a planning flag.
-         * "Expected present" only means the operator intends to populate that
-         * module on the current bench build. Until real probe paths exist,
-         * detection and health must stay false rather than pretending hardware
-         * responded.
+         * Planning edits must never erase the last known live module truth.
+         * Expected/debug flags describe operator intent; detected/healthy are
+         * runtime observations that should only change after an actual probe or
+         * live-readback path reports new information.
          */
-        module->detected = false;
-        module->healthy = false;
+        if (!module->detected) {
+            module->healthy = false;
+        }
     }
 }
 

@@ -156,6 +156,39 @@ function isBusCommand(cmd: string): boolean {
   )
 }
 
+function isSlowWirelessCommand(cmd: string): boolean {
+  return (
+    cmd === 'get_status' ||
+    cmd === 'get_bringup_profile' ||
+    cmd === 'set_runtime_safety' ||
+    cmd.includes('service_mode') ||
+    cmd.startsWith('set_supply_') ||
+    cmd.startsWith('set_haptic_') ||
+    cmd.startsWith('set_gpio_') ||
+    cmd === 'clear_gpio_overrides' ||
+    isBusCommand(cmd) ||
+    cmd.includes('haptic') ||
+    cmd.includes('dac') ||
+    cmd.includes('pd') ||
+    cmd.includes('imu') ||
+    cmd.includes('tof')
+  )
+}
+
+function effectiveCommandAckTimeoutMs(
+  cmd: string,
+  timeoutMs: number,
+  transportKind: TransportKind,
+): number {
+  if (transportKind !== 'wifi' || cmd === 'ping') {
+    return timeoutMs
+  }
+
+  return isSlowWirelessCommand(cmd)
+    ? Math.max(timeoutMs, 6500)
+    : Math.max(timeoutMs, 4500)
+}
+
 function deriveSnapshotEvents(
   previous: DeviceSnapshot,
   next: DeviceSnapshot,
@@ -327,10 +360,21 @@ function makeSeedSnapshot(): DeviceSnapshot {
     },
     wireless: {
       started: false,
+      mode: 'softap',
       apReady: false,
+      stationConfigured: false,
+      stationConnecting: false,
+      stationConnected: false,
       clientCount: 0,
       ssid: 'BSL-HTLS-Bench',
+      stationSsid: '',
+      stationRssiDbm: 0,
+      stationChannel: 0,
+      scanInProgress: false,
+      scannedNetworks: [],
+      ipAddress: '192.168.4.1',
       wsUrl: DEFAULT_WIFI_WS_URL,
+      lastError: '',
     },
     pd: {
       contractValid: false,
@@ -583,6 +627,9 @@ export function useDeviceSession() {
   const [serialReconnectEnabled, setSerialReconnectEnabled] = useState<boolean>(() =>
     readStoredSerialReconnect() || readStoredTransportKind() === 'serial',
   )
+  const [wifiReconnectEnabled, setWifiReconnectEnabled] = useState<boolean>(
+    () => readStoredTransportKind() === 'wifi',
+  )
 
   const commandCounterRef = useRef(1)
   const transportRef = useRef<DeviceTransport | null>(null)
@@ -786,6 +833,10 @@ export function useDeviceSession() {
       transportStatusRef.current !== 'connected' &&
       transportStatusRef.current !== 'connecting'
     ) {
+      return
+    }
+
+    if (pendingAcksRef.current.size > 0) {
       return
     }
 
@@ -1061,6 +1112,7 @@ export function useDeviceSession() {
       writeStoredSerialReconnect(true)
     } else if (transportKind === 'wifi') {
       wifiManualDisconnectRef.current = false
+      setWifiReconnectEnabled(true)
     }
 
     lastInboundMessageAtRef.current = Date.now()
@@ -1089,7 +1141,11 @@ export function useDeviceSession() {
   }, [connect, transportKind, transportStatus])
 
   useEffect(() => {
-    if (transportKind !== 'wifi' || wifiManualDisconnectRef.current) {
+    if (
+      transportKind !== 'wifi' ||
+      !wifiReconnectEnabled ||
+      wifiManualDisconnectRef.current
+    ) {
       return
     }
 
@@ -1110,7 +1166,7 @@ export function useDeviceSession() {
     return () => {
       window.clearTimeout(timerId)
     }
-  }, [connect, firmwareProgress, transportKind, transportStatus, wifiUrl])
+  }, [connect, firmwareProgress, transportKind, transportStatus, wifiReconnectEnabled, wifiUrl])
 
   useEffect(() => {
     writeStoredTransportKind(transportKind)
@@ -1140,6 +1196,10 @@ export function useDeviceSession() {
     const intervalId = window.setInterval(() => {
       const now = Date.now()
       const probe = livenessProbeRef.current
+
+      if (pendingAcksRef.current.size > 0) {
+        return
+      }
 
       if (probe !== null) {
         if (lastInboundMessageAtRef.current > probe.sentAt) {
@@ -1235,6 +1295,7 @@ export function useDeviceSession() {
       writeStoredSerialReconnect(false)
     } else if (transportKind === 'wifi') {
       wifiManualDisconnectRef.current = true
+      setWifiReconnectEnabled(false)
     }
 
     if (transportStatus === 'disconnected') {
@@ -1291,6 +1352,7 @@ export function useDeviceSession() {
       serialManualDisconnectRef.current = false
       wifiManualDisconnectRef.current = false
       setSerialReconnectEnabled(nextKind === 'serial')
+      setWifiReconnectEnabled(nextKind === 'wifi')
       setSerialReconnectCycle(0)
       setTransportKindState(nextKind)
     },
@@ -1379,7 +1441,11 @@ export function useDeviceSession() {
       },
     ): Promise<CommandAckResult> => {
       const logHistory = options?.logHistory ?? true
-      const timeoutMs = options?.timeoutMs ?? COMMAND_ACK_TIMEOUT_MS
+      const timeoutMs = effectiveCommandAckTimeoutMs(
+        cmd,
+        options?.timeoutMs ?? COMMAND_ACK_TIMEOUT_MS,
+        transportKind,
+      )
       const command: CommandEnvelope = {
         id: commandCounterRef.current++,
         type: 'cmd',
@@ -1542,13 +1608,20 @@ export function useDeviceSession() {
           source: 'host',
         })
 
+        if (
+          (transportKind === 'serial' || transportKind === 'wifi') &&
+          message.toLowerCase().includes('not connected')
+        ) {
+          markTransportUnhealthy(message, 'transport')
+        }
+
         return {
           ok: false,
           note: message,
         }
       }
     },
-    [appendEvent, issueLinkLivenessProbe, transportKind, waitForCommandAck],
+    [appendEvent, issueLinkLivenessProbe, markTransportUnhealthy, transportKind, waitForCommandAck],
   )
 
   const beginFirmwareTransfer = useCallback(

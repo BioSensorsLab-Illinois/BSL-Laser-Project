@@ -18,6 +18,102 @@ type RawProtocolMessage = {
   detail?: string
 }
 
+function asNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+function hasBit(value: number, bit: number): boolean {
+  return ((value >> bit) & 0x1) === 0x1
+}
+
+function decodeFastTelemetryPayload(payload: unknown): RealtimeTelemetryPatch {
+  if (
+    typeof payload !== 'object' ||
+    payload === null ||
+    !('v' in payload) ||
+    !('m' in payload)
+  ) {
+    return payload as RealtimeTelemetryPatch
+  }
+
+  const version = asNumber((payload as { v?: unknown }).v)
+  const metrics = (payload as { m?: unknown }).m
+
+  if (version !== 1 || !Array.isArray(metrics) || metrics.length < 17) {
+    return payload as RealtimeTelemetryPatch
+  }
+
+  const values = metrics.map((entry) => asNumber(entry))
+
+  if (values.some((entry) => entry === null)) {
+    return payload as RealtimeTelemetryPatch
+  }
+
+  const [
+    imuFlags,
+    pitchCenti,
+    rollCenti,
+    yawCenti,
+    pitchLimitCenti,
+    tofFlags,
+    distanceMm,
+    laserFlags,
+    measuredCurrentMa,
+    driverTempCenti,
+    tecFlags,
+    tecTempCenti,
+    tecTempAdcMv,
+    tecCurrentCentiA,
+    tecVoltageCentiV,
+    safetyFlags,
+    buttonFlags,
+  ] = values as number[]
+
+  return {
+    imu: {
+      valid: hasBit(imuFlags, 0),
+      fresh: hasBit(imuFlags, 1),
+      beamYawRelative: hasBit(imuFlags, 2),
+      beamPitchDeg: pitchCenti / 100,
+      beamRollDeg: rollCenti / 100,
+      beamYawDeg: yawCenti / 100,
+      beamPitchLimitDeg: pitchLimitCenti / 100,
+    },
+    tof: {
+      valid: hasBit(tofFlags, 0),
+      fresh: hasBit(tofFlags, 1),
+      distanceM: distanceMm / 1000,
+    },
+    laser: {
+      alignmentEnabled: hasBit(laserFlags, 0),
+      nirEnabled: hasBit(laserFlags, 1),
+      driverStandby: hasBit(laserFlags, 2),
+      loopGood: hasBit(laserFlags, 3),
+      measuredCurrentA: measuredCurrentMa / 1000,
+      driverTempC: driverTempCenti / 100,
+    },
+    tec: {
+      tempGood: hasBit(tecFlags, 0),
+      tempC: tecTempCenti / 100,
+      tempAdcVoltageV: tecTempAdcMv / 1000,
+      currentA: tecCurrentCentiA / 100,
+      voltageV: tecVoltageCentiV / 100,
+    },
+    safety: {
+      allowAlignment: hasBit(safetyFlags, 0),
+      allowNir: hasBit(safetyFlags, 1),
+      horizonBlocked: hasBit(safetyFlags, 2),
+      distanceBlocked: hasBit(safetyFlags, 3),
+      lambdaDriftBlocked: hasBit(safetyFlags, 4),
+      tecTempAdcBlocked: hasBit(safetyFlags, 5),
+    },
+    buttons: {
+      stage1Pressed: hasBit(buttonFlags, 0),
+      stage2Pressed: hasBit(buttonFlags, 1),
+    },
+  }
+}
+
 function nowIso(): string {
   return new Date().toISOString()
 }
@@ -164,7 +260,10 @@ export function interpretControllerLine(
     context.onProtocolReady?.()
     context.emit({
       kind: 'telemetry',
-      telemetry: parsed.payload as unknown as RealtimeTelemetryPatch,
+      telemetry:
+        parsed.event === 'fast_telemetry'
+          ? decodeFastTelemetryPayload(parsed.payload)
+          : (parsed.payload as unknown as RealtimeTelemetryPatch),
     })
     return
   }

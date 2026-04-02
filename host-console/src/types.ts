@@ -26,8 +26,16 @@ export type EventSource = 'firmware' | 'host' | 'derived'
 export type EventBus = 'i2c' | 'spi'
 
 export type TransportKind = 'mock' | 'serial' | 'wifi'
+export type WirelessMode = 'softap' | 'station'
 
 export type TransportStatus = 'disconnected' | 'connecting' | 'connected' | 'error'
+
+export interface WirelessScanNetwork {
+  ssid: string
+  rssiDbm: number
+  channel: number
+  secure: boolean
+}
 
 export type CommandRisk = 'read' | 'write' | 'service' | 'firmware'
 export type BenchTargetMode = 'temp' | 'lambda'
@@ -73,10 +81,21 @@ export interface PdStatus {
 
 export interface WirelessStatus {
   started: boolean
+  mode: WirelessMode
   apReady: boolean
+  stationConfigured: boolean
+  stationConnecting: boolean
+  stationConnected: boolean
   clientCount: number
   ssid: string
+  stationSsid: string
+  stationRssiDbm: number
+  stationChannel: number
+  scanInProgress: boolean
+  scannedNetworks: WirelessScanNetwork[]
+  ipAddress: string
   wsUrl: string
+  lastError: string
 }
 
 export interface ImuStatus {

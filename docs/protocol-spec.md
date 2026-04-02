@@ -101,6 +101,8 @@ Required fields:
 | `set_profile_name` | rename the active bring-up profile | safe bring-up metadata; does not require service mode |
 | `set_module_state` | declare whether a module is expected present and debug-enabled | safe bring-up metadata; does not require service mode |
 | `save_bringup_profile` | request device-side persistence of the bring-up profile | safe bring-up metadata write; may be unavailable in early firmware |
+| `scan_wireless_networks` | ask the controller to scan nearby Wi-Fi SSIDs for station-mode setup | read-only transport diagnostic; may briefly pause station reconnect attempts while the scan runs |
+| `configure_wireless` | switch the controller between bench SoftAP and existing-Wi-Fi station mode | transport-management write; may intentionally drop the current wireless socket while the controller changes networks |
 | `set_supply_enable` | request the LD or TEC MPM3530 VIN rail on/off during service bring-up | service-only; beam outputs stay forced safe |
 | `refresh_pd_status` | force an immediate STUSB4500 contract/PDO refresh | read-only diagnostic; does not require service mode |
 | `dac_debug_set` | stage DAC channel shadow voltages for bench validation | service-only; actuator shadow, not direct beam authority |
@@ -126,6 +128,10 @@ Current bring-up-specific behavior:
 
 - `enter_service_mode` updates `serviceModeRequested` immediately and `serviceModeActive` on the next control-cycle/state-machine pass.
 - `set_profile_name`, `set_module_state`, and `save_bringup_profile` are intentionally allowed outside service mode so the bench plan can be saved without opening a write session.
+- `scan_wireless_networks` is intentionally allowed outside service mode so the operator can discover nearby SSIDs before switching the controller into station mode.
+- `scan_wireless_networks` may temporarily pause station reconnect attempts during the scan, then resume them automatically after results are captured.
+- `configure_wireless` is intentionally allowed outside service mode so an operator can move the controller between bench SoftAP and an existing Wi-Fi network without opening a hazardous write session.
+- `configure_wireless` accepts `mode:"softap"` or `mode:"station"`. In station mode the host may also provide `ssid` and `password`; if the password is omitted, the controller reuses the saved credential.
 - `i2c_scan`, `i2c_read`, `spi_read`, and `refresh_pd_status` are intentionally allowed outside service mode because they are read-only probes.
 - `set_supply_enable` is intentionally separate from beam-control commands. In `SERVICE_MODE`, it only requests the LD or TEC MPM3530 VIN rail while alignment stays off and the laser driver stays in standby.
 - `set_haptic_enable` is intentionally separate from `haptic_debug_config`. It directly controls the dedicated ERM enable line on `GPIO48` during service bring-up so the operator can prove the motor power path independently from DRV2605 register writes.
@@ -158,10 +164,24 @@ Current bring-up-specific behavior:
   },
   "wireless": {
     "started": true,
+    "mode": "station",
     "apReady": true,
+    "stationConfigured": true,
+    "stationConnecting": false,
+    "stationConnected": true,
     "clientCount": 1,
-    "ssid": "BSL-HTLS-Bench",
-    "wsUrl": "ws://192.168.4.1/ws"
+    "ssid": "LabNet-5G",
+    "stationSsid": "LabNet-5G",
+    "stationRssiDbm": -54,
+    "stationChannel": 149,
+    "scanInProgress": false,
+    "scannedNetworks": [
+      { "ssid": "LabNet-5G", "rssiDbm": -54, "channel": 149, "secure": true },
+      { "ssid": "LabNet-Guest", "rssiDbm": -70, "channel": 11, "secure": false }
+    ],
+    "ipAddress": "192.168.1.42",
+    "wsUrl": "ws://192.168.1.42/ws",
+    "lastError": ""
   },
   "pd": {
     "contractValid": true,

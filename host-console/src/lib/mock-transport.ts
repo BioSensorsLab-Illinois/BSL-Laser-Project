@@ -60,6 +60,7 @@ type MockState = {
   safety: DeviceSnapshot['safety']
   bringup: DeviceSnapshot['bringup']
   gpioInspector: DeviceSnapshot['gpioInspector']
+  wireless: DeviceSnapshot['wireless']
 }
 
 const MOCK_TICK_MS = 100
@@ -258,6 +259,24 @@ export class MockTransport implements DeviceTransport {
     },
     bringup: makeDefaultBringupStatus(),
     gpioInspector: makeDefaultGpioInspectorStatus(),
+    wireless: {
+      started: false,
+      mode: 'softap',
+      apReady: false,
+      stationConfigured: false,
+      stationConnecting: false,
+      stationConnected: false,
+      clientCount: 0,
+      ssid: 'BSL-HTLS-Bench',
+      stationSsid: '',
+      stationRssiDbm: 0,
+      stationChannel: 0,
+      scanInProgress: false,
+      scannedNetworks: [],
+      ipAddress: '192.168.4.1',
+      wsUrl: 'ws://192.168.4.1/ws',
+      lastError: '',
+    },
   }
 
   subscribe(listener: (message: TransportMessage) => void): () => void {
@@ -328,6 +347,67 @@ export class MockTransport implements DeviceTransport {
     switch (command.cmd) {
       case 'get_status':
       case 'get_faults':
+        break
+      case 'configure_wireless':
+        if (command.args?.mode === 'station') {
+          const nextStationSsid =
+            typeof command.args?.ssid === 'string' && command.args.ssid.trim().length > 0
+              ? command.args.ssid.trim()
+              : this.state.wireless.stationSsid
+
+          if (nextStationSsid.length > 0) {
+            this.state.wireless = {
+              ...this.state.wireless,
+              started: true,
+              mode: 'station',
+              apReady: false,
+              stationConfigured: true,
+              stationConnecting: false,
+              stationConnected: true,
+              ssid: nextStationSsid,
+              stationSsid: nextStationSsid,
+              stationRssiDbm: -54,
+              stationChannel: 149,
+              scanInProgress: false,
+              ipAddress: '192.168.1.77',
+              wsUrl: 'ws://192.168.1.77/ws',
+              lastError: '',
+            }
+          } else {
+            this.state.wireless = {
+              ...this.state.wireless,
+              lastError: 'Station mode needs an SSID.',
+            }
+          }
+        } else {
+          this.state.wireless = {
+            ...this.state.wireless,
+            started: true,
+            mode: 'softap',
+            apReady: true,
+            stationConnecting: false,
+            stationConnected: false,
+            ssid: 'BSL-HTLS-Bench',
+            stationRssiDbm: 0,
+            stationChannel: 6,
+            scanInProgress: false,
+            ipAddress: '192.168.4.1',
+            wsUrl: 'ws://192.168.4.1/ws',
+            lastError: '',
+          }
+        }
+        break
+      case 'scan_wireless_networks':
+        this.state.wireless = {
+          ...this.state.wireless,
+          scanInProgress: false,
+          scannedNetworks: [
+            { ssid: 'LabNet-5G', rssiDbm: -48, channel: 149, secure: true },
+            { ssid: 'BioSensors-2G', rssiDbm: -61, channel: 11, secure: true },
+            { ssid: 'Microscope-Guest', rssiDbm: -73, channel: 1, secure: false },
+          ],
+          lastError: '',
+        }
         break
       case 'clear_faults':
         this.state.activeFault = 'none'
@@ -1385,11 +1465,7 @@ export class MockTransport implements DeviceTransport {
         connectedAtIso: new Date(Date.now() - this.state.uptimeSeconds * 1000).toISOString(),
       },
       wireless: {
-        started: false,
-        apReady: false,
-        clientCount: 0,
-        ssid: 'BSL-HTLS-Bench',
-        wsUrl: 'ws://192.168.4.1/ws',
+        ...this.state.wireless,
       },
       pd: {
         contractValid: this.state.powerTier !== 'unknown',
