@@ -39,6 +39,12 @@ typedef struct {
     float current_a;
 } laser_controller_service_pd_profile_t;
 
+typedef struct {
+    bool service_mode_requested;
+    float dac_ld_channel_v;
+    float dac_tec_channel_v;
+} laser_controller_service_dac_runtime_t;
+
 typedef enum {
     LASER_CONTROLLER_SERVICE_SUPPLY_LD = 0,
     LASER_CONTROLLER_SERVICE_SUPPLY_TEC,
@@ -85,6 +91,39 @@ typedef struct {
 } laser_controller_service_gpio_override_t;
 
 typedef struct {
+    laser_controller_service_dac_reference_t reference;
+    bool gain_2x;
+    bool ref_div;
+    laser_controller_service_dac_sync_t sync_mode;
+} laser_controller_service_dac_config_t;
+
+typedef struct {
+    uint32_t odr_hz;
+    uint32_t accel_range_g;
+    uint32_t gyro_range_dps;
+    bool gyro_enabled;
+    bool lpf2_enabled;
+    bool timestamp_enabled;
+    bool bdu_enabled;
+    bool if_inc_enabled;
+    bool i2c_disabled;
+} laser_controller_service_imu_config_t;
+
+typedef struct {
+    uint32_t effect_id;
+    laser_controller_service_haptic_mode_t mode;
+    uint32_t library;
+    laser_controller_service_haptic_actuator_t actuator;
+    uint32_t rtp_level;
+} laser_controller_service_haptic_config_t;
+
+typedef struct {
+    bool enabled;
+    uint32_t duty_cycle_pct;
+    uint32_t frequency_hz;
+} laser_controller_service_tof_illumination_t;
+
+typedef struct {
     bool service_mode_requested;
     bool persistence_dirty;
     bool persistence_available;
@@ -116,6 +155,9 @@ typedef struct {
     float tof_min_range_m;
     float tof_max_range_m;
     uint32_t tof_stale_timeout_ms;
+    bool tof_illumination_enabled;
+    uint32_t tof_illumination_duty_cycle_pct;
+    uint32_t tof_illumination_frequency_hz;
     laser_controller_service_pd_profile_t
         pd_profiles[LASER_CONTROLLER_SERVICE_PD_PROFILE_COUNT];
     float pd_programming_only_max_w;
@@ -139,6 +181,16 @@ void laser_controller_service_copy_status(laser_controller_service_status_t *sta
 bool laser_controller_service_mode_requested(void);
 bool laser_controller_service_module_expected(laser_controller_module_t module);
 bool laser_controller_service_module_write_enabled(laser_controller_module_t module);
+void laser_controller_service_get_dac_runtime(
+    laser_controller_service_dac_runtime_t *runtime);
+void laser_controller_service_get_dac_config(
+    laser_controller_service_dac_config_t *config);
+void laser_controller_service_get_imu_config(
+    laser_controller_service_imu_config_t *config);
+void laser_controller_service_get_haptic_config(
+    laser_controller_service_haptic_config_t *config);
+void laser_controller_service_get_tof_illumination_config(
+    laser_controller_service_tof_illumination_t *config);
 void laser_controller_service_report_module_probe(
     laser_controller_module_t module,
     bool detected,
@@ -164,6 +216,10 @@ bool laser_controller_service_set_supply_enable(
 void laser_controller_service_set_haptic_driver_enable(
     bool enabled,
     laser_controller_time_ms_t now_ms);
+void laser_controller_service_get_service_output_requests(
+    bool *ld_rail_enabled,
+    bool *tec_rail_enabled,
+    bool *haptic_driver_enabled);
 void laser_controller_service_mark_runtime_status(
     const char *message,
     laser_controller_time_ms_t now_ms);
@@ -193,6 +249,11 @@ void laser_controller_service_set_tof_config(
     float max_range_m,
     uint32_t stale_timeout_ms,
     laser_controller_time_ms_t now_ms);
+esp_err_t laser_controller_service_set_tof_illumination(
+    bool enabled,
+    uint32_t duty_cycle_pct,
+    uint32_t frequency_hz,
+    laser_controller_time_ms_t now_ms);
 esp_err_t laser_controller_service_set_pd_config(
     const laser_controller_power_policy_t *power_policy,
     const laser_controller_service_pd_profile_t *profiles,
@@ -220,6 +281,12 @@ void laser_controller_service_set_haptic_config(
     uint32_t rtp_level,
     laser_controller_time_ms_t now_ms);
 void laser_controller_service_fire_haptic_test(laser_controller_time_ms_t now_ms);
+esp_err_t laser_controller_service_fire_haptic_trigger_pattern(
+    uint32_t pulse_count,
+    uint32_t high_ms,
+    uint32_t low_ms,
+    bool release_after,
+    laser_controller_time_ms_t now_ms);
 bool laser_controller_service_set_gpio_override(
     uint32_t gpio_num,
     laser_controller_service_gpio_mode_t mode,

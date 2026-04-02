@@ -107,8 +107,10 @@ Required fields:
 | `dac_debug_config` | stage DAC reference, gain, divider, and update policy | service-only; safe shadow/config only |
 | `imu_debug_config` | tune IMU ODR, full-scale, and runtime interface flags during bring-up | service-only |
 | `tof_debug_config` | tune ToF thresholds and stale-data timeout during bring-up | service-only |
+| `tof_illumination_set` | drive the front visible illumination path on `GPIO6` with service PWM | service-only; transient bring-up aid, never persisted |
 | `haptic_debug_config` | stage DRV2605 mode, library, actuator, RTP level, and effect selection | service-only |
 | `set_haptic_enable` | assert or clear the dedicated ERM driver enable pin on `GPIO48` | service-only; direct bench GPIO control for the motor path |
+| `haptic_external_trigger_pattern` | fire a bounded external-trigger burst on shared `IO37 / GN_LD_EN` for ERM validation | service-only; hazardous shared net, requires explicit bench safeguards |
 | `haptic_debug_fire` | fire a service-mode haptic pattern | service-only |
 | `set_gpio_override` | force a selected ESP32 pad into firmware/input/output service ownership with optional pull and drive level | service-only; hazardous on USB, boot, and debug pins |
 | `clear_gpio_overrides` | clear every GPIO override and return ownership to the original firmware logic | service-only; global recovery path for the GPIO inspector |
@@ -127,6 +129,8 @@ Current bring-up-specific behavior:
 - `i2c_scan`, `i2c_read`, `spi_read`, and `refresh_pd_status` are intentionally allowed outside service mode because they are read-only probes.
 - `set_supply_enable` is intentionally separate from beam-control commands. In `SERVICE_MODE`, it only requests the LD or TEC MPM3530 VIN rail while alignment stays off and the laser driver stays in standby.
 - `set_haptic_enable` is intentionally separate from `haptic_debug_config`. It directly controls the dedicated ERM enable line on `GPIO48` during service bring-up so the operator can prove the motor power path independently from DRV2605 register writes.
+- `haptic_external_trigger_pattern` is intentionally hazardous and transient. It is only for bench validation of DRV2605 external-trigger modes and must never hide the fact that `IO37` is a shared `ERM_TRIG / GN_LD_EN` net.
+- `tof_illumination_set` is intentionally transient. It drives the TPS61169 `CTRL` pin on `GPIO6` with a service-only PWM dimming signal and must drop low again when service mode closes, the ToF write gate closes, or the host explicitly disables it.
 - `set_gpio_override` is intentionally separate from all module tools. It is the service-owned escape hatch for direct ESP32 pad control during controlled bench work.
 - `clear_gpio_overrides` is the required reset path for the GPIO inspector. It must clear every override, rebuild the board GPIO state, and return ownership to the original firmware logic.
 - `i2c_scan` now reports raw shared-bus line levels in failure text when the bus is unavailable, for example `Shared I2C unavailable (ESP_ERR_TIMEOUT, SDA=0, SCL=1).`
@@ -206,22 +210,7 @@ Current bring-up-specific behavior:
     "anyOverrideActive": true,
     "activeOverrideCount": 1,
     "pins": [
-      {
-        "gpioNum": 48,
-        "modulePin": 25,
-        "outputCapable": true,
-        "inputEnabled": false,
-        "outputEnabled": true,
-        "openDrainEnabled": false,
-        "pullupEnabled": false,
-        "pulldownEnabled": false,
-        "levelHigh": true,
-        "overrideActive": true,
-        "overrideMode": "output",
-        "overrideLevelHigh": true,
-        "overridePullupEnabled": false,
-        "overridePulldownEnabled": false
-      }
+      [48, 197, 6]
     ]
   },
   "bench": {
@@ -274,9 +263,16 @@ Current bring-up-specific behavior:
       "ldRequested": false,
       "tecRequested": true
     },
+    "illumination": {
+      "tof": {
+        "enabled": true,
+        "dutyCyclePct": 35,
+        "frequencyHz": 5000
+      }
+    },
     "modules": {
       "imu": { "expectedPresent": true, "debugEnabled": true, "detected": true, "healthy": true },
-      "tof": { "expectedPresent": false, "debugEnabled": false, "detected": false, "healthy": false }
+      "tof": { "expectedPresent": true, "debugEnabled": true, "detected": true, "healthy": true }
     },
     "tuning": {
       "dacLdChannelV": 0.0,
@@ -326,10 +322,67 @@ Current bring-up-specific behavior:
 }
 ```
 
+## Periodic Telemetry Events
+
+The bench image now uses two async telemetry tiers:
+
+- `live_telemetry`: the lightweight high-rate stream for UI motion and fast numeric readback. It carries the current `session`, `pd`, `rails`, `imu`, `tof`, `laser`, `tec`, `safety`, `buttons`, compact `bringup` service state, and `fault`.
+- `status_snapshot`: the slower richer snapshot for periodic reconciliation. It still carries identity, GPIO inspector state, haptic peripheral readback, and the compact bring-up status block.
+
+Representative `live_telemetry` event:
+
+```json
+{
+  "type": "event",
+  "event": "live_telemetry",
+  "timestamp_ms": 123456,
+  "detail": "High-rate controller telemetry.",
+  "payload": {
+    "session": { "uptimeSeconds": 123, "state": "SERVICE_MODE", "powerTier": "full" },
+    "imu": {
+      "valid": true,
+      "fresh": true,
+      "beamPitchDeg": -12.5,
+      "beamRollDeg": 3.4,
+      "beamYawDeg": 18.9,
+      "beamYawRelative": true,
+      "beamPitchLimitDeg": 0.0
+    },
+    "tof": { "valid": true, "fresh": true, "distanceM": 0.42, "minRangeM": 0.2, "maxRangeM": 1.0 },
+    "laser": { "alignmentEnabled": false, "nirEnabled": false, "driverStandby": true, "measuredCurrentA": 0.0, "commandedCurrentA": 0.0, "loopGood": true, "driverTempC": 29.4 },
+    "tec": { "targetTempC": 25.0, "targetLambdaNm": 785.0, "actualLambdaNm": 784.7, "tempGood": false, "tempC": 24.8, "tempAdcVoltageV": 1.115, "currentA": 0.3, "voltageV": 2.1, "settlingSecondsRemaining": 1 },
+    "buttons": { "stage1Pressed": false, "stage2Pressed": false, "stage1Edge": false, "stage2Edge": false },
+    "bringup": {
+      "serviceModeRequested": true,
+      "serviceModeActive": true,
+      "illumination": {
+        "tof": { "enabled": true, "dutyCyclePct": 35, "frequencyHz": 5000 }
+      }
+    },
+    "fault": { "latched": false, "activeCode": "none", "activeCount": 0, "tripCounter": 0 }
+  }
+}
+```
+
 `gpioInspector` is live SoC pad truth from the board layer:
 
-- `inputEnabled`, `outputEnabled`, `openDrainEnabled`, `pullupEnabled`, `pulldownEnabled`, and `levelHigh` are actual controller readback.
-- `overrideActive`, `overrideMode`, and the `override*` fields describe only the service override path.
+- `pins` is now compact on the wire: each entry is `[gpioNum, liveFlags, overrideFlags]`.
+- `liveFlags` bit layout is:
+  - bit 0: `outputCapable`
+  - bit 1: `inputEnabled`
+  - bit 2: `outputEnabled`
+  - bit 3: `openDrainEnabled`
+  - bit 4: `pullupEnabled`
+  - bit 5: `pulldownEnabled`
+  - bit 6: `levelHigh`
+  - bit 7: `overrideActive`
+- `overrideFlags` bit layout is:
+  - bits 0-1: `overrideMode` (`0 = firmware`, `1 = input`, `2 = output`)
+  - bit 2: `overrideLevelHigh`
+  - bit 3: `overridePullupEnabled`
+  - bit 4: `overridePulldownEnabled`
+- `inputEnabled`, `outputEnabled`, `openDrainEnabled`, `pullupEnabled`, `pulldownEnabled`, and `levelHigh` remain actual controller readback after the host expands the compact tuple.
+- `overrideActive`, `overrideMode`, and the `override*` fields still describe only the service override path.
 - Host UI should always distinguish live readback from staged override draft values.
 
 Wireless transport notes:
@@ -379,6 +432,11 @@ Wireless transport notes:
   - `min_range_m`
   - `max_range_m`
   - `stale_timeout_ms`
+- `tof_illumination_set` currently mirrors:
+  - `enabled`
+  - `duty_cycle_pct`
+  - `frequency_hz`
+  - This command is transient service state only; it does not change the saved bring-up profile.
 - `set_runtime_safety` currently mirrors:
   - `horizon_threshold_deg`
   - `horizon_hysteresis_deg`

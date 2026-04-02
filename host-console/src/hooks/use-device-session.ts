@@ -2,8 +2,24 @@ import { useCallback, useEffect, useEffectEvent, useMemo, useRef, useState } fro
 
 import { makeDefaultBringupStatus } from '../lib/bringup'
 import { makeDefaultGpioInspectorStatus } from '../lib/gpio-layout'
+import { mergeGpioInspector } from '../lib/gpio-inspector'
 import { makeDefaultBenchControlStatus } from '../lib/bench-model'
 import { annotateSessionEvent } from '../lib/event-decode'
+import { createRealtimeTelemetryStore } from '../lib/live-telemetry'
+import {
+  downloadSessionArchive,
+  makeSessionArchivePayload,
+} from '../lib/session-archive'
+import {
+  clearSessionAutosaveHandle,
+  describeSessionAutosaveError,
+  ensureSessionAutosavePermission,
+  loadSessionAutosaveHandle,
+  pickSessionAutosaveHandle,
+  saveSessionAutosaveHandle,
+  supportsSessionAutosave,
+  writeSessionAutosaveFile,
+} from '../lib/session-autosave'
 import { MockTransport } from '../lib/mock-transport'
 import { WebSerialTransport } from '../lib/web-serial-transport'
 import { WebSocketTransport } from '../lib/websocket-transport'
@@ -15,6 +31,8 @@ import type {
   DeviceTransport,
   FirmwarePackageDescriptor,
   FirmwareTransferProgress,
+  SessionArchivePayload,
+  SessionAutosaveStatus,
   SessionEvent,
   TransportKind,
   TransportMessage,
@@ -26,6 +44,14 @@ const HOST_SERIAL_RECONNECT_STORAGE_KEY = 'bsl-host-serial-reconnect'
 const HOST_WIFI_URL_STORAGE_KEY = 'bsl-host-wifi-url'
 const DEFAULT_WIFI_WS_URL = 'ws://192.168.4.1/ws'
 const COMMAND_ACK_TIMEOUT_MS = 2600
+const LINK_IDLE_PROBE_DELAY_MS = 1000
+const LINK_IDLE_PROBE_TIMEOUT_MS = 1000
+const SESSION_AUTOSAVE_FLUSH_MS = 2500
+
+type LinkLivenessProbe = {
+  commandId: number
+  sentAt: number
+}
 
 function makeEventId(suffix: string): string {
   return `${Date.now()}-${Math.random().toString(16).slice(2, 8)}-${suffix}`
@@ -50,6 +76,10 @@ function moduleFromCommand(cmd: string): string {
 
   if (cmd.includes('imu') || cmd === 'spi_read' || cmd === 'spi_write') {
     return 'imu'
+  }
+
+  if (cmd.includes('tof')) {
+    return 'tof'
   }
 
   if (cmd.includes('dac')) {
@@ -105,6 +135,12 @@ function noteFromSnapshotForCommand(
 
   if (cmd === 'clear_gpio_overrides') {
     return 'All GPIO overrides cleared; original firmware logic owns every pin again.'
+  }
+
+  if (cmd === 'tof_illumination_set') {
+    return snapshot.bringup.illumination.tof.enabled
+      ? `Front illumination active on GPIO6 at ${snapshot.bringup.illumination.tof.dutyCyclePct}% duty and ${snapshot.bringup.illumination.tof.frequencyHz} Hz.`
+      : 'Front illumination disabled and GPIO6 returned low.'
   }
 
   return null
@@ -347,6 +383,12 @@ function makeSeedSnapshot(): DeviceSnapshot {
       voltageV: 0,
       settlingSecondsRemaining: 0,
     },
+    buttons: {
+      stage1Pressed: false,
+      stage2Pressed: false,
+      stage1Edge: false,
+      stage2Edge: false,
+    },
     peripherals: {
       dac: {
         reachable: false,
@@ -467,49 +509,50 @@ function mergeSnapshot(
     wireless: { ...current.wireless, ...incoming.wireless },
     pd: { ...current.pd, ...incoming.pd },
     rails: {
-      ld: { ...current.rails.ld, ...incoming.rails.ld },
-      tec: { ...current.rails.tec, ...incoming.rails.tec },
+      ld: { ...current.rails.ld, ...(incoming.rails?.ld ?? {}) },
+      tec: { ...current.rails.tec, ...(incoming.rails?.tec ?? {}) },
     },
     imu: { ...current.imu, ...incoming.imu },
     tof: { ...current.tof, ...incoming.tof },
     laser: { ...current.laser, ...incoming.laser },
     tec: { ...current.tec, ...incoming.tec },
+    buttons: { ...current.buttons, ...(incoming.buttons ?? {}) },
     peripherals: {
-      dac: { ...current.peripherals.dac, ...incoming.peripherals.dac },
-      pd: { ...current.peripherals.pd, ...incoming.peripherals.pd },
-      imu: { ...current.peripherals.imu, ...incoming.peripherals.imu },
-      haptic: { ...current.peripherals.haptic, ...incoming.peripherals.haptic },
-      tof: { ...current.peripherals.tof, ...incoming.peripherals.tof },
+      dac: { ...current.peripherals.dac, ...(incoming.peripherals?.dac ?? {}) },
+      pd: { ...current.peripherals.pd, ...(incoming.peripherals?.pd ?? {}) },
+      imu: { ...current.peripherals.imu, ...(incoming.peripherals?.imu ?? {}) },
+      haptic: { ...current.peripherals.haptic, ...(incoming.peripherals?.haptic ?? {}) },
+      tof: { ...current.peripherals.tof, ...(incoming.peripherals?.tof ?? {}) },
     },
-    gpioInspector: {
-      ...current.gpioInspector,
-      ...incoming.gpioInspector,
-      pins:
-        incoming.gpioInspector?.pins !== undefined &&
-        incoming.gpioInspector.pins.length > 0
-          ? incoming.gpioInspector.pins
-          : current.gpioInspector.pins,
-    },
+    gpioInspector: mergeGpioInspector(current.gpioInspector, incoming.gpioInspector),
     bench: { ...current.bench, ...incoming.bench },
     safety: { ...current.safety, ...incoming.safety },
     bringup: {
       ...current.bringup,
-      ...incoming.bringup,
+      ...(incoming.bringup ?? {}),
       power: {
         ...current.bringup.power,
-        ...incoming.bringup.power,
+        ...(incoming.bringup?.power ?? {}),
+      },
+      illumination: {
+        ...current.bringup.illumination,
+        ...(incoming.bringup?.illumination ?? {}),
+        tof: {
+          ...current.bringup.illumination.tof,
+          ...(incoming.bringup?.illumination?.tof ?? {}),
+        },
       },
       modules: {
         ...current.bringup.modules,
-        ...incoming.bringup.modules,
+        ...(incoming.bringup?.modules ?? {}),
       },
       tuning: {
         ...current.bringup.tuning,
-        ...incoming.bringup.tuning,
+        ...(incoming.bringup?.tuning ?? {}),
       },
       tools: {
         ...current.bringup.tools,
-        ...incoming.bringup.tools,
+        ...(incoming.bringup?.tools ?? {}),
       },
     },
     fault: { ...current.fault, ...incoming.fault },
@@ -528,6 +571,14 @@ export function useDeviceSession() {
   const [events, setEvents] = useState<SessionEvent[]>([])
   const [commands, setCommands] = useState<CommandHistoryEntry[]>([])
   const [firmwareProgress, setFirmwareProgress] = useState<FirmwareTransferProgress | null>(null)
+  const [sessionAutosave, setSessionAutosave] = useState<SessionAutosaveStatus>(() => ({
+    supported: supportsSessionAutosave(),
+    armed: false,
+    fileName: null,
+    saving: false,
+    lastSavedAtIso: null,
+    error: null,
+  }))
   const [serialReconnectCycle, setSerialReconnectCycle] = useState(0)
   const [serialReconnectEnabled, setSerialReconnectEnabled] = useState<boolean>(() =>
     readStoredSerialReconnect() || readStoredTransportKind() === 'serial',
@@ -536,12 +587,36 @@ export function useDeviceSession() {
   const commandCounterRef = useRef(1)
   const transportRef = useRef<DeviceTransport | null>(null)
   const snapshotRef = useRef<DeviceSnapshot>(makeSeedSnapshot())
+  const telemetryStoreRef = useRef<ReturnType<typeof createRealtimeTelemetryStore> | null>(null)
+  if (telemetryStoreRef.current === null) {
+    telemetryStoreRef.current = createRealtimeTelemetryStore(snapshotRef.current)
+  }
+  const transportKindRef = useRef<TransportKind>(transportKind)
+  const transportStatusRef = useRef<TransportStatus>(transportStatus)
+  const eventsRef = useRef<SessionEvent[]>(events)
+  const commandsRef = useRef<CommandHistoryEntry[]>(commands)
+  const firmwareProgressRef = useRef<FirmwareTransferProgress | null>(firmwareProgress)
   const serialReconnectAttemptRef = useRef(false)
   const serialManualDisconnectRef = useRef(false)
   const wifiManualDisconnectRef = useRef(false)
   const protocolReadyRef = useRef(false)
   const flashRecoveryUntilRef = useRef(0)
+  const lastInboundMessageAtRef = useRef(0)
+  const livenessProbeRef = useRef<LinkLivenessProbe | null>(null)
   const pendingAcksRef = useRef(new Map<number, PendingCommandAck>())
+  const sessionAutosaveHandleRef = useRef<FileSystemFileHandle | null>(null)
+  const sessionArchiveRevisionRef = useRef(0)
+  const sessionArchiveRef = useRef<SessionArchivePayload>(
+    makeSessionArchivePayload({
+      transportKind,
+      snapshot: snapshotRef.current,
+      events,
+      commands,
+      firmwareProgress,
+    }),
+  )
+  const autosaveDirtyRef = useRef(false)
+  const autosaveWriteInFlightRef = useRef(false)
 
   const transport = useMemo<DeviceTransport>(() => {
     if (transportKind === 'serial') {
@@ -559,6 +634,92 @@ export function useDeviceSession() {
     setEvents((current) => [annotateSessionEvent(event), ...current].slice(0, 250))
   }, [])
 
+  const rebuildSessionArchive = useCallback(() => {
+    const payload = makeSessionArchivePayload({
+      transportKind: transportKindRef.current,
+      snapshot: snapshotRef.current,
+      events: eventsRef.current,
+      commands: commandsRef.current,
+      firmwareProgress: firmwareProgressRef.current,
+    })
+
+    sessionArchiveRef.current = payload
+    sessionArchiveRevisionRef.current += 1
+    autosaveDirtyRef.current = true
+  }, [])
+
+  const flushSessionAutosave = useCallback(
+    async (interactivePermission = false) => {
+      const handle = sessionAutosaveHandleRef.current
+
+      if (handle === null || !supportsSessionAutosave()) {
+        return
+      }
+
+      if (autosaveWriteInFlightRef.current) {
+        autosaveDirtyRef.current = true
+        return
+      }
+
+      autosaveWriteInFlightRef.current = true
+      const revisionAtStart = sessionArchiveRevisionRef.current
+
+      setSessionAutosave((current) => ({
+        ...current,
+        saving: true,
+        error: null,
+      }))
+
+      try {
+        const permissionGranted = await ensureSessionAutosavePermission(
+          handle,
+          interactivePermission,
+        )
+
+        if (!permissionGranted) {
+          throw new DOMException(
+            'Browser write permission for the autosave file was not granted.',
+            'NotAllowedError',
+          )
+        }
+
+        const payload = makeSessionArchivePayload({
+          transportKind: transportKindRef.current,
+          snapshot: snapshotRef.current,
+          events: eventsRef.current,
+          commands: commandsRef.current,
+          firmwareProgress: firmwareProgressRef.current,
+        })
+        sessionArchiveRef.current = payload
+        await writeSessionAutosaveFile(handle, payload)
+
+        if (sessionArchiveRevisionRef.current === revisionAtStart) {
+          autosaveDirtyRef.current = false
+        }
+
+        setSessionAutosave((current) => ({
+          ...current,
+          armed: true,
+          fileName: handle.name,
+          saving: false,
+          lastSavedAtIso: payload.exportedAtIso,
+          error: null,
+        }))
+      } catch (error) {
+        setSessionAutosave((current) => ({
+          ...current,
+          armed: handle !== null,
+          fileName: handle.name,
+          saving: false,
+          error: describeSessionAutosaveError(error),
+        }))
+      } finally {
+        autosaveWriteInFlightRef.current = false
+      }
+    },
+    [],
+  )
+
   const clearPendingAcks = useCallback((message: string) => {
     for (const [commandId, pending] of pendingAcksRef.current) {
       window.clearTimeout(pending.timeoutId)
@@ -573,11 +734,14 @@ export function useDeviceSession() {
   const resetLiveSnapshot = useCallback(() => {
     const nextSnapshot = makeSeedSnapshot()
     snapshotRef.current = nextSnapshot
+    telemetryStoreRef.current?.reset(nextSnapshot)
     setSnapshot(nextSnapshot)
   }, [])
 
   const markTransportUnhealthy = useCallback(
     (reason: string, module = 'transport') => {
+      livenessProbeRef.current = null
+      transportStatusRef.current = 'error'
       setTransportStatus('error')
       setTransportDetail(reason)
       clearPendingAcks(reason)
@@ -597,6 +761,67 @@ export function useDeviceSession() {
     [appendEvent, clearPendingAcks, resetLiveSnapshot],
   )
 
+  const noteInboundControllerTraffic = useCallback(() => {
+    lastInboundMessageAtRef.current = Date.now()
+    livenessProbeRef.current = null
+
+    if (
+      (transportKindRef.current === 'serial' || transportKindRef.current === 'wifi') &&
+      transportStatusRef.current === 'connecting' &&
+      !protocolReadyRef.current
+    ) {
+      setTransportDetail('Controller port active. Waiting for firmware protocol handshake…')
+    }
+  }, [])
+
+  const issueLinkLivenessProbe = useCallback(async () => {
+    if (
+      transportKindRef.current !== 'serial' &&
+      transportKindRef.current !== 'wifi'
+    ) {
+      return
+    }
+
+    if (
+      transportStatusRef.current !== 'connected' &&
+      transportStatusRef.current !== 'connecting'
+    ) {
+      return
+    }
+
+    if (transportRef.current === null || livenessProbeRef.current !== null) {
+      return
+    }
+
+    const commandId = commandCounterRef.current++
+    livenessProbeRef.current = {
+      commandId,
+      sentAt: Date.now(),
+    }
+
+    try {
+      await transportRef.current.sendCommand({
+        id: commandId,
+        type: 'cmd',
+        cmd: 'ping',
+      })
+
+      if (
+        transportStatusRef.current === 'connecting' &&
+        !protocolReadyRef.current
+      ) {
+        setTransportDetail('Controller went quiet. Sending a protocol checkup…')
+      }
+    } catch (error) {
+      livenessProbeRef.current = null
+      markTransportUnhealthy(
+        error instanceof Error
+          ? error.message
+          : 'The controller liveness probe could not be sent.',
+      )
+    }
+  }, [markTransportUnhealthy])
+
   const handleMessage = useEffectEvent((message: TransportMessage) => {
     if (message.kind === 'transport') {
       if (
@@ -614,7 +839,10 @@ export function useDeviceSession() {
         message.status === 'connected' &&
         (transportKind === 'serial' || transportKind === 'wifi')
       ) {
+        lastInboundMessageAtRef.current = Date.now()
+        livenessProbeRef.current = null
         protocolReadyRef.current = false
+        transportStatusRef.current = 'connecting'
         setTransportStatus('connecting')
         setTransportDetail(
           transportKind === 'serial'
@@ -625,10 +853,13 @@ export function useDeviceSession() {
       }
 
       protocolReadyRef.current = false
+      livenessProbeRef.current = null
+      transportStatusRef.current = message.status
       setTransportStatus(message.status)
       setTransportDetail(message.detail ?? '')
 
       if (message.status === 'disconnected' || message.status === 'error') {
+        lastInboundMessageAtRef.current = 0
         clearPendingAcks(message.detail ?? 'Transport became unavailable.')
         resetLiveSnapshot()
       }
@@ -636,18 +867,21 @@ export function useDeviceSession() {
     }
 
     if (message.kind === 'snapshot') {
+      noteInboundControllerTraffic()
       protocolReadyRef.current = true
       flashRecoveryUntilRef.current = 0
       if (
         (transportKind === 'serial' || transportKind === 'wifi') &&
         transportStatus !== 'connected'
       ) {
+        transportStatusRef.current = 'connected'
         setTransportStatus('connected')
         setTransportDetail('Controller protocol active.')
       }
       const merged = mergeSnapshot(snapshotRef.current, message.snapshot)
       const derivedEvents = deriveSnapshotEvents(snapshotRef.current, merged)
       snapshotRef.current = merged
+      telemetryStoreRef.current?.syncFromSnapshot(merged)
       setSnapshot(merged)
 
       if (derivedEvents.length > 0) {
@@ -656,18 +890,37 @@ export function useDeviceSession() {
       return
     }
 
-    if (message.kind === 'event') {
-      appendEvent(message.event)
-      return
-    }
-
-    if (message.kind === 'commandAck') {
+    if (message.kind === 'telemetry') {
+      noteInboundControllerTraffic()
       protocolReadyRef.current = true
       flashRecoveryUntilRef.current = 0
       if (
         (transportKind === 'serial' || transportKind === 'wifi') &&
         transportStatus !== 'connected'
       ) {
+        transportStatusRef.current = 'connected'
+        setTransportStatus('connected')
+        setTransportDetail('Controller protocol active.')
+      }
+      telemetryStoreRef.current?.publish(message.telemetry)
+      return
+    }
+
+    if (message.kind === 'event') {
+      noteInboundControllerTraffic()
+      appendEvent(message.event)
+      return
+    }
+
+    if (message.kind === 'commandAck') {
+      noteInboundControllerTraffic()
+      protocolReadyRef.current = true
+      flashRecoveryUntilRef.current = 0
+      if (
+        (transportKind === 'serial' || transportKind === 'wifi') &&
+        transportStatus !== 'connected'
+      ) {
+        transportStatusRef.current = 'connected'
         setTransportStatus('connected')
         setTransportDetail('Controller protocol active.')
       }
@@ -696,6 +949,75 @@ export function useDeviceSession() {
       return
     }
   })
+
+  useEffect(() => {
+    transportKindRef.current = transportKind
+    transportStatusRef.current = transportStatus
+    eventsRef.current = events
+    commandsRef.current = commands
+    firmwareProgressRef.current = firmwareProgress
+    rebuildSessionArchive()
+  }, [commands, events, firmwareProgress, rebuildSessionArchive, transportKind, transportStatus])
+
+  useEffect(() => {
+    snapshotRef.current = snapshot
+    rebuildSessionArchive()
+  }, [rebuildSessionArchive, snapshot])
+
+  useEffect(() => {
+    if (!supportsSessionAutosave()) {
+      return
+    }
+
+    let cancelled = false
+
+    void loadSessionAutosaveHandle()
+      .then((handle) => {
+        if (cancelled || handle === null) {
+          return
+        }
+
+        sessionAutosaveHandleRef.current = handle
+        setSessionAutosave((current) => ({
+          ...current,
+          armed: true,
+          fileName: handle.name,
+          error: null,
+        }))
+      })
+      .catch((error) => {
+        if (cancelled) {
+          return
+        }
+
+        setSessionAutosave((current) => ({
+          ...current,
+          error: describeSessionAutosaveError(error),
+        }))
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!sessionAutosave.armed || sessionAutosaveHandleRef.current === null) {
+      return
+    }
+
+    const intervalId = window.setInterval(() => {
+      if (!autosaveDirtyRef.current || autosaveWriteInFlightRef.current) {
+        return
+      }
+
+      void flushSessionAutosave(false)
+    }, SESSION_AUTOSAVE_FLUSH_MS)
+
+    return () => {
+      window.clearInterval(intervalId)
+    }
+  }, [flushSessionAutosave, sessionAutosave.armed])
 
   useEffect(() => {
     transportRef.current = transport
@@ -741,6 +1063,9 @@ export function useDeviceSession() {
       wifiManualDisconnectRef.current = false
     }
 
+    lastInboundMessageAtRef.current = Date.now()
+    livenessProbeRef.current = null
+    transportStatusRef.current = 'connecting'
     setTransportDetail('Connecting…')
     await transportRef.current?.connect()
   }, [transportKind, transportStatus])
@@ -804,27 +1129,54 @@ export function useDeviceSession() {
       return
     }
 
-    if (transportStatus !== 'connecting') {
+    if (transportStatus !== 'connected' && transportStatus !== 'connecting') {
       return
     }
 
-    const timerId = window.setTimeout(() => {
-      if (!protocolReadyRef.current) {
-        const recoveringFromFlash = flashRecoveryUntilRef.current > Date.now()
+    if (firmwareProgress !== null && firmwareProgress.percent < 100) {
+      return
+    }
+
+    const intervalId = window.setInterval(() => {
+      const now = Date.now()
+      const probe = livenessProbeRef.current
+
+      if (probe !== null) {
+        if (lastInboundMessageAtRef.current > probe.sentAt) {
+          livenessProbeRef.current = null
+          return
+        }
+
+        if ((now - probe.sentAt) < LINK_IDLE_PROBE_TIMEOUT_MS) {
+          return
+        }
+
+        const recoveringFromFlash = flashRecoveryUntilRef.current > now
         markTransportUnhealthy(
-          recoveringFromFlash && transportKind === 'serial'
-            ? 'Serial port reopened after browser flash, but the controller firmware still has not resumed the host protocol. The board may still be rebooting, sitting in bootloader mode, or have failed to leave the flasher cleanly.'
-            : transportKind === 'serial'
-              ? 'Serial port opened, but the controller firmware did not answer the host protocol. The board may still be rebooting, sitting in bootloader mode, or running incompatible firmware.'
-              : 'Wireless link opened, but the controller firmware did not answer the host protocol. Verify the laptop joined the controller AP and the ESP32 is running the wireless bench image.',
+          transportStatusRef.current === 'connecting'
+            ? recoveringFromFlash && transportKindRef.current === 'serial'
+              ? 'Serial port reopened after browser flash, but the controller stayed silent after a liveness probe. The board may still be rebooting, sitting in bootloader mode, or have failed to leave the flasher cleanly.'
+              : transportKindRef.current === 'serial'
+                ? 'Serial port opened, then stayed silent for over 1 second and ignored a controller checkup. The board may still be rebooting, sitting in bootloader mode, or running incompatible firmware.'
+                : 'Wireless link opened, then stayed silent for over 1 second and ignored a controller checkup. Verify the laptop joined the controller AP and the ESP32 is running the wireless bench image.'
+            : 'Controller traffic stopped for over 1 second and the keepalive probe was not answered. Treating the active link as lost.',
         )
+        return
       }
-    }, flashRecoveryUntilRef.current > Date.now() && transportKind === 'serial' ? 7500 : 2200)
+
+      if (lastInboundMessageAtRef.current === 0) {
+        return
+      }
+
+      if ((now - lastInboundMessageAtRef.current) >= LINK_IDLE_PROBE_DELAY_MS) {
+        void issueLinkLivenessProbe()
+      }
+    }, 200)
 
     return () => {
-      window.clearTimeout(timerId)
+      window.clearInterval(intervalId)
     }
-  }, [markTransportUnhealthy, transportKind, transportStatus])
+  }, [firmwareProgress, issueLinkLivenessProbe, markTransportUnhealthy, transportKind, transportStatus])
 
   useEffect(() => {
     if (transportKind !== 'serial' || !serialReconnectEnabled || serialManualDisconnectRef.current) {
@@ -922,6 +1274,9 @@ export function useDeviceSession() {
         }
       }
 
+      transportStatusRef.current = 'disconnected'
+      lastInboundMessageAtRef.current = 0
+      livenessProbeRef.current = null
       setTransportStatus('disconnected')
       setTransportDetail(
         nextKind === 'serial'
@@ -1088,7 +1443,7 @@ export function useDeviceSession() {
           appendEvent({
             id: makeEventId('command-timeout'),
             atIso: new Date().toISOString(),
-            severity: ack.note.toLowerCase().includes('timed out') ? 'critical' : 'warn',
+            severity: 'warn',
             category: 'transport',
             title: ack.note.toLowerCase().includes('timed out')
               ? 'Command timed out'
@@ -1102,10 +1457,13 @@ export function useDeviceSession() {
             (transportKind === 'serial' || transportKind === 'wifi') &&
             ack.note.toLowerCase().includes('timed out')
           ) {
-            markTransportUnhealthy(
-              `The controller stopped answering protocol commands after "${cmd}". Reconnect after the firmware finishes booting or reattach the board.`,
-              moduleFromCommand(cmd),
-            )
+            const quietForMs = Date.now() - lastInboundMessageAtRef.current
+            if (
+              quietForMs >= LINK_IDLE_PROBE_DELAY_MS &&
+              livenessProbeRef.current === null
+            ) {
+              void issueLinkLivenessProbe()
+            }
           }
         }
 
@@ -1190,7 +1548,7 @@ export function useDeviceSession() {
         }
       }
     },
-    [appendEvent, markTransportUnhealthy, transportKind, waitForCommandAck],
+    [appendEvent, issueLinkLivenessProbe, transportKind, waitForCommandAck],
   )
 
   const beginFirmwareTransfer = useCallback(
@@ -1248,27 +1606,88 @@ export function useDeviceSession() {
     [appendEvent],
   )
 
-  const exportSession = useCallback(() => {
-    const payload = {
-      exportedAtIso: new Date().toISOString(),
-      transportKind,
-      snapshot,
-      events,
-      commands,
-      firmwareProgress,
+  const configureSessionAutosave = useCallback(async () => {
+    if (!supportsSessionAutosave()) {
+      setSessionAutosave({
+        supported: false,
+        armed: false,
+        fileName: null,
+        saving: false,
+        lastSavedAtIso: null,
+        error:
+          'This browser does not support file-backed autosave. Use Chrome or Edge for a persistent session file.',
+      })
+      return
     }
 
-    const blob = new Blob([JSON.stringify(payload, null, 2)], {
-      type: 'application/json',
-    })
-    const url = URL.createObjectURL(blob)
-    const anchor = document.createElement('a')
+    try {
+      const handle = await pickSessionAutosaveHandle()
+      const permissionGranted = await ensureSessionAutosavePermission(handle, true)
 
-    anchor.href = url
-    anchor.download = `bsl-session-${new Date().toISOString().replaceAll(':', '-')}.json`
-    anchor.click()
-    URL.revokeObjectURL(url)
-  }, [commands, events, firmwareProgress, snapshot, transportKind])
+      if (!permissionGranted) {
+        throw new DOMException(
+          'Browser write permission for the autosave file was not granted.',
+          'NotAllowedError',
+        )
+      }
+
+      sessionAutosaveHandleRef.current = handle
+      await saveSessionAutosaveHandle(handle)
+      setSessionAutosave((current) => ({
+        ...current,
+        supported: true,
+        armed: true,
+        fileName: handle.name,
+        error: null,
+      }))
+      autosaveDirtyRef.current = true
+      await flushSessionAutosave(true)
+    } catch (error) {
+      setSessionAutosave((current) => ({
+        ...current,
+        error: describeSessionAutosaveError(error),
+      }))
+    }
+  }, [flushSessionAutosave])
+
+  const disableSessionAutosave = useCallback(async () => {
+    sessionAutosaveHandleRef.current = null
+
+    try {
+      await clearSessionAutosaveHandle()
+    } catch (error) {
+      setSessionAutosave((current) => ({
+        ...current,
+        error: describeSessionAutosaveError(error),
+      }))
+      return
+    }
+
+    setSessionAutosave((current) => ({
+      ...current,
+      armed: false,
+      fileName: null,
+      saving: false,
+      error: null,
+    }))
+  }, [])
+
+  const clearSessionHistory = useCallback(() => {
+    setEvents([])
+    setCommands([])
+  }, [])
+
+  const exportSession = useCallback(() => {
+    downloadSessionArchive(
+      makeSessionArchivePayload({
+        transportKind: transportKindRef.current,
+        snapshot: snapshotRef.current,
+        events: eventsRef.current,
+        commands: commandsRef.current,
+        firmwareProgress: firmwareProgressRef.current,
+      }),
+    )
+  }, [])
 
   return {
     transportKind,
@@ -1278,9 +1697,11 @@ export function useDeviceSession() {
     transportStatus,
     transportDetail,
     snapshot,
+    telemetryStore: telemetryStoreRef.current,
     events,
     commands,
     firmwareProgress,
+    sessionAutosave,
     supportsFirmwareTransfer: transport.supportsFirmwareTransfer,
     connect,
     disconnect,
@@ -1288,5 +1709,8 @@ export function useDeviceSession() {
     issueCommandAwaitAck,
     beginFirmwareTransfer,
     exportSession,
+    clearSessionHistory,
+    configureSessionAutosave,
+    disableSessionAutosave,
   }
 }

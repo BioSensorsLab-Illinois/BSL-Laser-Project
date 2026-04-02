@@ -21,6 +21,7 @@ import { ConfirmActionDialog } from './ConfirmActionDialog'
 import { ControllerBusyOverlay } from './ControllerBusyOverlay'
 import { ImuPostureCard } from './ImuPostureCard'
 import { ProgressMeter } from './ProgressMeter'
+import type { RealtimeTelemetryStore } from '../lib/live-telemetry'
 import {
   dacReferenceOptions,
   dacSyncModeOptions,
@@ -53,6 +54,7 @@ import type {
 
 type BringupWorkbenchProps = {
   snapshot: DeviceSnapshot
+  telemetryStore: RealtimeTelemetryStore
   transportStatus: TransportStatus
   onIssueCommandAwaitAck: (
     cmd: string,
@@ -163,6 +165,14 @@ type BringupOperation = {
   requiresConfirm?: boolean
 }
 
+type HapticPatternDraft = {
+  pulseCount: string
+  highMs: string
+  lowMs: string
+  releaseAfter: boolean
+  hazardAccepted: boolean
+}
+
 type ProbeRequest = {
   id: string
   cmd: string
@@ -172,14 +182,18 @@ type ProbeRequest = {
 
 const HOST_DRAFT_STORAGE_KEY = 'bsl-bringup-draft-v6'
 const LEGACY_HOST_DRAFT_STORAGE_KEY = 'bsl-bringup-draft-v3'
-const BRINGUP_ACK_TIMEOUT_MS = 2400
-const BRINGUP_PROBE_INTERVAL_MS = 1500
+const BRINGUP_ACK_TIMEOUT_MS = 3200
+const BRINGUP_PROBE_INTERVAL_MS = 4500
 const BRINGUP_PD_REFRESH_TIMEOUT_MS = 2600
 const BRINGUP_PD_APPLY_TIMEOUT_MS = 7000
 const BRINGUP_PD_NVM_TIMEOUT_MS = 12000
 const BRINGUP_SERVICE_MODE_WAIT_MS = 2200
 const BRINGUP_SUCCESS_DISMISS_MS = 260
 const BRINGUP_HAPTIC_ENABLE_WAIT_MS = 1200
+const BRINGUP_HAPTIC_PATTERN_MAX_PULSES = 12
+const BRINGUP_HAPTIC_PATTERN_MIN_MS = 10
+const BRINGUP_HAPTIC_PATTERN_MAX_MS = 600
+const TOF_ILLUMINATION_PWM_HZ = 5000
 
 const bringupPages: PageDefinition[] = [
   {
@@ -255,6 +269,24 @@ function parseNumber(value: string, fallback: number): number {
 
 function formatRegisterHex(value: number, width = 4): string {
   return `0x${Math.max(0, Math.trunc(value)).toString(16).toUpperCase().padStart(width, '0')}`
+}
+
+function clampInteger(value: number, minimum: number, maximum: number): number {
+  if (!Number.isFinite(value)) {
+    return minimum
+  }
+
+  return Math.min(maximum, Math.max(minimum, Math.round(value)))
+}
+
+function makeDefaultHapticPatternDraft(): HapticPatternDraft {
+  return {
+    pulseCount: '3',
+    highMs: '45',
+    lowMs: '90',
+    releaseAfter: true,
+    hazardAccepted: false,
+  }
 }
 
 function readbackErrorLabel(errorCode: number, errorName: string): string {
@@ -549,13 +581,7 @@ function pause(ms: number): Promise<void> {
 }
 
 function buildProbeQueue(modules: BringupModuleMap): ProbeRequest[] {
-  const probes: ProbeRequest[] = [
-    {
-      id: 'status',
-      cmd: 'get_status',
-      note: 'Refresh the live bring-up snapshot.',
-    },
-  ]
+  const probes: ProbeRequest[] = []
 
   if (modules.imu.expectedPresent || modules.imu.debugEnabled) {
     probes.push({
@@ -759,6 +785,7 @@ function FieldLabel({
 
 export function BringupWorkbench({
   snapshot,
+  telemetryStore,
   transportStatus,
   onIssueCommandAwaitAck,
 }: BringupWorkbenchProps) {
@@ -779,6 +806,16 @@ export function BringupWorkbench({
   const [spiValue, setSpiValue] = useState(initialStoredState.spiValue)
   const [operation, setOperation] = useState<BringupOperation | null>(null)
   const [pdNvmConfirmOpen, setPdNvmConfirmOpen] = useState(false)
+  const [hapticPattern, setHapticPattern] = useState<HapticPatternDraft>(
+    makeDefaultHapticPatternDraft,
+  )
+  const [tofIlluminationDutyPct, setTofIlluminationDutyPct] = useState(() =>
+    String(
+      snapshot.bringup.illumination.tof.dutyCyclePct > 0
+        ? snapshot.bringup.illumination.tof.dutyCyclePct
+        : 35,
+    ),
+  )
 
   const connected = transportStatus === 'connected'
   const serviceModeRequested = connected && snapshot.bringup.serviceModeRequested
@@ -821,6 +858,16 @@ export function BringupWorkbench({
   useEffect(() => {
     latestSnapshotRef.current = snapshot
   }, [snapshot])
+
+  useEffect(() => {
+    const liveDuty = snapshot.bringup.illumination.tof.dutyCyclePct
+    if (snapshot.bringup.illumination.tof.enabled || liveDuty > 0) {
+      setTofIlluminationDutyPct(String(liveDuty))
+    }
+  }, [
+    snapshot.bringup.illumination.tof.dutyCyclePct,
+    snapshot.bringup.illumination.tof.enabled,
+  ])
 
   function dismissOperation() {
     const resolve = operationConfirmResolveRef.current
@@ -1861,6 +1908,54 @@ export function BringupWorkbench({
     )
   }
 
+  async function applyTofIllumination(enabled: boolean) {
+    const parsedDuty = Math.round(
+      parseNumber(
+        tofIlluminationDutyPct,
+        snapshot.bringup.illumination.tof.dutyCyclePct > 0
+          ? snapshot.bringup.illumination.tof.dutyCyclePct
+          : 35,
+      ),
+    )
+    const clampedDuty = Math.max(0, Math.min(100, parsedDuty))
+    const effectiveDuty = enabled ? Math.max(1, clampedDuty) : 0
+
+    await runCommandSequence(
+      enabled ? 'Enable front illumination' : 'Disable front illumination',
+      enabled
+        ? `Front illumination staged on GPIO6 at ${effectiveDuty}% duty.`
+        : 'Front illumination returned low on GPIO6.',
+      [
+        moduleStateStep('tof', 'Syncing ToF module plan...'),
+        {
+          detail: enabled
+            ? 'Driving TPS61169 CTRL from GPIO6 with service PWM...'
+            : 'Forcing GPIO6 low so the front illumination path shuts down...',
+          cmd: 'tof_illumination_set',
+          risk: 'service',
+          note: enabled
+            ? 'Stage service-only front illumination on GPIO6 for bring-up visibility tests.'
+            : 'Disable the service-only front illumination on GPIO6.',
+          requireService: true,
+          args: {
+            enabled,
+            duty_cycle_pct: effectiveDuty,
+            frequency_hz: TOF_ILLUMINATION_PWM_HZ,
+          },
+          retryOnModuleBlocked: {
+            module: 'tof',
+            expectedPresent: form.modules.tof.expectedPresent,
+            debugEnabled: form.modules.tof.debugEnabled,
+            label: moduleMeta.tof.label,
+          },
+        },
+      ],
+      {
+        refreshAfter: false,
+      },
+    )
+  }
+
   async function applyPdProfile() {
     await runCommandSequence(
       'Apply PD runtime PDOs',
@@ -2429,6 +2524,108 @@ export function BringupWorkbench({
         return
       }
     }
+  }
+
+  function patchHapticPattern<Key extends keyof HapticPatternDraft>(
+    key: Key,
+    value: HapticPatternDraft[Key],
+  ) {
+    setHapticPattern((current) => ({
+      ...current,
+      [key]: value,
+    }))
+  }
+
+  function applyHapticPatternPreset(
+    pulseCount: number,
+    highMs: number,
+    lowMs: number,
+  ) {
+    setHapticPattern((current) => ({
+      ...current,
+      pulseCount: String(pulseCount),
+      highMs: String(highMs),
+      lowMs: String(lowMs),
+    }))
+  }
+
+  async function runHapticExternalPattern() {
+    const pulseCount = clampInteger(
+      parseNumber(hapticPattern.pulseCount, 3),
+      1,
+      BRINGUP_HAPTIC_PATTERN_MAX_PULSES,
+    )
+    const highMs = clampInteger(
+      parseNumber(hapticPattern.highMs, 45),
+      BRINGUP_HAPTIC_PATTERN_MIN_MS,
+      BRINGUP_HAPTIC_PATTERN_MAX_MS,
+    )
+    const lowMs = clampInteger(
+      parseNumber(hapticPattern.lowMs, 90),
+      BRINGUP_HAPTIC_PATTERN_MIN_MS,
+      BRINGUP_HAPTIC_PATTERN_MAX_MS,
+    )
+    const totalPatternMs = pulseCount * (highMs + lowMs)
+
+    if (!hapticPattern.hazardAccepted) {
+      setDraftNote(
+        'Acknowledge the shared IO37 / GN_LD_EN hazard before running an external trigger burst.',
+      )
+      return
+    }
+
+    await runCommandSequence(
+      'Run external ERM trigger pattern',
+      `External trigger burst completed: ${pulseCount} pulse${pulseCount === 1 ? '' : 's'} on IO37.`,
+      [
+        {
+          detail: 'Applying the staged DRV2605 profile for external trigger mode...',
+          cmd: 'haptic_debug_config',
+          risk: 'service',
+          note: 'Stage the DRV2605 profile before driving the external ERM trigger burst.',
+          requireService: true,
+          retryOnModuleBlocked: {
+            module: 'haptic',
+            expectedPresent: form.modules.haptic.expectedPresent,
+            debugEnabled: form.modules.haptic.debugEnabled,
+            label: 'haptic',
+          },
+          args: {
+            effect_id: parseNumber(
+              form.hapticEffectId,
+              snapshot.bringup.tuning.hapticEffectId,
+            ),
+            mode: form.hapticMode,
+            library: parseNumber(
+              form.hapticLibrary,
+              snapshot.bringup.tuning.hapticLibrary,
+            ),
+            actuator: form.hapticActuator,
+            rtp_level: parseNumber(
+              form.hapticRtpLevel,
+              snapshot.bringup.tuning.hapticRtpLevel,
+            ),
+          },
+        },
+        {
+          detail: `Driving a ${pulseCount}-pulse burst on shared IO37 / GN_LD_EN...`,
+          cmd: 'haptic_external_trigger_pattern',
+          risk: 'service',
+          note: 'Bench-only hazardous shared-net ERM trigger burst on IO37 / GN_LD_EN. Use only with the visible alignment path controlled and terminated.',
+          requireService: true,
+          timeoutMs: Math.max(BRINGUP_ACK_TIMEOUT_MS, totalPatternMs + 1800),
+          args: {
+            pulse_count: pulseCount,
+            high_ms: highMs,
+            low_ms: lowMs,
+            release_after: hapticPattern.releaseAfter,
+          },
+        },
+      ],
+      {
+        refreshAfter: false,
+      },
+    )
   }
 
   function renderPowerPage() {
@@ -3422,7 +3619,7 @@ export function BringupWorkbench({
           <p className="inline-help">{snapshot.bringup.tools.lastSpiOp}</p>
         </article>
 
-        <ImuPostureCard snapshot={snapshot} />
+        <ImuPostureCard snapshot={snapshot} telemetryStore={telemetryStore} />
       </div>
     )
   }
@@ -3740,6 +3937,35 @@ export function BringupWorkbench({
   }
 
   function renderHapticPage() {
+    const externalPatternModeSelected =
+      form.hapticMode === 'external_edge' || form.hapticMode === 'external_level'
+    const previewPulseCount = clampInteger(
+      parseNumber(hapticPattern.pulseCount, 3),
+      1,
+      BRINGUP_HAPTIC_PATTERN_MAX_PULSES,
+    )
+    const previewHighMs = clampInteger(
+      parseNumber(hapticPattern.highMs, 45),
+      BRINGUP_HAPTIC_PATTERN_MIN_MS,
+      BRINGUP_HAPTIC_PATTERN_MAX_MS,
+    )
+    const previewLowMs = clampInteger(
+      parseNumber(hapticPattern.lowMs, 90),
+      BRINGUP_HAPTIC_PATTERN_MIN_MS,
+      BRINGUP_HAPTIC_PATTERN_MAX_MS,
+    )
+    const previewTotalMs = previewPulseCount * (previewHighMs + previewLowMs)
+    const previewSegments = Array.from({ length: previewPulseCount * 2 }, (_, index) => {
+      const active = index % 2 === 0
+      const durationMs = active ? previewHighMs : previewLowMs
+      return {
+        key: `${active ? 'high' : 'low'}-${index}`,
+        active,
+        durationMs,
+        widthPercent: (durationMs / (previewTotalMs || 1)) * 100,
+      }
+    })
+
     return (
       <div className="bringup-page-grid">
         {renderModuleSettings('haptic')}
@@ -3932,6 +4158,168 @@ export function BringupWorkbench({
             </button>
           </div>
 
+          <div
+            className={`haptic-pattern-lab ${externalPatternModeSelected ? 'is-armed' : ''}`}
+          >
+            <div className="haptic-pattern-lab__head">
+              <div>
+                <span className="eyebrow">External trigger lab</span>
+                <strong>Pattern designer for ERM IN/TRIG bursts</strong>
+              </div>
+              <div className="status-badges">
+                <span
+                  className={`status-badge ${
+                    externalPatternModeSelected ? 'is-warn' : 'is-off'
+                  }`}
+                >
+                  {externalPatternModeSelected
+                    ? 'External trigger mode staged'
+                    : 'Select external edge or level mode'}
+                </span>
+                <span className="status-badge is-muted">
+                  {previewPulseCount} pulse{previewPulseCount === 1 ? '' : 's'} · {previewTotalMs} ms
+                </span>
+              </div>
+            </div>
+
+            <div className="segmented haptic-pattern-lab__presets">
+              <button
+                type="button"
+                className="segmented__button"
+                onClick={() => applyHapticPatternPreset(1, 30, 120)}
+              >
+                Tick
+              </button>
+              <button
+                type="button"
+                className="segmented__button"
+                onClick={() => applyHapticPatternPreset(3, 40, 90)}
+              >
+                Triple
+              </button>
+              <button
+                type="button"
+                className="segmented__button"
+                onClick={() => applyHapticPatternPreset(6, 28, 55)}
+              >
+                Buzz
+              </button>
+            </div>
+
+            <div className="field-grid">
+              <label className="field">
+                <FieldLabel
+                  label="Pulse count"
+                  help="Number of high-going trigger bursts to drive on the shared IO37 net."
+                />
+                <input
+                  value={hapticPattern.pulseCount}
+                  title="Set the number of trigger pulses."
+                  onChange={(event) => patchHapticPattern('pulseCount', event.target.value)}
+                />
+              </label>
+
+              <label className="field">
+                <FieldLabel
+                  label="High time (ms)"
+                  help="Duration that IO37 stays high for each pulse."
+                />
+                <input
+                  value={hapticPattern.highMs}
+                  title="Set the trigger high time in milliseconds."
+                  onChange={(event) => patchHapticPattern('highMs', event.target.value)}
+                />
+              </label>
+
+              <label className="field">
+                <FieldLabel
+                  label="Low gap (ms)"
+                  help="Low-time gap between trigger pulses."
+                />
+                <input
+                  value={hapticPattern.lowMs}
+                  title="Set the trigger low gap in milliseconds."
+                  onChange={(event) => patchHapticPattern('lowMs', event.target.value)}
+                />
+              </label>
+            </div>
+
+            <div className="haptic-pattern-lab__preview" aria-hidden="true">
+              {previewSegments.map((segment) => (
+                <span
+                  key={segment.key}
+                  className={segment.active ? 'is-active' : 'is-gap'}
+                  style={{ width: `${segment.widthPercent}%` }}
+                />
+              ))}
+            </div>
+
+            <div className="haptic-pattern-lab__facts">
+              <div>
+                <span>High</span>
+                <strong>{previewHighMs} ms</strong>
+              </div>
+              <div>
+                <span>Gap</span>
+                <strong>{previewLowMs} ms</strong>
+              </div>
+              <div>
+                <span>Release</span>
+                <strong>{hapticPattern.releaseAfter ? 'Firmware after burst' : 'Hold low override'}</strong>
+              </div>
+            </div>
+
+            <label className="toggle-line haptic-pattern-lab__toggle">
+              <input
+                type="checkbox"
+                checked={hapticPattern.releaseAfter}
+                onChange={(event) =>
+                  patchHapticPattern('releaseAfter', event.target.checked)
+                }
+              />
+              <span>Release IO37 back to firmware after the burst completes.</span>
+            </label>
+
+            <label className="toggle-line haptic-pattern-lab__toggle is-danger">
+              <input
+                type="checkbox"
+                checked={hapticPattern.hazardAccepted}
+                onChange={(event) =>
+                  patchHapticPattern('hazardAccepted', event.target.checked)
+                }
+              />
+              <span>
+                I understand IO37 is shared with `GN_LD_EN`, so this burst is bench-only and may
+                assert the visible-laser enable net.
+              </span>
+            </label>
+
+            <div className="button-row is-compact">
+              <button
+                type="button"
+                className="action-button is-inline is-accent"
+                disabled={
+                  writesDisabled ||
+                  !snapshot.peripherals.haptic.enablePinHigh ||
+                  !externalPatternModeSelected ||
+                  !hapticPattern.hazardAccepted
+                }
+                title="Apply the staged external-trigger profile and run the designed IO37 burst."
+                onClick={() => {
+                  void runHapticExternalPattern()
+                }}
+              >
+                Run external trigger pattern
+              </button>
+            </div>
+
+            <p className="inline-help">
+              This uses the staged DRV2605 external mode and then drives a bounded service-only
+              pulse train on the shared `IO37 / GN_LD_EN` net. Keep the visible alignment path
+              terminated and only use it on an intentional bench setup.
+            </p>
+          </div>
+
           <div className="bringup-fact-grid">
             <div>
               <span>Peripheral reachable</span>
@@ -3999,6 +4387,20 @@ export function BringupWorkbench({
   }
 
   function renderTofPage() {
+    const liveIllumination = snapshot.bringup.illumination.tof
+    const stagedIlluminationDuty = Math.max(
+      0,
+      Math.min(
+        100,
+        Math.round(
+          parseNumber(
+            tofIlluminationDutyPct,
+            liveIllumination.dutyCyclePct > 0 ? liveIllumination.dutyCyclePct : 35,
+          ),
+        ),
+      ),
+    )
+
     return (
       <div className="bringup-page-grid">
         {renderModuleSettings('tof')}
@@ -4073,7 +4475,92 @@ export function BringupWorkbench({
             </button>
           </div>
 
+          <div className="panel-cutout bringup-illumination-card">
+            <div className="cutout-head">
+              <Activity size={16} />
+              <strong>Front illumination</strong>
+            </div>
+            <p className="inline-help">
+              The front visible LED path uses the TPS61169 `CTRL` pin on `GPIO6`.
+              Firmware keeps that line low by default, and only drives a service-only
+              `5 kHz` PWM dimming signal here while service mode is active.
+            </p>
+
+            <label className="field">
+              <FieldLabel
+                label="Brightness duty cycle"
+                help="Service-only PWM duty on GPIO6 into TPS61169 CTRL. Zero keeps the illumination path low."
+              />
+              <input
+                type="range"
+                min="0"
+                max="100"
+                step="1"
+                value={stagedIlluminationDuty}
+                title="Stage the service-only front illumination brightness."
+                onChange={(event) => setTofIlluminationDutyPct(event.target.value)}
+              />
+            </label>
+
+            <div className="bringup-illumination-meter">
+              <div>
+                <span>Staged duty</span>
+                <strong>{stagedIlluminationDuty}%</strong>
+              </div>
+              <span className={liveIllumination.enabled ? 'status-badge is-on' : 'status-badge is-off'}>
+                {liveIllumination.enabled ? 'service PWM active' : 'forced low'}
+              </span>
+            </div>
+
+            <ProgressMeter
+              value={stagedIlluminationDuty}
+              tone={liveIllumination.enabled ? 'warning' : 'steady'}
+              compact
+            />
+
+            <div className="button-row">
+              <button
+                type="button"
+                className="action-button is-inline is-accent"
+                disabled={writesDisabled || stagedIlluminationDuty <= 0}
+                onClick={() => {
+                  void applyTofIllumination(true)
+                }}
+              >
+                Apply front light
+              </button>
+              <button
+                type="button"
+                className="action-button is-inline"
+                disabled={writesDisabled || !liveIllumination.enabled}
+                onClick={() => {
+                  void applyTofIllumination(false)
+                }}
+              >
+                Lights off
+              </button>
+            </div>
+
+            <p className="inline-help">
+              TPS61169 brightness dimming is PWM-based on `CTRL`; this bring-up path
+              keeps a fixed `5 kHz` carrier and only changes duty cycle so the test
+              stays easy to reproduce. Leaving service mode forces the line low again.
+            </p>
+          </div>
+
           <div className="bringup-fact-grid">
+            <div>
+              <span>Service illumination</span>
+              <strong>{liveIllumination.enabled ? 'Active' : 'Off'}</strong>
+            </div>
+            <div>
+              <span>Service duty</span>
+              <strong>{liveIllumination.dutyCyclePct}%</strong>
+            </div>
+            <div>
+              <span>PWM carrier</span>
+              <strong>{formatNumber(liveIllumination.frequencyHz / 1000, 1)} kHz</strong>
+            </div>
             <div>
               <span>Controller live distance</span>
               <strong>{formatNumber(snapshot.tof.distanceM, 2)} m</strong>

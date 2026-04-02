@@ -14,7 +14,14 @@ static bool laser_controller_thermal_supervision_active(
     const laser_controller_config_t *config,
     const laser_controller_safety_snapshot_t *snapshot)
 {
+    const laser_controller_board_inputs_t *hw =
+        snapshot != NULL ? snapshot->hw : NULL;
+
     if (config == NULL || snapshot == NULL) {
+        return false;
+    }
+
+    if (hw == NULL) {
         return false;
     }
 
@@ -30,23 +37,26 @@ static bool laser_controller_thermal_supervision_active(
         return false;
     }
 
-    return snapshot->hw.tec_rail_pgood ||
-           snapshot->hw.tec_temp_good ||
-           snapshot->hw.tec_voltage_v > 0.05f ||
-           snapshot->hw.tec_current_a > 0.05f ||
-           snapshot->hw.tec_current_a < -0.05f;
+    return hw->tec_rail_pgood ||
+           hw->tec_temp_good ||
+           hw->tec_voltage_v > 0.05f ||
+           hw->tec_current_a > 0.05f ||
+           hw->tec_current_a < -0.05f;
 }
 
 static bool laser_controller_horizon_blocked(
     const laser_controller_config_t *config,
     const laser_controller_safety_snapshot_t *snapshot)
 {
+    const laser_controller_board_inputs_t *hw =
+        snapshot != NULL ? snapshot->hw : NULL;
     const laser_controller_radians_t trip_threshold =
         config->thresholds.horizon_threshold_rad;
     const laser_controller_radians_t clear_threshold =
         config->thresholds.horizon_threshold_rad -
         config->thresholds.horizon_hysteresis_rad;
-    const laser_controller_radians_t pitch = snapshot->hw.beam_pitch_rad;
+    const laser_controller_radians_t pitch =
+        hw != NULL ? hw->beam_pitch_rad : 0.0f;
 
     if (snapshot->last_horizon_blocked) {
         return pitch > clear_threshold;
@@ -59,7 +69,10 @@ static bool laser_controller_distance_blocked(
     const laser_controller_config_t *config,
     const laser_controller_safety_snapshot_t *snapshot)
 {
-    const laser_controller_distance_m_t distance = snapshot->hw.tof_distance_m;
+    const laser_controller_board_inputs_t *hw =
+        snapshot != NULL ? snapshot->hw : NULL;
+    const laser_controller_distance_m_t distance =
+        hw != NULL ? hw->tof_distance_m : 0.0f;
     const laser_controller_distance_m_t min_trip = config->thresholds.tof_min_range_m;
     const laser_controller_distance_m_t max_trip = config->thresholds.tof_max_range_m;
     const laser_controller_distance_m_t min_clear =
@@ -99,13 +112,15 @@ static bool laser_controller_tec_temp_adc_blocked(
     const laser_controller_config_t *config,
     const laser_controller_safety_snapshot_t *snapshot)
 {
+    const laser_controller_board_inputs_t *hw =
+        snapshot != NULL ? snapshot->hw : NULL;
     const laser_controller_volts_t trip_threshold =
         config->thresholds.tec_temp_adc_trip_v;
     const laser_controller_volts_t clear_threshold =
         config->thresholds.tec_temp_adc_trip_v -
         config->thresholds.tec_temp_adc_hysteresis_v;
     const laser_controller_volts_t adc_voltage_v =
-        snapshot->hw.tec_temp_adc_voltage_v;
+        hw != NULL ? hw->tec_temp_adc_voltage_v : 0.0f;
 
     if (snapshot->last_tec_temp_adc_blocked) {
         return adc_voltage_v > clear_threshold;
@@ -135,10 +150,13 @@ void laser_controller_safety_evaluate(
     const laser_controller_safety_snapshot_t *snapshot,
     laser_controller_safety_decision_t *decision)
 {
+    const laser_controller_board_inputs_t *hw =
+        snapshot != NULL ? snapshot->hw : NULL;
+
     memset(decision, 0, sizeof(*decision));
     decision->driver_standby_asserted = true;
 
-    if (config == NULL || snapshot == NULL) {
+    if (config == NULL || snapshot == NULL || hw == NULL) {
         laser_controller_set_fault(
             decision,
             LASER_CONTROLLER_FAULT_INVALID_CONFIG,
@@ -149,14 +167,14 @@ void laser_controller_safety_evaluate(
 
     if (!snapshot->allow_missing_buttons) {
         decision->request_alignment =
-            snapshot->hw.button.stage1_pressed && !snapshot->hw.button.stage2_pressed;
+            hw->button.stage1_pressed && !hw->button.stage2_pressed;
         decision->request_nir =
-            snapshot->hw.button.stage1_pressed && snapshot->hw.button.stage2_pressed;
+            hw->button.stage1_pressed && hw->button.stage2_pressed;
     }
 
     if (!snapshot->allow_missing_buttons &&
-        snapshot->hw.button.stage2_pressed &&
-        !snapshot->hw.button.stage1_pressed) {
+        hw->button.stage2_pressed &&
+        !hw->button.stage1_pressed) {
         laser_controller_set_fault(
             decision,
             LASER_CONTROLLER_FAULT_ILLEGAL_BUTTON_STATE,
@@ -172,7 +190,7 @@ void laser_controller_safety_evaluate(
             "configuration invalid");
     }
 
-    if (!snapshot->hw.comms_alive) {
+    if (!hw->comms_alive) {
         laser_controller_set_fault(
             decision,
             LASER_CONTROLLER_FAULT_COMMS_TIMEOUT,
@@ -180,7 +198,7 @@ void laser_controller_safety_evaluate(
             "critical comms path unhealthy");
     }
 
-    if (!snapshot->hw.watchdog_ok) {
+    if (!hw->watchdog_ok) {
         laser_controller_set_fault(
             decision,
             LASER_CONTROLLER_FAULT_WATCHDOG_RESET,
@@ -188,7 +206,7 @@ void laser_controller_safety_evaluate(
             "watchdog unhealthy");
     }
 
-    if (snapshot->hw.brownout_seen) {
+    if (hw->brownout_seen) {
         laser_controller_set_fault(
             decision,
             LASER_CONTROLLER_FAULT_BROWNOUT_RESET,
@@ -196,7 +214,7 @@ void laser_controller_safety_evaluate(
             "brownout observed");
     }
 
-    if (!snapshot->allow_missing_imu && !snapshot->hw.imu_data_valid) {
+    if (!snapshot->allow_missing_imu && !hw->imu_data_valid) {
         laser_controller_set_fault(
             decision,
             LASER_CONTROLLER_FAULT_IMU_INVALID,
@@ -204,7 +222,7 @@ void laser_controller_safety_evaluate(
             "imu invalid");
     }
 
-    if (!snapshot->allow_missing_imu && !snapshot->hw.imu_data_fresh) {
+    if (!snapshot->allow_missing_imu && !hw->imu_data_fresh) {
         laser_controller_set_fault(
             decision,
             LASER_CONTROLLER_FAULT_IMU_STALE,
@@ -212,7 +230,7 @@ void laser_controller_safety_evaluate(
             "imu stale");
     }
 
-    if (!snapshot->allow_missing_tof && !snapshot->hw.tof_data_valid) {
+    if (!snapshot->allow_missing_tof && !hw->tof_data_valid) {
         laser_controller_set_fault(
             decision,
             LASER_CONTROLLER_FAULT_TOF_INVALID,
@@ -220,7 +238,7 @@ void laser_controller_safety_evaluate(
             "tof invalid");
     }
 
-    if (!snapshot->allow_missing_tof && !snapshot->hw.tof_data_fresh) {
+    if (!snapshot->allow_missing_tof && !hw->tof_data_fresh) {
         laser_controller_set_fault(
             decision,
             LASER_CONTROLLER_FAULT_TOF_STALE,
@@ -257,7 +275,7 @@ void laser_controller_safety_evaluate(
             laser_controller_tec_temp_adc_blocked(config, snapshot);
     }
 
-    if (snapshot->hw.measured_laser_current_a > config->thresholds.off_current_threshold_a &&
+    if (hw->measured_laser_current_a > config->thresholds.off_current_threshold_a &&
         !decision->request_nir) {
         laser_controller_set_fault(
             decision,
@@ -266,7 +284,7 @@ void laser_controller_safety_evaluate(
             "current present while nir not requested");
     }
 
-    if (snapshot->hw.laser_driver_temp_c > config->thresholds.ld_overtemp_limit_c) {
+    if (hw->laser_driver_temp_c > config->thresholds.ld_overtemp_limit_c) {
         laser_controller_set_fault(
             decision,
             LASER_CONTROLLER_FAULT_LD_OVERTEMP,
@@ -274,7 +292,7 @@ void laser_controller_safety_evaluate(
             "laser driver overtemperature");
     }
 
-    if (snapshot->hw.ld_rail_pgood && !snapshot->hw.driver_loop_good) {
+    if (hw->ld_rail_pgood && !hw->driver_loop_good) {
         laser_controller_set_fault(
             decision,
             LASER_CONTROLLER_FAULT_LD_LOOP_BAD,
@@ -301,10 +319,10 @@ void laser_controller_safety_evaluate(
     decision->allow_nir =
         snapshot->power_tier == LASER_CONTROLLER_POWER_TIER_FULL &&
         !decision->fault_present &&
-        snapshot->hw.ld_rail_pgood &&
+        hw->ld_rail_pgood &&
         (!config->require_tec_for_nir ||
-         (snapshot->hw.tec_rail_pgood && snapshot->hw.tec_temp_good)) &&
-        snapshot->hw.driver_loop_good;
+         (hw->tec_rail_pgood && hw->tec_temp_good)) &&
+        hw->driver_loop_good;
 
     if (!config->alignment_obeys_interlocks &&
         !decision->fault_present &&

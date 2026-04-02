@@ -262,6 +262,13 @@ export function makeDefaultBringupStatus(): BringupStatus {
       ldRequested: false,
       tecRequested: false,
     },
+    illumination: {
+      tof: {
+        enabled: false,
+        dutyCyclePct: 0,
+        frequencyHz: 5000,
+      },
+    },
     modules: makeDefaultBringupModules(),
     tuning: {
       dacLdChannelV: 0,

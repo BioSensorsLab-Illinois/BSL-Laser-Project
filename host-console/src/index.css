@@ -186,6 +186,34 @@ code {
   gap: 16px;
 }
 
+.offline-dim {
+  filter: grayscale(1) saturate(0.18);
+  opacity: 0.48;
+  transition:
+    filter 180ms ease,
+    opacity 180ms ease;
+}
+
+.offline-banner {
+  border: 1px solid color-mix(in srgb, var(--warning) 24%, var(--line));
+  border-radius: var(--radius-lg);
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--warning-soft) 82%, var(--surface-elevated)), var(--surface-strong)),
+    var(--surface-soft);
+  padding: 14px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+
+.offline-banner strong {
+  display: block;
+  margin-top: 2px;
+  font-size: 0.98rem;
+}
+
 .inspector {
   display: flex;
   flex-direction: column;
@@ -1042,14 +1070,22 @@ code {
 
 .gpio-module-visual {
   display: grid;
-  grid-template-columns: minmax(160px, 1fr) minmax(220px, 0.88fr) minmax(160px, 1fr);
-  gap: 14px;
-  align-items: stretch;
+  grid-template-columns: minmax(120px, 0.75fr) minmax(280px, 340px) minmax(120px, 0.75fr);
+  gap: 10px;
+  align-items: center;
 }
 
 .gpio-module-visual__column {
   display: grid;
-  gap: 10px;
+  gap: 6px;
+}
+
+.gpio-module-visual__column--left .gpio-pin-button {
+  border-radius: 16px 10px 10px 16px;
+}
+
+.gpio-module-visual__column--right .gpio-pin-button {
+  border-radius: 10px 16px 16px 10px;
 }
 
 .gpio-module-visual__chip,
@@ -1063,12 +1099,49 @@ code {
 }
 
 .gpio-module-visual__chip {
-  padding: 18px;
+  padding: 16px;
   display: grid;
   gap: 12px;
-  align-content: center;
+  align-content: start;
   text-align: center;
   min-height: 100%;
+  overflow: hidden;
+  position: relative;
+}
+
+.gpio-module-visual__chip::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(circle at 50% 14%, color-mix(in srgb, var(--accent-soft) 70%, transparent), transparent 34%),
+    linear-gradient(180deg, transparent, color-mix(in srgb, var(--surface-soft) 85%, transparent));
+  pointer-events: none;
+}
+
+.gpio-module-visual__antenna {
+  height: 86px;
+  border-radius: 18px;
+  border: 1px dashed color-mix(in srgb, var(--line-strong) 72%, transparent);
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--surface-elevated) 88%, transparent), color-mix(in srgb, var(--surface-soft) 92%, transparent)),
+    radial-gradient(circle at 50% 24%, color-mix(in srgb, var(--accent) 12%, transparent), transparent 40%);
+  position: relative;
+}
+
+.gpio-module-visual__antenna::after {
+  content: '';
+  position: absolute;
+  left: 18px;
+  right: 18px;
+  bottom: 14px;
+  height: 1px;
+  background: color-mix(in srgb, var(--line-strong) 72%, transparent);
+}
+
+.gpio-module-visual__package {
+  display: grid;
+  gap: 12px;
 }
 
 .gpio-module-visual__badge {
@@ -1097,6 +1170,13 @@ code {
   line-height: 1.52;
 }
 
+.gpio-module-visual__legend {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 6px;
+}
+
 .gpio-module-visual__center-stats {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -1122,19 +1202,25 @@ code {
 }
 
 .gpio-pin-button {
+  --gpio-signal: var(--line-strong);
+  --gpio-surface: var(--surface-elevated);
   appearance: none;
   width: 100%;
   display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
   gap: 8px;
-  padding: 12px;
-  border-radius: 18px;
-  border: 1px solid var(--line);
+  align-items: center;
+  padding: 8px 10px;
+  border-radius: 12px;
+  border: 1px solid color-mix(in srgb, var(--gpio-signal) 18%, var(--line));
   background:
-    linear-gradient(180deg, var(--surface-elevated), var(--surface-strong)),
+    linear-gradient(180deg, color-mix(in srgb, var(--gpio-surface) 88%, var(--surface-elevated)), var(--surface-strong)),
     var(--surface-soft);
   color: var(--text);
   text-align: left;
   cursor: pointer;
+  position: relative;
+  overflow: hidden;
   transition:
     border-color 140ms ease,
     transform 140ms ease,
@@ -1142,9 +1228,53 @@ code {
     background 140ms ease;
 }
 
+.gpio-pin-button::before {
+  content: '';
+  position: absolute;
+  inset: 6px auto 6px 0;
+  width: 3px;
+  border-radius: 999px;
+  background: var(--gpio-signal);
+}
+
+.gpio-pin-button--bus {
+  --gpio-signal: var(--info);
+  --gpio-surface: color-mix(in srgb, var(--info-soft) 70%, var(--surface-elevated));
+}
+
+.gpio-pin-button--power {
+  --gpio-signal: var(--warning);
+  --gpio-surface: color-mix(in srgb, var(--warning-soft) 58%, var(--surface-elevated));
+}
+
+.gpio-pin-button--analog {
+  --gpio-signal: color-mix(in srgb, var(--accent) 54%, var(--info));
+  --gpio-surface: color-mix(in srgb, var(--accent-soft) 52%, var(--surface-elevated));
+}
+
+.gpio-pin-button--control {
+  --gpio-signal: var(--accent);
+  --gpio-surface: color-mix(in srgb, var(--accent-soft) 64%, var(--surface-elevated));
+}
+
+.gpio-pin-button--strap {
+  --gpio-signal: var(--critical);
+  --gpio-surface: color-mix(in srgb, var(--critical-soft) 54%, var(--surface-elevated));
+}
+
+.gpio-pin-button--usb {
+  --gpio-signal: color-mix(in srgb, var(--accent) 36%, var(--critical));
+  --gpio-surface: color-mix(in srgb, var(--critical-soft) 42%, var(--surface-elevated));
+}
+
+.gpio-pin-button--debug {
+  --gpio-signal: color-mix(in srgb, var(--info) 72%, var(--line-strong));
+  --gpio-surface: color-mix(in srgb, var(--info-soft) 42%, var(--surface-elevated));
+}
+
 .gpio-pin-button:hover,
 .gpio-pin-button:focus-visible {
-  border-color: color-mix(in srgb, var(--accent) 30%, var(--line-strong));
+  border-color: color-mix(in srgb, var(--gpio-signal) 34%, var(--line-strong));
   box-shadow: var(--shadow-soft);
   transform: translateY(-1px);
 }
@@ -1155,10 +1285,13 @@ code {
 }
 
 .gpio-pin-button.is-selected {
-  border-color: color-mix(in srgb, var(--accent-vivid) 50%, var(--line));
+  border-color: color-mix(in srgb, var(--gpio-signal) 54%, var(--line));
   background:
-    linear-gradient(180deg, color-mix(in srgb, var(--accent-soft) 60%, var(--surface-elevated)), var(--surface-strong)),
+    linear-gradient(180deg, color-mix(in srgb, var(--gpio-surface) 80%, var(--surface-elevated)), var(--surface-strong)),
     var(--surface-soft);
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--gpio-signal) 18%, transparent),
+    var(--shadow-soft);
 }
 
 .gpio-pin-button.is-overridden {
@@ -1176,56 +1309,106 @@ code {
 }
 
 .gpio-pin-button__head {
-  display: flex;
-  justify-content: space-between;
-  gap: 10px;
-  align-items: baseline;
+  display: grid;
+  gap: 1px;
+  min-width: 54px;
 }
 
 .gpio-pin-button__head strong {
-  font-size: 0.95rem;
+  font-size: 0.86rem;
+  letter-spacing: -0.03em;
 }
 
 .gpio-pin-button__head span {
   color: var(--text-soft);
   font-family: var(--mono);
-  font-size: 0.75rem;
+  font-size: 0.66rem;
+}
+
+.gpio-pin-button__body {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
 }
 
 .gpio-pin-button__label {
-  min-height: 2.3em;
+  color: var(--text);
+  font-size: 0.8rem;
+  font-weight: 500;
+  line-height: 1.1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.gpio-pin-button__net {
   color: var(--text-soft);
-  line-height: 1.4;
+  font-family: var(--mono);
+  font-size: 0.63rem;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .gpio-pin-button__tokens {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 5px;
+}
+
+.gpio-state-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--line-strong) 70%, transparent);
+  background: color-mix(in srgb, var(--surface-elevated) 92%, var(--line));
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+}
+
+.gpio-state-dot.is-high {
+  background: linear-gradient(180deg, var(--accent-vivid), var(--accent));
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent-soft) 40%, transparent);
+}
+
+.gpio-state-dot.is-low {
+  background: linear-gradient(180deg, color-mix(in srgb, var(--critical-soft) 30%, var(--surface-elevated)), color-mix(in srgb, var(--line) 60%, var(--surface-soft)));
 }
 
 .gpio-mini-token {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-height: 26px;
-  padding: 4px 8px;
+  min-height: 18px;
+  padding: 1px 6px;
   border-radius: 999px;
   border: 1px solid var(--line);
   background: var(--surface-elevated);
   color: var(--text-soft);
   font-family: var(--mono);
-  font-size: 0.72rem;
-  letter-spacing: 0.08em;
+  font-size: 0.59rem;
+  letter-spacing: 0.05em;
   text-transform: uppercase;
 }
 
-.gpio-mini-token.is-high {
-  border-color: color-mix(in srgb, var(--accent) 30%, var(--line));
+.gpio-mini-token.is-mode-output {
+  border-color: color-mix(in srgb, var(--accent) 32%, var(--line));
   color: var(--accent-vivid);
 }
 
-.gpio-mini-token.is-low {
+.gpio-mini-token.is-mode-input {
+  border-color: color-mix(in srgb, var(--info) 28%, var(--line));
+  color: var(--info);
+}
+
+.gpio-mini-token.is-mode-bidirectional {
+  border-color: color-mix(in srgb, var(--accent) 22%, var(--info));
+  color: color-mix(in srgb, var(--accent-vivid) 60%, var(--info));
+}
+
+.gpio-mini-token.is-mode-idle {
   color: var(--text-soft);
 }
 
@@ -1233,6 +1416,11 @@ code {
   border-color: color-mix(in srgb, var(--warning) 30%, var(--line));
   color: var(--warning);
   background: color-mix(in srgb, var(--warning-soft) 52%, var(--surface-elevated));
+}
+
+.gpio-mini-token.is-analog {
+  border-color: color-mix(in srgb, var(--info) 24%, var(--line));
+  color: color-mix(in srgb, var(--accent-vivid) 52%, var(--info));
 }
 
 .gpio-detail-card {
@@ -1270,8 +1458,98 @@ code {
   line-height: 1.56;
 }
 
+.gpio-detail-card__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
 .gpio-detail-card__net {
   text-align: right;
+}
+
+.gpio-detail-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--surface-elevated);
+  color: var(--text-soft);
+  font-family: var(--mono);
+  font-size: 0.67rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.gpio-detail-chip.is-bus {
+  border-color: color-mix(in srgb, var(--info) 30%, var(--line));
+  color: var(--info);
+}
+
+.gpio-detail-chip.is-power {
+  border-color: color-mix(in srgb, var(--warning) 28%, var(--line));
+  color: var(--warning);
+}
+
+.gpio-detail-chip.is-analog {
+  border-color: color-mix(in srgb, var(--accent) 24%, var(--info));
+  color: color-mix(in srgb, var(--accent-vivid) 52%, var(--info));
+}
+
+.gpio-detail-chip.is-control {
+  border-color: color-mix(in srgb, var(--accent) 30%, var(--line));
+  color: var(--accent-vivid);
+}
+
+.gpio-detail-chip.is-strap,
+.gpio-detail-chip.is-usb {
+  border-color: color-mix(in srgb, var(--critical) 30%, var(--line));
+  color: var(--critical);
+}
+
+.gpio-detail-chip.is-debug {
+  border-color: color-mix(in srgb, var(--info) 22%, var(--line));
+  color: var(--info);
+}
+
+.gpio-detail-chip.is-high,
+.gpio-detail-metric.is-high {
+  border-color: color-mix(in srgb, var(--accent) 32%, var(--line));
+  color: var(--accent-vivid);
+}
+
+.gpio-detail-chip.is-low,
+.gpio-detail-metric.is-low {
+  border-color: color-mix(in srgb, var(--critical) 18%, var(--line));
+}
+
+.gpio-detail-chip.is-override,
+.gpio-detail-metric.is-override {
+  border-color: color-mix(in srgb, var(--warning) 26%, var(--line));
+  color: var(--warning);
+}
+
+.gpio-detail-chip.is-mode-output,
+.gpio-detail-metric.is-mode-output {
+  border-color: color-mix(in srgb, var(--accent) 28%, var(--line));
+}
+
+.gpio-detail-chip.is-mode-input,
+.gpio-detail-metric.is-mode-input {
+  border-color: color-mix(in srgb, var(--info) 24%, var(--line));
+}
+
+.gpio-detail-chip.is-mode-bidirectional,
+.gpio-detail-metric.is-mode-bidirectional {
+  border-color: color-mix(in srgb, var(--accent) 18%, var(--info));
+}
+
+.gpio-detail-chip.is-mode-idle,
+.gpio-detail-metric.is-mode-idle {
+  border-color: color-mix(in srgb, var(--line-strong) 75%, var(--line));
 }
 
 .gpio-risk-banner {
@@ -1297,6 +1575,67 @@ code {
 .gpio-detail-grid,
 .gpio-override-grid {
   gap: 14px;
+}
+
+.gpio-detail-metric {
+  transition: border-color 140ms ease, background 140ms ease, color 140ms ease;
+}
+
+.gpio-analog-card {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border-radius: 18px;
+  border: 1px solid color-mix(in srgb, var(--info) 22%, var(--line));
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--info-soft) 38%, var(--surface-elevated)), var(--surface-strong)),
+    var(--surface-soft);
+}
+
+.gpio-analog-card__head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: end;
+}
+
+.gpio-analog-card__head strong {
+  display: block;
+  font-size: 1rem;
+  letter-spacing: -0.03em;
+}
+
+.gpio-analog-card__meter {
+  height: 12px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--info) 18%, var(--line));
+  overflow: hidden;
+  background:
+    linear-gradient(90deg, color-mix(in srgb, var(--critical-soft) 30%, transparent), color-mix(in srgb, var(--warning-soft) 34%, transparent) 52%, color-mix(in srgb, var(--accent-soft) 48%, transparent));
+}
+
+.gpio-analog-card__meter span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--info), var(--accent-vivid));
+  box-shadow: 0 0 24px color-mix(in srgb, var(--accent-soft) 60%, transparent);
+}
+
+.gpio-analog-card__scale {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  color: var(--text-soft);
+  font-family: var(--mono);
+  font-size: 0.67rem;
+}
+
+.gpio-analog-card__scale span:nth-child(2) {
+  text-align: center;
+}
+
+.gpio-analog-card__scale span:last-child {
+  text-align: right;
 }
 
 .gpio-output-toggle {
@@ -3170,184 +3509,123 @@ code {
 
 .imu-posture-card {
   display: grid;
-  gap: 14px;
+  gap: 16px;
 }
 
 .imu-posture-card__viewport {
   position: relative;
-  min-height: 230px;
+  min-height: 340px;
   overflow: hidden;
-  border-radius: 22px;
-  border: 1px solid rgba(23, 45, 38, 0.08);
+  border-radius: 26px;
+  border: 1px solid color-mix(in srgb, var(--line-strong) 48%, rgba(23, 45, 38, 0.08));
   background:
-    radial-gradient(circle at top left, rgba(112, 170, 148, 0.18), transparent 36%),
-    linear-gradient(180deg, rgba(231, 242, 238, 0.96), rgba(245, 248, 247, 0.94));
-  perspective: 1100px;
-}
-
-.imu-posture-card__scene {
-  position: relative;
-  height: 100%;
-  min-height: 230px;
-  transform-style: preserve-3d;
-}
-
-.imu-posture-card__yaw-dial {
-  position: absolute;
-  left: 20px;
-  top: 18px;
-  width: 84px;
-  height: 84px;
-  display: grid;
-  place-items: center;
-  z-index: 2;
-}
-
-.imu-posture-card__yaw-dial-ring {
-  position: absolute;
-  inset: 0;
-  border-radius: 999px;
-  border: 1px solid rgba(28, 53, 48, 0.18);
-  background: radial-gradient(circle at center, rgba(255, 255, 255, 0.44), rgba(255, 255, 255, 0.06));
-  box-shadow: inset 0 0 0 10px rgba(35, 124, 92, 0.05);
-}
-
-.imu-posture-card__yaw-dial-pointer {
-  position: absolute;
-  width: 3px;
-  height: 28px;
-  border-radius: 999px;
-  background: linear-gradient(180deg, rgba(44, 192, 138, 0.9), rgba(44, 192, 138, 0.2));
-  transform-origin: center 30px;
-  transform: rotate(var(--imu-yaw-pointer-deg, 0deg)) translateY(-12px);
-  box-shadow: 0 0 12px rgba(44, 192, 138, 0.24);
-}
-
-.imu-posture-card__yaw-dial-center {
-  position: absolute;
-  width: 12px;
-  height: 12px;
-  border-radius: 999px;
-  background: rgba(28, 53, 48, 0.8);
-  box-shadow: 0 0 0 4px rgba(255, 255, 255, 0.55);
-}
-
-.imu-posture-card__yaw-dial-label {
-  position: absolute;
-  bottom: -18px;
-  font-size: 0.72rem;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: var(--text-soft);
-}
-
-.imu-posture-card__safe-band {
-  position: absolute;
-  inset: 54% 10% 24% 10%;
-  border-radius: 999px 999px 28px 28px;
-  background: linear-gradient(180deg, rgba(35, 124, 92, 0.06), rgba(35, 124, 92, 0.02));
-}
-
-.imu-posture-card__horizon {
-  position: absolute;
-  left: 10%;
-  right: 10%;
-  top: 54%;
-  height: 2px;
-  background: linear-gradient(90deg, rgba(28, 53, 48, 0.14), rgba(28, 53, 48, 0.62), rgba(28, 53, 48, 0.14));
-  box-shadow: 0 0 0 6px rgba(28, 53, 48, 0.04);
-}
-
-.imu-posture-card__horizon-label {
-  position: absolute;
-  right: 18px;
-  top: calc(54% - 18px);
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  color: var(--text-soft);
-  font-size: 0.78rem;
-  font-weight: 700;
-  letter-spacing: 0.03em;
-}
-
-.imu-posture-card__device {
-  position: absolute;
-  left: 50%;
-  bottom: 34px;
-  width: 220px;
-  height: 94px;
-  transform-style: preserve-3d;
-  transform:
-    translateX(-50%)
-    rotateY(var(--imu-yaw-deg, 0deg))
-    rotateX(var(--imu-pitch-deg, 0deg))
-    rotateZ(calc(var(--imu-roll-deg, 0deg) - 9deg));
-  transition: transform 90ms linear;
-}
-
-.imu-posture-card__body {
-  position: absolute;
-  inset: 0;
-  transform-style: preserve-3d;
-}
-
-.imu-posture-card__top,
-.imu-posture-card__side {
-  position: absolute;
-  inset: 0;
-  border-radius: 28px;
-  border: 1px solid rgba(23, 45, 38, 0.08);
-}
-
-.imu-posture-card__top {
-  background: linear-gradient(180deg, rgba(42, 52, 60, 0.96), rgba(17, 24, 29, 0.92));
+    radial-gradient(circle at 18% 12%, rgba(116, 207, 179, 0.14), transparent 24%),
+    radial-gradient(circle at 84% 18%, rgba(80, 133, 223, 0.1), transparent 28%),
+    linear-gradient(180deg, rgba(239, 245, 242, 0.98), rgba(247, 249, 248, 0.96));
   box-shadow:
-    0 20px 36px rgba(18, 22, 28, 0.24),
-    inset 0 1px 0 rgba(255, 255, 255, 0.08);
-  transform: translateZ(12px);
+    inset 0 1px 0 rgba(255, 255, 255, 0.7),
+    0 22px 42px rgba(17, 24, 38, 0.08);
 }
 
-.imu-posture-card__side {
-  background: linear-gradient(180deg, rgba(28, 33, 40, 0.98), rgba(10, 13, 16, 0.98));
-  transform: rotateX(90deg) translateZ(-32px);
-  height: 64px;
-  top: auto;
+.imu-posture-card__canvas {
+  display: block;
+  width: 100%;
+  height: 340px;
 }
 
-.imu-posture-card__window {
-  position: absolute;
-  right: 18px;
-  top: 18px;
-  width: 28px;
-  height: 28px;
+.haptic-pattern-lab__facts div {
+  border: 1px solid rgba(21, 48, 53, 0.08);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.6);
+  padding: 10px 12px;
+  display: grid;
+  gap: 3px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.55);
+}
+
+.haptic-pattern-lab__facts strong {
+  font-size: 1.02rem;
+  letter-spacing: -0.03em;
+}
+
+.haptic-pattern-lab__facts span {
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-soft);
+}
+
+.haptic-pattern-lab {
+  display: grid;
+  gap: 14px;
+  padding: 16px;
+  border-radius: 22px;
+  border: 1px solid color-mix(in srgb, var(--warning) 16%, var(--line));
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.78), rgba(246, 246, 242, 0.82)),
+    var(--surface-soft);
+}
+
+.haptic-pattern-lab.is-armed {
+  border-color: color-mix(in srgb, var(--warning) 36%, var(--line));
+  box-shadow: inset 0 0 0 1px rgba(209, 154, 52, 0.08);
+}
+
+.haptic-pattern-lab__head {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  align-items: flex-start;
+}
+
+.haptic-pattern-lab__presets {
+  display: flex;
+  flex-wrap: wrap;
+}
+
+.haptic-pattern-lab__preview {
+  display: flex;
+  gap: 4px;
+  align-items: stretch;
+  min-height: 28px;
+  padding: 6px;
+  border-radius: 16px;
+  background: rgba(17, 26, 45, 0.05);
+  border: 1px solid rgba(21, 48, 53, 0.08);
+}
+
+.haptic-pattern-lab__preview span {
+  display: block;
   border-radius: 999px;
-  background: radial-gradient(circle at 35% 35%, rgba(255, 255, 255, 0.82), rgba(123, 169, 202, 0.72) 34%, rgba(48, 79, 103, 0.88));
-  transform: translateZ(17px);
-  box-shadow: 0 0 0 6px rgba(163, 211, 245, 0.12);
+  min-width: 10px;
 }
 
-.imu-posture-card__beam {
-  position: absolute;
-  right: -112px;
-  top: 43px;
-  width: 128px;
-  height: 8px;
-  border-radius: 999px;
-  transform: translateZ(16px);
-  background: linear-gradient(90deg, rgba(44, 192, 138, 0.18), rgba(44, 192, 138, 0.92));
-  box-shadow: 0 0 18px rgba(44, 192, 138, 0.28);
+.haptic-pattern-lab__preview .is-active {
+  background: linear-gradient(180deg, rgba(221, 140, 44, 0.92), rgba(209, 154, 52, 0.58));
+  box-shadow: 0 0 10px rgba(209, 154, 52, 0.24);
 }
 
-.imu-posture-card__beam[data-tone='warning'] {
-  background: linear-gradient(90deg, rgba(209, 154, 52, 0.18), rgba(209, 154, 52, 0.9));
-  box-shadow: 0 0 18px rgba(209, 154, 52, 0.24);
+.haptic-pattern-lab__preview .is-gap {
+  background: rgba(17, 26, 45, 0.14);
 }
 
-.imu-posture-card__beam[data-tone='critical'] {
-  background: linear-gradient(90deg, rgba(207, 100, 85, 0.18), rgba(207, 100, 85, 0.9));
-  box-shadow: 0 0 18px rgba(207, 100, 85, 0.26);
+.haptic-pattern-lab__facts {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.haptic-pattern-lab__toggle {
+  border-radius: 16px;
+  padding: 10px 12px;
+  background: rgba(255, 255, 255, 0.56);
+  border: 1px solid rgba(21, 48, 53, 0.08);
+}
+
+.haptic-pattern-lab__toggle.is-danger {
+  border-color: color-mix(in srgb, var(--critical) 24%, var(--line));
+  background: color-mix(in srgb, var(--critical) 8%, rgba(255, 255, 255, 0.72));
 }
 
 .help-hint {
@@ -3835,6 +4113,43 @@ code {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
+.bringup-illumination-card {
+  display: grid;
+  gap: 14px;
+  margin-top: 16px;
+  border-color: color-mix(in srgb, var(--warning) 26%, var(--line));
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--warning-soft) 72%, var(--panel)),
+      color-mix(in srgb, var(--accent-soft) 20%, var(--panel))
+    );
+}
+
+.bringup-illumination-card input[type='range'] {
+  width: 100%;
+  accent-color: var(--warning);
+}
+
+.bringup-illumination-meter {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: center;
+}
+
+.bringup-illumination-meter > div span {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 0.82rem;
+  color: var(--text-soft);
+}
+
+.bringup-illumination-meter > div strong {
+  font-size: 1.1rem;
+}
+
 .bringup-verification-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -4027,14 +4342,6 @@ code {
     grid-column: 1 / -1;
   }
 
-  .gpio-module-visual {
-    grid-template-columns: 1fr;
-  }
-
-  .gpio-module-visual__center-stats {
-    grid-template-columns: 1fr;
-  }
-
   .gpio-detail-card__net {
     text-align: left;
   }
@@ -4099,6 +4406,15 @@ code {
 
   .gpio-output-toggle__buttons {
     width: 100%;
+  }
+
+  .gpio-module-visual {
+    grid-template-columns: 1fr;
+  }
+
+  .gpio-module-visual__center-stats,
+  .gpio-analog-card__head {
+    grid-template-columns: 1fr;
   }
 
   .event-card__toggle {

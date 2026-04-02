@@ -24,7 +24,7 @@ typedef struct {
     laser_controller_power_tier_t power_tier;
     laser_controller_nm_t target_lambda_nm;
     laser_controller_nm_t actual_lambda_nm;
-    laser_controller_board_inputs_t hw;
+    const laser_controller_board_inputs_t *hw;
 } laser_controller_safety_snapshot_t;
 
 typedef struct {

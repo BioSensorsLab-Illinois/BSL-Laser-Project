@@ -1,4 +1,10 @@
-import type { DeviceSnapshot, SessionEvent, TransportMessage } from '../types'
+import type {
+  DeviceSnapshot,
+  RealtimeTelemetryPatch,
+  SessionEvent,
+  TransportMessage,
+} from '../types'
+import { normalizeGpioInspector } from './gpio-inspector'
 
 type RawProtocolMessage = {
   type?: 'resp' | 'event'
@@ -86,6 +92,23 @@ type ProtocolLineContext = {
   onProtocolReady?: () => void
 }
 
+function normalizeSnapshotCandidate(raw: unknown): DeviceSnapshot | undefined {
+  if (typeof raw !== 'object' || raw === null || !('session' in raw)) {
+    return undefined
+  }
+
+  const normalized = { ...(raw as Record<string, unknown>) } as unknown as DeviceSnapshot
+  const gpioInspector = normalizeGpioInspector(
+    (raw as { gpioInspector?: unknown }).gpioInspector,
+  )
+
+  if (gpioInspector !== undefined) {
+    normalized.gpioInspector = gpioInspector
+  }
+
+  return normalized
+}
+
 export function interpretControllerLine(
   line: string,
   context: ProtocolLineContext,
@@ -109,11 +132,11 @@ export function interpretControllerLine(
 
   if (parsed.type === 'resp' && typeof parsed.id === 'number') {
     context.onProtocolReady?.()
-    const candidateSnapshot = (parsed.result?.snapshot ?? parsed.result) as
-      | DeviceSnapshot
-      | undefined
+    const candidateSnapshot = normalizeSnapshotCandidate(
+      (parsed.result?.snapshot ?? parsed.result) as Record<string, unknown> | undefined,
+    )
 
-    if (candidateSnapshot !== undefined && 'session' in candidateSnapshot) {
+    if (candidateSnapshot !== undefined) {
       context.emit({
         kind: 'snapshot',
         snapshot: candidateSnapshot,
@@ -137,11 +160,22 @@ export function interpretControllerLine(
     return
   }
 
-  const maybeSnapshot = (parsed.payload?.snapshot ??
-    parsed.payload ??
-    parsed.result) as DeviceSnapshot | undefined
+  if (parsed.event === 'live_telemetry' || parsed.event === 'fast_telemetry') {
+    context.onProtocolReady?.()
+    context.emit({
+      kind: 'telemetry',
+      telemetry: parsed.payload as unknown as RealtimeTelemetryPatch,
+    })
+    return
+  }
 
-  if (maybeSnapshot !== undefined && 'session' in maybeSnapshot) {
+  const maybeSnapshot = normalizeSnapshotCandidate(
+    (parsed.payload?.snapshot ??
+      parsed.payload ??
+      parsed.result) as Record<string, unknown> | undefined,
+  )
+
+  if (maybeSnapshot !== undefined) {
     context.onProtocolReady?.()
     context.emit({
       kind: 'snapshot',

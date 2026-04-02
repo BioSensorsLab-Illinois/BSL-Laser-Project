@@ -1,7 +1,12 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Cpu, RefreshCcw, TriangleAlert } from 'lucide-react'
 
-import { gpioModulePins } from '../lib/gpio-layout'
+import { formatNumber } from '../lib/format'
+import {
+  gpioModulePins,
+  type GpioModulePinMeta,
+  type GpioModuleSignalClass,
+} from '../lib/gpio-layout'
 import type {
   CommandRisk,
   DeviceSnapshot,
@@ -28,6 +33,22 @@ type GpioDraft = {
   levelHigh: boolean
   bias: GpioBias
 }
+
+type GpioAnalogReading = {
+  label: string
+  voltageV: number
+  caption: string
+}
+
+const gpioSignalLegend: GpioModuleSignalClass[] = [
+  'bus',
+  'power',
+  'analog',
+  'control',
+  'usb',
+  'strap',
+  'debug',
+]
 
 function inferBias(pullupEnabled: boolean, pulldownEnabled: boolean): GpioBias {
   if (pullupEnabled) {
@@ -73,6 +94,38 @@ function formatActualMode(pin: GpioPinReadback) {
   return 'Not actively configured'
 }
 
+function formatCompactMode(pin: GpioPinReadback) {
+  if (pin.inputEnabled && pin.outputEnabled) {
+    return pin.openDrainEnabled ? 'IN/OD' : 'I/O'
+  }
+
+  if (pin.outputEnabled) {
+    return pin.openDrainEnabled ? 'OD' : 'OUT'
+  }
+
+  if (pin.inputEnabled) {
+    return 'IN'
+  }
+
+  return 'OFF'
+}
+
+function getModeTone(pin: GpioPinReadback) {
+  if (pin.inputEnabled && pin.outputEnabled) {
+    return 'bidirectional'
+  }
+
+  if (pin.outputEnabled) {
+    return 'output'
+  }
+
+  if (pin.inputEnabled) {
+    return 'input'
+  }
+
+  return 'idle'
+}
+
 function formatBias(pin: GpioPinReadback) {
   if (pin.pullupEnabled) {
     return 'Pull-up'
@@ -104,6 +157,43 @@ function formatOverrideBias(draft: GpioDraft) {
     pullup_enabled: false,
     pulldown_enabled: false,
   }
+}
+
+function formatSignalClass(signalClass: GpioModuleSignalClass) {
+  switch (signalClass) {
+    case 'bus':
+      return 'Bus'
+    case 'power':
+      return 'Power'
+    case 'analog':
+      return 'Analog'
+    case 'control':
+      return 'Control'
+    case 'strap':
+      return 'Boot / strap'
+    case 'usb':
+      return 'USB'
+    case 'debug':
+      return 'Debug'
+    default:
+      return 'GPIO'
+  }
+}
+
+function deriveAnalogReading(
+  meta: GpioModulePinMeta,
+  snapshot: DeviceSnapshot,
+): GpioAnalogReading | null {
+  if (meta.analogTelemetry === 'tecTempAdc') {
+    return {
+      label: 'TEC temperature ADC',
+      voltageV: snapshot.tec.tempAdcVoltageV,
+      caption:
+        'Live TEC temperature monitor sample from the controller snapshot. Meter range is shown against the 0 V to 3.3 V ADC span.',
+    }
+  }
+
+  return null
 }
 
 export function GpioWorkbench({
@@ -150,15 +240,46 @@ export function GpioWorkbench({
     } satisfies GpioPinReadback)
   const selectedMeta =
     gpioModulePins.find((pin) => pin.gpioNum === selectedPin.gpioNum) ?? gpioModulePins[0]
+  const selectedAnalogReading =
+    selectedMeta !== undefined ? deriveAnalogReading(selectedMeta, snapshot) : null
+  const selectedAnalogPercent =
+    selectedAnalogReading !== null
+      ? Math.max(0, Math.min(100, (selectedAnalogReading.voltageV / 3.3) * 100))
+      : 0
 
   const [draft, setDraft] = useState<GpioDraft>(() => makeDraftFromPin(selectedPin))
+  const [draftDirty, setDraftDirty] = useState(false)
 
   const serviceWriteReady = connected && snapshot.bringup.serviceModeActive
-  const anyOverrideActive = snapshot.gpioInspector.anyOverrideActive
+  const activeOverrideCount = useMemo(
+    () => snapshot.gpioInspector.pins.filter((pin) => pin.overrideActive).length,
+    [snapshot.gpioInspector.pins],
+  )
+  const anyOverrideActive = activeOverrideCount > 0
+
+  const selectedPinSyncKey = [
+    selectedPin.gpioNum,
+    selectedPin.levelHigh ? 1 : 0,
+    selectedPin.overrideActive ? 1 : 0,
+    selectedPin.overrideMode,
+    selectedPin.overrideLevelHigh ? 1 : 0,
+    selectedPin.overridePullupEnabled ? 1 : 0,
+    selectedPin.overridePulldownEnabled ? 1 : 0,
+    selectedPin.pullupEnabled ? 1 : 0,
+    selectedPin.pulldownEnabled ? 1 : 0,
+  ].join(':')
+  const liveDraft = useMemo(() => makeDraftFromPin(selectedPin), [selectedPinSyncKey])
+
+  useEffect(() => {
+    if (!draftDirty) {
+      setDraft(liveDraft)
+    }
+  }, [draftDirty, liveDraft])
 
   function selectGpio(gpioNum: number) {
     const nextPin = pinLookup.get(gpioNum)
     setSelectedGpio(gpioNum)
+    setDraftDirty(false)
     if (nextPin !== undefined) {
       setDraft(makeDraftFromPin(nextPin))
     }
@@ -187,8 +308,8 @@ export function GpioWorkbench({
       },
     )
 
-    if (ok && draft.mode === 'firmware') {
-      setDraft(makeDraftFromPin(selectedPin))
+    if (ok) {
+      setDraftDirty(false)
     }
   }
 
@@ -208,7 +329,7 @@ export function GpioWorkbench({
     )
 
     if (ok) {
-      setDraft(makeDraftFromPin(selectedPin))
+      setDraftDirty(false)
     }
   }
 
@@ -221,7 +342,7 @@ export function GpioWorkbench({
     )
 
     if (ok) {
-      setDraft(makeDraftFromPin(selectedPin))
+      setDraftDirty(false)
     }
   }
 
@@ -234,7 +355,8 @@ export function GpioWorkbench({
     }
 
     const isSelected = gpioNum === selectedGpio
-    const actualMode = pin.outputEnabled ? 'OUT' : pin.inputEnabled ? 'IN' : 'IDLE'
+    const actualMode = formatCompactMode(pin)
+    const analogReading = deriveAnalogReading(meta, snapshot)
 
     return (
       <button
@@ -242,6 +364,7 @@ export function GpioWorkbench({
         type="button"
         className={[
           'gpio-pin-button',
+          `gpio-pin-button--${meta.signalClass}`,
           isSelected ? 'is-selected' : '',
           pin.overrideActive ? 'is-overridden' : '',
           pin.levelHigh ? 'is-high' : 'is-low',
@@ -254,14 +377,23 @@ export function GpioWorkbench({
       >
         <div className="gpio-pin-button__head">
           <strong>GPIO{gpioNum}</strong>
-          <span>pin {meta.modulePin}</span>
+          <span>P{meta.modulePin}</span>
         </div>
-        <span className="gpio-pin-button__label">{meta.label}</span>
+        <div className="gpio-pin-button__body">
+          <span className="gpio-pin-button__label">{meta.label}</span>
+          <span className="gpio-pin-button__net">{meta.netName}</span>
+        </div>
         <div className="gpio-pin-button__tokens">
-          <span className={`gpio-mini-token ${pin.levelHigh ? 'is-high' : 'is-low'}`}>
-            {pin.levelHigh ? 'HIGH' : 'LOW'}
-          </span>
-          <span className="gpio-mini-token">{actualMode}</span>
+          <span
+            className={`gpio-state-dot ${pin.levelHigh ? 'is-high' : 'is-low'}`}
+            aria-hidden="true"
+          />
+          <span className={`gpio-mini-token is-mode-${getModeTone(pin)}`}>{actualMode}</span>
+          {analogReading !== null ? (
+            <span className="gpio-mini-token is-analog">
+              {formatNumber(analogReading.voltageV, 2)}V
+            </span>
+          ) : null}
           {pin.overrideActive ? <span className="gpio-mini-token is-override">OVR</span> : null}
         </div>
       </button>
@@ -289,46 +421,57 @@ export function GpioWorkbench({
             {serviceWriteReady ? 'Service write enabled' : 'Read-only until service mode'}
           </span>
           <span className={`status-badge ${anyOverrideActive ? 'is-warn' : ''}`}>
-            {snapshot.gpioInspector.activeOverrideCount} override
-            {snapshot.gpioInspector.activeOverrideCount === 1 ? '' : 's'}
+            {activeOverrideCount} override
+            {activeOverrideCount === 1 ? '' : 's'}
           </span>
         </div>
       </div>
 
       <div className="gpio-workbench__layout">
         <div className="gpio-module-visual">
-          <div className="gpio-module-visual__column">
+          <div className="gpio-module-visual__column gpio-module-visual__column--left">
             {leftPins.map((pin) => renderPinButton(pin.gpioNum))}
           </div>
 
           <div className="gpio-module-visual__chip">
-            <div className="gpio-module-visual__badge">ESP32-S3-WROOM</div>
-            <strong>Physical module map</strong>
-            <p>
-              Select a side pad to inspect actual readback and optionally apply a
-              temporary service override.
-            </p>
-            <div className="gpio-module-visual__center-stats">
-              <div>
-                <span>Visible pads</span>
-                <strong>{gpioModulePins.length}</strong>
+            <div className="gpio-module-visual__antenna" />
+            <div className="gpio-module-visual__package">
+              <div className="gpio-module-visual__badge">ESP32-S3-WROOM</div>
+              <strong>Castellated live map</strong>
+              <p>
+                Compact pad view sized closer to the module footprint. Select a pad
+                to inspect live state and stage a temporary service override.
+              </p>
+              <div className="gpio-module-visual__legend">
+                {gpioSignalLegend.map((signalClass) => (
+                  <span
+                    key={signalClass}
+                    className={`gpio-detail-chip is-${signalClass}`}
+                  >
+                    {formatSignalClass(signalClass)}
+                  </span>
+                ))}
               </div>
-              <div>
-                <span>Overrides</span>
-                <strong>{snapshot.gpioInspector.activeOverrideCount}</strong>
-              </div>
-              <div>
-                <span>Transport risk pins</span>
-                <strong>
-                  {
-                    gpioModulePins.filter((pin) => pin.riskNote !== undefined).length
-                  }
-                </strong>
+              <div className="gpio-module-visual__center-stats">
+                <div>
+                  <span>Visible pads</span>
+                  <strong>{gpioModulePins.length}</strong>
+                </div>
+                <div>
+                  <span>Overrides</span>
+                  <strong>{activeOverrideCount}</strong>
+                </div>
+                <div>
+                  <span>Risk pins</span>
+                  <strong>
+                    {gpioModulePins.filter((pin) => pin.riskNote !== undefined).length}
+                  </strong>
+                </div>
               </div>
             </div>
           </div>
 
-          <div className="gpio-module-visual__column">
+          <div className="gpio-module-visual__column gpio-module-visual__column--right">
             {rightPins.map((pin) => renderPinButton(pin.gpioNum))}
           </div>
         </div>
@@ -355,6 +498,20 @@ export function GpioWorkbench({
             <div>
               <strong>{selectedMeta?.label ?? `GPIO${selectedPin.gpioNum}`}</strong>
               <p>{selectedMeta?.detail ?? 'No board annotation available for this pad.'}</p>
+              <div className="gpio-detail-card__chips">
+                <span className={`gpio-detail-chip is-${selectedMeta?.signalClass ?? 'control'}`}>
+                  {formatSignalClass(selectedMeta?.signalClass ?? 'control')}
+                </span>
+                <span className={`gpio-detail-chip ${selectedPin.levelHigh ? 'is-high' : 'is-low'}`}>
+                  {selectedPin.levelHigh ? 'Level high' : 'Level low'}
+                </span>
+                <span className={`gpio-detail-chip is-mode-${getModeTone(selectedPin)}`}>
+                  {formatCompactMode(selectedPin)}
+                </span>
+                {selectedPin.overrideActive ? (
+                  <span className="gpio-detail-chip is-override">Service override</span>
+                ) : null}
+              </div>
             </div>
             <div className="gpio-detail-card__net">
               <span className="eyebrow">Board net</span>
@@ -370,26 +527,26 @@ export function GpioWorkbench({
           ) : null}
 
           <div className="metric-grid is-two gpio-detail-grid">
-            <div className="metric-card">
+            <div className={`metric-card gpio-detail-metric is-mode-${getModeTone(selectedPin)}`}>
               <span>Actual direction</span>
               <strong>{formatActualMode(selectedPin)}</strong>
               <small>
                 {selectedPin.outputCapable ? 'output-capable pad' : 'input-only / limited pad'}
               </small>
             </div>
-            <div className="metric-card">
+            <div className="metric-card gpio-detail-metric">
               <span>Actual bias</span>
               <strong>{formatBias(selectedPin)}</strong>
               <small>
                 {selectedPin.openDrainEnabled ? 'open-drain enabled' : 'push-pull or input path'}
               </small>
             </div>
-            <div className="metric-card">
+            <div className={`metric-card gpio-detail-metric ${selectedPin.levelHigh ? 'is-high' : 'is-low'}`}>
               <span>Actual level</span>
               <strong>{selectedPin.levelHigh ? 'High' : 'Low'}</strong>
               <small>live pin sample from the controller snapshot</small>
             </div>
-            <div className="metric-card">
+            <div className={`metric-card gpio-detail-metric ${selectedPin.overrideActive ? 'is-override' : ''}`}>
               <span>Override owner</span>
               <strong>
                 {selectedPin.overrideActive
@@ -404,6 +561,46 @@ export function GpioWorkbench({
             </div>
           </div>
 
+          {selectedMeta?.signalClass === 'analog' ? (
+            <div className="gpio-analog-card">
+              <div className="gpio-analog-card__head">
+                <div>
+                  <span className="eyebrow">ADC range meter</span>
+                  <strong>
+                    {selectedAnalogReading?.label ?? 'Analog telemetry input'}
+                  </strong>
+                </div>
+                <strong>
+                  {selectedAnalogReading !== null
+                    ? `${formatNumber(selectedAnalogReading.voltageV, 3)} V`
+                    : 'No live ADC voltage'}
+                </strong>
+              </div>
+
+              <div
+                className="gpio-analog-card__meter"
+                role="progressbar"
+                aria-label="ADC voltage"
+                aria-valuemin={0}
+                aria-valuemax={3.3}
+                aria-valuenow={selectedAnalogReading?.voltageV ?? 0}
+              >
+                <span style={{ width: `${selectedAnalogPercent}%` }} />
+              </div>
+
+              <div className="gpio-analog-card__scale" aria-hidden="true">
+                <span>0.0 V</span>
+                <span>1.65 V</span>
+                <span>3.3 V</span>
+              </div>
+
+              <small>
+                {selectedAnalogReading?.caption ??
+                  'This pad is marked as an analog telemetry input, but the current snapshot does not publish a raw 0-3.3 V ADC sample for it yet.'}
+              </small>
+            </div>
+          ) : null}
+
           <div className="field-grid gpio-override-grid">
             <label className="field">
               <span className="field-label">Override mode</span>
@@ -411,10 +608,13 @@ export function GpioWorkbench({
                 value={draft.mode}
                 title="Firmware returns ownership to the original control logic. Input and output claim the pin in service mode."
                 onChange={(event) =>
-                  setDraft((current) => ({
-                    ...current,
-                    mode: event.target.value as GpioOverrideMode,
-                  }))
+                  {
+                    setDraftDirty(true)
+                    setDraft((current) => ({
+                      ...current,
+                      mode: event.target.value as GpioOverrideMode,
+                    }))
+                  }
                 }
               >
                 <option value="firmware">Firmware control</option>
@@ -431,10 +631,13 @@ export function GpioWorkbench({
                 value={draft.bias}
                 title="Apply a pull-up or pull-down during the service override."
                 onChange={(event) =>
-                  setDraft((current) => ({
-                    ...current,
-                    bias: event.target.value as GpioBias,
-                  }))
+                  {
+                    setDraftDirty(true)
+                    setDraft((current) => ({
+                      ...current,
+                      bias: event.target.value as GpioBias,
+                    }))
+                  }
                 }
               >
                 <option value="floating">Floating</option>
@@ -451,12 +654,13 @@ export function GpioWorkbench({
                 type="button"
                 className={`segmented__button ${!draft.levelHigh ? 'is-active' : ''}`}
                 disabled={draft.mode !== 'output'}
-                onClick={() =>
+                onClick={() => {
+                  setDraftDirty(true)
                   setDraft((current) => ({
                     ...current,
                     levelHigh: false,
                   }))
-                }
+                }}
               >
                 Drive low
               </button>
@@ -464,12 +668,13 @@ export function GpioWorkbench({
                 type="button"
                 className={`segmented__button ${draft.levelHigh ? 'is-active' : ''}`}
                 disabled={draft.mode !== 'output'}
-                onClick={() =>
+                onClick={() => {
+                  setDraftDirty(true)
                   setDraft((current) => ({
                     ...current,
                     levelHigh: true,
                   }))
-                }
+                }}
               >
                 Drive high
               </button>

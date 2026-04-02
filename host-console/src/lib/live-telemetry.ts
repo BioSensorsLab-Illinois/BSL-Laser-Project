@@ -1,0 +1,228 @@
+import type {
+  DeviceSnapshot,
+  RealtimeTelemetry,
+  RealtimeTelemetryPatch,
+} from '../types'
+
+type Listener = () => void
+
+export interface RealtimeTelemetryStore {
+  getSnapshot(): RealtimeTelemetry
+  subscribe(listener: Listener): () => void
+}
+
+export interface RealtimeTelemetryController extends RealtimeTelemetryStore {
+  publish(telemetry: RealtimeTelemetryPatch): void
+  reset(snapshot: DeviceSnapshot): void
+  syncFromSnapshot(snapshot: DeviceSnapshot): void
+}
+
+export function makeRealtimeTelemetryFromSnapshot(
+  snapshot: DeviceSnapshot,
+): RealtimeTelemetry {
+  return {
+    session: {
+      uptimeSeconds: snapshot.session.uptimeSeconds,
+      state: snapshot.session.state,
+      powerTier: snapshot.session.powerTier,
+    },
+    pd: {
+      contractValid: snapshot.pd.contractValid,
+      negotiatedPowerW: snapshot.pd.negotiatedPowerW,
+      sourceVoltageV: snapshot.pd.sourceVoltageV,
+      sourceCurrentA: snapshot.pd.sourceCurrentA,
+      operatingCurrentA: snapshot.pd.operatingCurrentA,
+      sourceIsHostOnly: snapshot.pd.sourceIsHostOnly,
+    },
+    rails: {
+      ld: { ...snapshot.rails.ld },
+      tec: { ...snapshot.rails.tec },
+    },
+    imu: { ...snapshot.imu },
+    tof: { ...snapshot.tof },
+    laser: { ...snapshot.laser },
+    tec: { ...snapshot.tec },
+    safety: {
+      allowAlignment: snapshot.safety.allowAlignment,
+      allowNir: snapshot.safety.allowNir,
+      horizonBlocked: snapshot.safety.horizonBlocked,
+      distanceBlocked: snapshot.safety.distanceBlocked,
+      lambdaDriftBlocked: snapshot.safety.lambdaDriftBlocked,
+      tecTempAdcBlocked: snapshot.safety.tecTempAdcBlocked,
+      actualLambdaNm: snapshot.safety.actualLambdaNm,
+      targetLambdaNm: snapshot.safety.targetLambdaNm,
+      lambdaDriftNm: snapshot.safety.lambdaDriftNm,
+      tempAdcVoltageV: snapshot.safety.tempAdcVoltageV,
+    },
+    buttons: { ...snapshot.buttons },
+    bringup: {
+      serviceModeRequested: snapshot.bringup.serviceModeRequested,
+      serviceModeActive: snapshot.bringup.serviceModeActive,
+      illumination: {
+        tof: { ...snapshot.bringup.illumination.tof },
+      },
+    },
+    fault: {
+      latched: snapshot.fault.latched,
+      activeCode: snapshot.fault.activeCode,
+      activeCount: snapshot.fault.activeCount,
+      tripCounter: snapshot.fault.tripCounter,
+    },
+  }
+}
+
+export function mergeRealtimeTelemetryIntoSnapshot(
+  snapshot: DeviceSnapshot,
+  telemetry: RealtimeTelemetry,
+): DeviceSnapshot {
+  return {
+    ...snapshot,
+    session: {
+      ...snapshot.session,
+      uptimeSeconds: telemetry.session.uptimeSeconds,
+      state: telemetry.session.state,
+      powerTier: telemetry.session.powerTier,
+    },
+    pd: {
+      ...snapshot.pd,
+      contractValid: telemetry.pd.contractValid,
+      negotiatedPowerW: telemetry.pd.negotiatedPowerW,
+      sourceVoltageV: telemetry.pd.sourceVoltageV,
+      sourceCurrentA: telemetry.pd.sourceCurrentA,
+      operatingCurrentA: telemetry.pd.operatingCurrentA,
+      sourceIsHostOnly: telemetry.pd.sourceIsHostOnly,
+    },
+    rails: {
+      ld: { ...snapshot.rails.ld, ...telemetry.rails.ld },
+      tec: { ...snapshot.rails.tec, ...telemetry.rails.tec },
+    },
+    imu: { ...snapshot.imu, ...telemetry.imu },
+    tof: { ...snapshot.tof, ...telemetry.tof },
+    laser: { ...snapshot.laser, ...telemetry.laser },
+    tec: { ...snapshot.tec, ...telemetry.tec },
+    safety: {
+      ...snapshot.safety,
+      ...telemetry.safety,
+    },
+    buttons: { ...snapshot.buttons, ...telemetry.buttons },
+    bringup: {
+      ...snapshot.bringup,
+      serviceModeRequested: telemetry.bringup.serviceModeRequested,
+      serviceModeActive: telemetry.bringup.serviceModeActive,
+      illumination: {
+        ...snapshot.bringup.illumination,
+        tof: {
+          ...snapshot.bringup.illumination.tof,
+          ...telemetry.bringup.illumination.tof,
+        },
+      },
+    },
+    fault: {
+      ...snapshot.fault,
+      ...telemetry.fault,
+    },
+  }
+}
+
+function mergeRealtimeTelemetry(
+  current: RealtimeTelemetry,
+  patch: RealtimeTelemetryPatch,
+): RealtimeTelemetry {
+  return {
+    session: {
+      ...current.session,
+      ...(patch.session ?? {}),
+    },
+    pd: {
+      ...current.pd,
+      ...(patch.pd ?? {}),
+    },
+    rails: {
+      ld: {
+        ...current.rails.ld,
+        ...(patch.rails?.ld ?? {}),
+      },
+      tec: {
+        ...current.rails.tec,
+        ...(patch.rails?.tec ?? {}),
+      },
+    },
+    imu: {
+      ...current.imu,
+      ...(patch.imu ?? {}),
+    },
+    tof: {
+      ...current.tof,
+      ...(patch.tof ?? {}),
+    },
+    laser: {
+      ...current.laser,
+      ...(patch.laser ?? {}),
+    },
+    tec: {
+      ...current.tec,
+      ...(patch.tec ?? {}),
+    },
+    safety: {
+      ...current.safety,
+      ...(patch.safety ?? {}),
+    },
+    buttons: {
+      ...current.buttons,
+      ...(patch.buttons ?? {}),
+    },
+    bringup: {
+      ...current.bringup,
+      ...(patch.bringup ?? {}),
+      illumination: {
+        ...current.bringup.illumination,
+        ...(patch.bringup?.illumination ?? {}),
+        tof: {
+          ...current.bringup.illumination.tof,
+          ...(patch.bringup?.illumination?.tof ?? {}),
+        },
+      },
+    },
+    fault: {
+      ...current.fault,
+      ...(patch.fault ?? {}),
+    },
+  }
+}
+
+export function createRealtimeTelemetryStore(
+  initialSnapshot: DeviceSnapshot,
+): RealtimeTelemetryController {
+  let current = makeRealtimeTelemetryFromSnapshot(initialSnapshot)
+  const listeners = new Set<Listener>()
+
+  const notify = () => {
+    for (const listener of listeners) {
+      listener()
+    }
+  }
+
+  return {
+    getSnapshot() {
+      return current
+    },
+    subscribe(listener: Listener) {
+      listeners.add(listener)
+      return () => {
+        listeners.delete(listener)
+      }
+    },
+    publish(telemetry: RealtimeTelemetryPatch) {
+      current = mergeRealtimeTelemetry(current, telemetry)
+      notify()
+    },
+    reset(snapshot: DeviceSnapshot) {
+      current = makeRealtimeTelemetryFromSnapshot(snapshot)
+      notify()
+    },
+    syncFromSnapshot(snapshot: DeviceSnapshot) {
+      current = makeRealtimeTelemetryFromSnapshot(snapshot)
+      notify()
+    },
+  }
+}

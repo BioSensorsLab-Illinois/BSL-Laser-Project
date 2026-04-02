@@ -191,6 +191,19 @@ export interface BringupTools {
   lastAction: string
 }
 
+export interface TofIlluminationStatus {
+  enabled: boolean
+  dutyCyclePct: number
+  frequencyHz: number
+}
+
+export interface ButtonRuntimeStatus {
+  stage1Pressed: boolean
+  stage2Pressed: boolean
+  stage1Edge: boolean
+  stage2Edge: boolean
+}
+
 export interface DacPeripheralReadback {
   reachable: boolean
   configured: boolean
@@ -296,6 +309,9 @@ export interface BringupStatus {
     ldRequested: boolean
     tecRequested: boolean
   }
+  illumination: {
+    tof: TofIlluminationStatus
+  }
   modules: BringupModuleMap
   tuning: BringupTuning
   tools: BringupTools
@@ -308,6 +324,72 @@ export interface FaultSummary {
   tripCounter: number
   lastFaultAtIso: string | null
 }
+
+export interface RealtimeSessionStatus {
+  uptimeSeconds: number
+  state: SystemState
+  powerTier: PowerTier
+}
+
+export interface RealtimePdStatus {
+  contractValid: boolean
+  negotiatedPowerW: number
+  sourceVoltageV: number
+  sourceCurrentA: number
+  operatingCurrentA: number
+  sourceIsHostOnly: boolean
+}
+
+export interface RealtimeSafetyStatus {
+  allowAlignment: boolean
+  allowNir: boolean
+  horizonBlocked: boolean
+  distanceBlocked: boolean
+  lambdaDriftBlocked: boolean
+  tecTempAdcBlocked: boolean
+  actualLambdaNm: number
+  targetLambdaNm: number
+  lambdaDriftNm: number
+  tempAdcVoltageV: number
+}
+
+export interface RealtimeBringupStatus {
+  serviceModeRequested: boolean
+  serviceModeActive: boolean
+  illumination: {
+    tof: TofIlluminationStatus
+  }
+}
+
+export interface RealtimeFaultSummary {
+  latched: boolean
+  activeCode: string
+  activeCount: number
+  tripCounter: number
+}
+
+type DeepPartial<T> = {
+  [K in keyof T]?: T[K] extends object ? DeepPartial<T[K]> : T[K]
+}
+
+export interface RealtimeTelemetry {
+  session: RealtimeSessionStatus
+  pd: RealtimePdStatus
+  rails: {
+    ld: RailState
+    tec: RailState
+  }
+  imu: ImuStatus
+  tof: TofStatus
+  laser: LaserStatus
+  tec: TecStatus
+  safety: RealtimeSafetyStatus
+  buttons: ButtonRuntimeStatus
+  bringup: RealtimeBringupStatus
+  fault: RealtimeFaultSummary
+}
+
+export type RealtimeTelemetryPatch = DeepPartial<RealtimeTelemetry>
 
 export interface SafetyStatus {
   allowAlignment: boolean
@@ -366,6 +448,7 @@ export interface DeviceSnapshot {
   tof: TofStatus
   laser: LaserStatus
   tec: TecStatus
+  buttons: ButtonRuntimeStatus
   peripherals: PeripheralReadback
   gpioInspector: GpioInspectorStatus
   bench: BenchControlStatus
@@ -473,6 +556,24 @@ export interface FirmwareTransferProgress {
   detail: string
 }
 
+export interface SessionArchivePayload {
+  exportedAtIso: string
+  transportKind: TransportKind
+  snapshot: DeviceSnapshot
+  events: SessionEvent[]
+  commands: CommandHistoryEntry[]
+  firmwareProgress: FirmwareTransferProgress | null
+}
+
+export interface SessionAutosaveStatus {
+  supported: boolean
+  armed: boolean
+  fileName: string | null
+  saving: boolean
+  lastSavedAtIso: string | null
+  error: string | null
+}
+
 export type TransportMessage =
   | {
       kind: 'transport'
@@ -482,6 +583,10 @@ export type TransportMessage =
   | {
       kind: 'snapshot'
       snapshot: DeviceSnapshot
+    }
+  | {
+      kind: 'telemetry'
+      telemetry: RealtimeTelemetryPatch
     }
   | {
       kind: 'event'

@@ -21,7 +21,7 @@
 
 #define LASER_CONTROLLER_CONTROL_PERIOD_MS 5U
 #define LASER_CONTROLLER_SLOW_DIVIDER 10U
-#define LASER_CONTROLLER_CONTROL_STACK_WORDS 4096U
+#define LASER_CONTROLLER_CONTROL_STACK_WORDS 6144U
 #define LASER_CONTROLLER_CONTROL_PRIORITY 20U
 #define LASER_CONTROLLER_MS_TO_TICKS_CEIL(ms_) \
     ((TickType_t)((((ms_) + portTICK_PERIOD_MS - 1U) / portTICK_PERIOD_MS) > 0U ? \
@@ -451,32 +451,32 @@ static void laser_controller_publish_runtime_status(
     const laser_controller_context_t *context,
     laser_controller_time_ms_t now_ms)
 {
-    laser_controller_runtime_status_t status;
+    laser_controller_config_t config_snapshot;
 
-    memset(&status, 0, sizeof(status));
-    status.started = context->started;
-    status.boot_complete = context->boot_complete;
-    status.config_valid = context->config_valid;
-    status.fault_latched = context->fault_latched;
-    status.uptime_ms = now_ms;
-    status.state = context->state_machine.current;
-    status.power_tier = context->power_tier;
-    status.active_fault_code = context->active_fault_code;
-    status.active_fault_class = context->active_fault_class;
-    status.active_fault_count = context->active_fault_count;
-    status.trip_counter = context->trip_counter;
-    status.last_fault_ms = context->last_fault_ms;
-    status.inputs = context->last_inputs;
-    status.outputs = context->last_outputs;
-    status.decision = context->last_decision;
     portENTER_CRITICAL(&s_context_lock);
-    status.config = context->config;
+    config_snapshot = context->config;
     portEXIT_CRITICAL(&s_context_lock);
-    laser_controller_bench_copy_status(&status.bench);
-    laser_controller_service_copy_status(&status.bringup);
 
     portENTER_CRITICAL(&s_runtime_status_lock);
-    s_runtime_status = status;
+    memset(&s_runtime_status, 0, sizeof(s_runtime_status));
+    s_runtime_status.started = context->started;
+    s_runtime_status.boot_complete = context->boot_complete;
+    s_runtime_status.config_valid = context->config_valid;
+    s_runtime_status.fault_latched = context->fault_latched;
+    s_runtime_status.uptime_ms = now_ms;
+    s_runtime_status.state = context->state_machine.current;
+    s_runtime_status.power_tier = context->power_tier;
+    s_runtime_status.active_fault_code = context->active_fault_code;
+    s_runtime_status.active_fault_class = context->active_fault_class;
+    s_runtime_status.active_fault_count = context->active_fault_count;
+    s_runtime_status.trip_counter = context->trip_counter;
+    s_runtime_status.last_fault_ms = context->last_fault_ms;
+    s_runtime_status.inputs = context->last_inputs;
+    s_runtime_status.outputs = context->last_outputs;
+    s_runtime_status.decision = context->last_decision;
+    s_runtime_status.config = config_snapshot;
+    laser_controller_bench_copy_status(&s_runtime_status.bench);
+    laser_controller_service_copy_status(&s_runtime_status.bringup);
     portEXIT_CRITICAL(&s_runtime_status_lock);
 }
 
@@ -484,7 +484,6 @@ static laser_controller_board_outputs_t laser_controller_derive_outputs(
     const laser_controller_context_t *context,
     const laser_controller_safety_decision_t *decision)
 {
-    laser_controller_service_status_t service_status;
     laser_controller_board_outputs_t outputs = {
         .enable_ld_vin = false,
         .enable_tec_vin = false,
@@ -498,13 +497,11 @@ static laser_controller_board_outputs_t laser_controller_derive_outputs(
         return outputs;
     }
 
-    laser_controller_service_copy_status(&service_status);
-
     if (context->state_machine.current == LASER_CONTROLLER_STATE_SERVICE_MODE) {
-        outputs.enable_ld_vin = service_status.ld_rail_debug_enabled;
-        outputs.enable_tec_vin = service_status.tec_rail_debug_enabled;
-        outputs.enable_haptic_driver =
-            service_status.haptic_driver_enable_requested;
+        laser_controller_service_get_service_output_requests(
+            &outputs.enable_ld_vin,
+            &outputs.enable_tec_vin,
+            &outputs.enable_haptic_driver);
         return outputs;
     }
 
@@ -698,7 +695,7 @@ static void laser_controller_run_fast_cycle(laser_controller_context_t *context)
     snapshot.actual_lambda_nm = laser_controller_lambda_from_temp(
         &config_snapshot,
         context->last_inputs.tec_temp_c);
-    snapshot.hw = context->last_inputs;
+    snapshot.hw = &context->last_inputs;
 
     laser_controller_safety_evaluate(&config_snapshot, &snapshot, &decision);
     raw_lambda_drift_blocked = decision.lambda_drift_blocked;

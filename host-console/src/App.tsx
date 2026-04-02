@@ -148,9 +148,11 @@ function App() {
     transportStatus,
     transportDetail,
     snapshot,
+    telemetryStore,
     events,
     commands,
     firmwareProgress,
+    sessionAutosave,
     supportsFirmwareTransfer,
     connect,
     disconnect,
@@ -158,6 +160,9 @@ function App() {
     issueCommandAwaitAck,
     beginFirmwareTransfer,
     exportSession,
+    clearSessionHistory,
+    configureSessionAutosave,
+    disableSessionAutosave,
   } = useDeviceSession()
 
   const stateTone = toneFromSystemState(snapshot.session.state)
@@ -312,6 +317,7 @@ function App() {
 
   const connectSteps = connectStepsForTransport(transportKind)
   const connectionHealthy = transportStatus === 'connected'
+  const deviceLinkLost = !connectionHealthy
   const serviceModeLabel = snapshot.bringup.serviceModeActive
     ? 'Service active'
     : snapshot.bringup.serviceModeRequested
@@ -346,8 +352,8 @@ function App() {
   }, [themeMode])
 
   return (
-    <div className="app-shell">
-      <aside className="sidebar">
+    <div className={deviceLinkLost ? 'app-shell is-offline' : 'app-shell'}>
+      <aside className={deviceLinkLost ? 'sidebar offline-dim' : 'sidebar'}>
         <div className="sidebar__brand">
           <div className="brand-mark">
             <Shield size={18} />
@@ -406,8 +412,25 @@ function App() {
       </aside>
 
       <main className="workspace">
+        {deviceLinkLost ? (
+          <section className="offline-banner">
+            <div>
+              <p className="eyebrow">Controller link lost</p>
+              <strong>
+                {transportStatus === 'connecting'
+                  ? 'Waiting for the ESP32 protocol handshake.'
+                  : 'Live telemetry and bench controls are muted until the ESP32 reconnects.'}
+              </strong>
+            </div>
+            <span className={`transport-chip is-${transportStatus}`}>
+              <Cable size={14} />
+              <span>{formatEnumLabel(transportStatus)}</span>
+            </span>
+          </section>
+        ) : null}
+
         <header className={`hero-panel tone-${stateTone}`}>
-          <div className="hero-panel__main">
+          <div className={deviceLinkLost ? 'hero-panel__main offline-dim' : 'hero-panel__main'}>
             <motion.div
               initial={{ opacity: 0, y: 16 }}
               animate={{ opacity: 1, y: 0 }}
@@ -459,7 +482,7 @@ function App() {
           </div>
 
           <div className="hero-panel__side">
-            <div className={connectionHealthy ? 'hero-connect is-compact' : 'hero-connect'}>
+            <div className={connectionHealthy ? 'hero-connect is-compact' : 'hero-connect'} data-link-surface="active">
               <div className="cutout-head">
                 <div>
                   <p className="eyebrow">Connection</p>
@@ -575,7 +598,7 @@ function App() {
               )}
             </div>
 
-            <div className="hero-facts">
+            <div className={deviceLinkLost ? 'hero-facts offline-dim' : 'hero-facts'}>
               <div className="cutout-head">
                 <div>
                   <p className="eyebrow">Bench facts</p>
@@ -595,7 +618,9 @@ function App() {
           </div>
         </header>
 
-        <StatusRail snapshot={snapshot} />
+        <div className={deviceLinkLost ? 'offline-dim' : undefined}>
+          <StatusRail snapshot={snapshot} telemetryStore={telemetryStore} />
+        </div>
 
         <AnimatePresence mode="wait">
           <motion.div
@@ -604,7 +629,7 @@ function App() {
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -12 }}
             transition={{ duration: 0.24 }}
-            className="workspace__content"
+            className={deviceLinkLost ? 'workspace__content offline-dim' : 'workspace__content'}
           >
             {activeView === 'overview' ? (
               <>
@@ -777,6 +802,7 @@ function App() {
             {activeView === 'control' ? (
               <ControlWorkbench
                 snapshot={snapshot}
+                telemetryStore={telemetryStore}
                 transportKind={transportKind}
                 transportStatus={transportStatus}
                 onIssueCommand={issueCommand}
@@ -786,6 +812,7 @@ function App() {
             {activeView === 'bringup' ? (
               <BringupWorkbench
                 snapshot={snapshot}
+                telemetryStore={telemetryStore}
                 transportStatus={transportStatus}
                 onIssueCommandAwaitAck={issueCommandAwaitAck}
               />
@@ -829,11 +856,12 @@ function App() {
                     severity={eventSeverity}
                     moduleFilter={eventModuleFilter}
                     onQueryChange={setEventQuery}
-                    onSeverityChange={setEventSeverity}
-                    onModuleFilterChange={setEventModuleFilter}
-                    mode="system"
-                  />
-                ) : (
+                  onSeverityChange={setEventSeverity}
+                  onModuleFilterChange={setEventModuleFilter}
+                  onClearSessionHistory={clearSessionHistory}
+                  mode="system"
+                />
+              ) : (
                   <BusTrafficViewer events={events} commands={commands} />
                 )}
               </>
@@ -873,7 +901,12 @@ function App() {
         transportDetail={transportDetail}
         wifiUrl={wifiUrl}
         firmwareProgress={firmwareProgress}
+        sessionAutosave={sessionAutosave}
+        deviceLinkLost={deviceLinkLost}
         onExportSession={exportSession}
+        onClearSessionHistory={clearSessionHistory}
+        onConfigureSessionAutosave={configureSessionAutosave}
+        onDisableSessionAutosave={disableSessionAutosave}
         onSetWifiUrl={setWifiUrl}
         onSetTransportKind={setTransportKind}
         onConnect={connect}

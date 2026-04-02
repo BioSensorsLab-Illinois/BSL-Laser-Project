@@ -12,6 +12,7 @@ import type {
   CommandHistoryEntry,
   DeviceSnapshot,
   FirmwareTransferProgress,
+  SessionAutosaveStatus,
   TransportKind,
   TransportStatus,
 } from '../types'
@@ -24,7 +25,12 @@ type InspectorRailProps = {
   transportDetail: string
   wifiUrl: string
   firmwareProgress: FirmwareTransferProgress | null
+  sessionAutosave: SessionAutosaveStatus
+  deviceLinkLost: boolean
   onExportSession: () => void
+  onClearSessionHistory: () => void
+  onConfigureSessionAutosave: () => Promise<void> | void
+  onDisableSessionAutosave: () => Promise<void> | void
   onSetWifiUrl: (url: string) => void
   onSetTransportKind: (kind: TransportKind) => Promise<void> | void
   onConnect: () => Promise<void> | void
@@ -40,7 +46,12 @@ export function InspectorRail({
   transportDetail,
   wifiUrl,
   firmwareProgress,
+  sessionAutosave,
+  deviceLinkLost,
   onExportSession,
+  onClearSessionHistory,
+  onConfigureSessionAutosave,
+  onDisableSessionAutosave,
   onSetWifiUrl,
   onSetTransportKind,
   onConnect,
@@ -58,7 +69,14 @@ export function InspectorRail({
 
   return (
     <aside className="inspector">
-      <section className="inspector-block inspector-block--emphasis" data-tone={safetySummary.tone}>
+      <section
+        className={
+          deviceLinkLost
+            ? 'inspector-block inspector-block--emphasis offline-dim'
+            : 'inspector-block inspector-block--emphasis'
+        }
+        data-tone={safetySummary.tone}
+      >
         <div className="inspector-block__head">
           <TriangleAlert size={16} />
           <strong>Bench posture</strong>
@@ -77,7 +95,7 @@ export function InspectorRail({
         <ProgressMeter value={safetySummary.percent} tone={safetySummary.tone} />
       </section>
 
-      <section className="inspector-block">
+      <section className={deviceLinkLost ? 'inspector-block offline-dim' : 'inspector-block'}>
         <div className="inspector-block__head">
           <Cpu size={16} />
           <strong>Device</strong>
@@ -118,7 +136,7 @@ export function InspectorRail({
         </dl>
       </section>
 
-      <section className="inspector-block">
+      <section className="inspector-block" data-link-surface="active">
         <div className="inspector-block__head">
           <Plug size={16} />
           <strong>Link and service</strong>
@@ -238,7 +256,7 @@ export function InspectorRail({
         ) : null}
       </section>
 
-      <section className="inspector-block">
+      <section className={deviceLinkLost ? 'inspector-block offline-dim' : 'inspector-block'}>
         <div className="inspector-block__head">
           <TriangleAlert size={16} />
           <strong>Fault summary</strong>
@@ -267,7 +285,7 @@ export function InspectorRail({
         </dl>
       </section>
 
-      <section className="inspector-block">
+      <section className={deviceLinkLost ? 'inspector-block offline-dim' : 'inspector-block'}>
         <div className="inspector-block__head">
           <MemoryStick size={16} />
           <strong>Recent commands</strong>
@@ -292,17 +310,60 @@ export function InspectorRail({
         </div>
       </section>
 
-      <section className="inspector-block">
+      <section className={deviceLinkLost ? 'inspector-block offline-dim' : 'inspector-block'}>
         <div className="inspector-block__head">
           <Download size={16} />
           <strong>Session archive</strong>
         </div>
         <p className="inline-help">
-          Export snapshot, commands, and events as JSON.
+          Export snapshot, commands, and events as JSON, or keep a live local autosave file updated in this browser.
         </p>
-        <button type="button" className="action-button is-inline" onClick={onExportSession}>
-          Export session bundle
-        </button>
+        <div className="status-badges is-stack">
+          <span className={sessionAutosave.armed ? 'status-badge is-on' : 'status-badge'}>
+            {sessionAutosave.armed
+              ? `Autosave armed${sessionAutosave.fileName !== null ? ` • ${sessionAutosave.fileName}` : ''}`
+              : 'Autosave off'}
+          </span>
+          {sessionAutosave.saving ? (
+            <span className="status-badge is-warn">Saving archive…</span>
+          ) : sessionAutosave.lastSavedAtIso !== null ? (
+            <span className="status-badge is-on">
+              Saved {formatShortTime(sessionAutosave.lastSavedAtIso)}
+            </span>
+          ) : null}
+        </div>
+        {sessionAutosave.error !== null ? (
+          <p className="inline-help">{sessionAutosave.error}</p>
+        ) : null}
+        <div className="button-row">
+          <button type="button" className="action-button is-inline" onClick={onExportSession}>
+            Export session bundle
+          </button>
+          <button type="button" className="action-button is-inline" onClick={onClearSessionHistory}>
+            Clear session log
+          </button>
+        </div>
+        <div className="button-row">
+          <button
+            type="button"
+            className="action-button is-inline"
+            onClick={() => {
+              void onConfigureSessionAutosave()
+            }}
+          >
+            {sessionAutosave.armed ? 'Change autosave file' : 'Choose autosave file'}
+          </button>
+          <button
+            type="button"
+            className="action-button is-inline"
+            disabled={!sessionAutosave.armed}
+            onClick={() => {
+              void onDisableSessionAutosave()
+            }}
+          >
+            Stop autosave
+          </button>
+        </div>
       </section>
     </aside>
   )

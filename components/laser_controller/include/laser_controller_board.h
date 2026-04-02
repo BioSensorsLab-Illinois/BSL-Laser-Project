@@ -172,6 +172,7 @@ esp_err_t laser_controller_board_burn_pd_nvm(
 void laser_controller_board_force_pd_refresh(void);
 bool laser_controller_board_gpio_inspector_has_pin(uint32_t gpio_num);
 void laser_controller_board_reset_gpio_debug_state(void);
+void laser_controller_board_apply_debug_gpio_state_now(void);
 void laser_controller_board_get_shared_i2c_line_levels(
     bool *sda_high,
     bool *scl_high);
@@ -201,6 +202,10 @@ esp_err_t laser_controller_board_configure_haptic_debug(
     uint32_t library,
     laser_controller_service_haptic_actuator_t actuator,
     uint32_t rtp_level);
+esp_err_t laser_controller_board_set_tof_illumination(
+    bool enabled,
+    uint32_t duty_cycle_pct,
+    uint32_t frequency_hz);
 esp_err_t laser_controller_board_fire_haptic_test(void);
 void laser_controller_board_apply_actuator_targets(
     const laser_controller_config_t *config,

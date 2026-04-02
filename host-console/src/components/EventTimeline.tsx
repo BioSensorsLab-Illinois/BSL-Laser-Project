@@ -29,6 +29,7 @@ type EventTimelineProps = {
   onQueryChange: (value: string) => void
   onSeverityChange: (value: Severity | 'all') => void
   onModuleFilterChange: (value: string) => void
+  onClearSessionHistory?: () => void
   compact?: boolean
   mode?: 'all' | 'system'
 }
@@ -187,6 +188,10 @@ function moduleFromCommand(cmd: string): string {
     return 'imu'
   }
 
+  if (cmd.includes('tof')) {
+    return 'tof'
+  }
+
   if (cmd.includes('dac')) {
     return 'dac'
   }
@@ -215,6 +220,7 @@ export function EventTimeline({
   onQueryChange,
   onSeverityChange,
   onModuleFilterChange,
+  onClearSessionHistory,
   compact = false,
   mode = 'all',
 }: EventTimelineProps) {
@@ -352,6 +358,18 @@ export function EventTimeline({
               : 'Triage faults, bus traffic, and service actions with decoded context and expandable detail.'}
         </p>
       </div>
+
+      {!compact && onClearSessionHistory !== undefined ? (
+        <div className="button-row">
+          <button
+            type="button"
+            className="action-button is-inline"
+            onClick={onClearSessionHistory}
+          >
+            Clear session log
+          </button>
+        </div>
+      ) : null}
 
       {!compact ? (
         <div className="event-overview">

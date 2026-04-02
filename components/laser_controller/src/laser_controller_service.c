@@ -18,6 +18,10 @@
 #define LASER_CONTROLLER_SERVICE_PROFILE_VER   4U
 #define LASER_CONTROLLER_SERVICE_PROFILE_VER_MIN 3U
 #define LASER_CONTROLLER_SERVICE_DAC_MAX_V     2.5f
+#define LASER_CONTROLLER_SERVICE_TOF_ILLUMINATION_PWM_HZ 5000U
+#define LASER_CONTROLLER_SERVICE_HAPTIC_PATTERN_MAX_PULSES 12U
+#define LASER_CONTROLLER_SERVICE_HAPTIC_PATTERN_MIN_MS     10U
+#define LASER_CONTROLLER_SERVICE_HAPTIC_PATTERN_MAX_MS     600U
 
 typedef struct {
     bool expected_present;
@@ -783,6 +787,10 @@ static void laser_controller_service_apply_core_preset_locked(const char *profil
     s_service.status.tof_min_range_m = 0.20f;
     s_service.status.tof_max_range_m = 1.00f;
     s_service.status.tof_stale_timeout_ms = 150U;
+    s_service.status.tof_illumination_enabled = false;
+    s_service.status.tof_illumination_duty_cycle_pct = 0U;
+    s_service.status.tof_illumination_frequency_hz =
+        LASER_CONTROLLER_SERVICE_TOF_ILLUMINATION_PWM_HZ;
     memcpy(
         s_service.status.pd_profiles,
         kDefaultPdProfiles,
@@ -1003,6 +1011,12 @@ void laser_controller_service_init_defaults(void)
         status.haptic_library,
         status.haptic_actuator,
         status.haptic_rtp_level);
+    (void)laser_controller_board_set_tof_illumination(
+        false,
+        0U,
+        status.tof_illumination_frequency_hz > 0U ?
+            status.tof_illumination_frequency_hz :
+            LASER_CONTROLLER_SERVICE_TOF_ILLUMINATION_PWM_HZ);
 }
 
 void laser_controller_service_copy_status(laser_controller_service_status_t *status)
@@ -1055,6 +1069,85 @@ bool laser_controller_service_module_write_enabled(laser_controller_module_t mod
     return enabled;
 }
 
+void laser_controller_service_get_dac_runtime(
+    laser_controller_service_dac_runtime_t *runtime)
+{
+    if (runtime == NULL) {
+        return;
+    }
+
+    portENTER_CRITICAL(&s_service_lock);
+    runtime->service_mode_requested = s_service.status.service_mode_requested;
+    runtime->dac_ld_channel_v = s_service.status.dac_ld_channel_v;
+    runtime->dac_tec_channel_v = s_service.status.dac_tec_channel_v;
+    portEXIT_CRITICAL(&s_service_lock);
+}
+
+void laser_controller_service_get_dac_config(
+    laser_controller_service_dac_config_t *config)
+{
+    if (config == NULL) {
+        return;
+    }
+
+    portENTER_CRITICAL(&s_service_lock);
+    config->reference = s_service.status.dac_reference;
+    config->gain_2x = s_service.status.dac_gain_2x;
+    config->ref_div = s_service.status.dac_ref_div;
+    config->sync_mode = s_service.status.dac_sync_mode;
+    portEXIT_CRITICAL(&s_service_lock);
+}
+
+void laser_controller_service_get_imu_config(
+    laser_controller_service_imu_config_t *config)
+{
+    if (config == NULL) {
+        return;
+    }
+
+    portENTER_CRITICAL(&s_service_lock);
+    config->odr_hz = s_service.status.imu_odr_hz;
+    config->accel_range_g = s_service.status.imu_accel_range_g;
+    config->gyro_range_dps = s_service.status.imu_gyro_range_dps;
+    config->gyro_enabled = s_service.status.imu_gyro_enabled;
+    config->lpf2_enabled = s_service.status.imu_lpf2_enabled;
+    config->timestamp_enabled = s_service.status.imu_timestamp_enabled;
+    config->bdu_enabled = s_service.status.imu_bdu_enabled;
+    config->if_inc_enabled = s_service.status.imu_if_inc_enabled;
+    config->i2c_disabled = s_service.status.imu_i2c_disabled;
+    portEXIT_CRITICAL(&s_service_lock);
+}
+
+void laser_controller_service_get_haptic_config(
+    laser_controller_service_haptic_config_t *config)
+{
+    if (config == NULL) {
+        return;
+    }
+
+    portENTER_CRITICAL(&s_service_lock);
+    config->effect_id = s_service.status.haptic_effect_id;
+    config->mode = s_service.status.haptic_mode;
+    config->library = s_service.status.haptic_library;
+    config->actuator = s_service.status.haptic_actuator;
+    config->rtp_level = s_service.status.haptic_rtp_level;
+    portEXIT_CRITICAL(&s_service_lock);
+}
+
+void laser_controller_service_get_tof_illumination_config(
+    laser_controller_service_tof_illumination_t *config)
+{
+    if (config == NULL) {
+        return;
+    }
+
+    portENTER_CRITICAL(&s_service_lock);
+    config->enabled = s_service.status.tof_illumination_enabled;
+    config->duty_cycle_pct = s_service.status.tof_illumination_duty_cycle_pct;
+    config->frequency_hz = s_service.status.tof_illumination_frequency_hz;
+    portEXIT_CRITICAL(&s_service_lock);
+}
+
 void laser_controller_service_report_module_probe(
     laser_controller_module_t module,
     bool detected,
@@ -1080,6 +1173,7 @@ void laser_controller_service_set_mode_requested(
     s_service.status.service_mode_requested = enable;
     if (!enable) {
         s_service.status.haptic_driver_enable_requested = false;
+        s_service.status.tof_illumination_enabled = false;
         memset(
             s_service.status.gpio_overrides,
             0,
@@ -1094,6 +1188,10 @@ void laser_controller_service_set_mode_requested(
     portEXIT_CRITICAL(&s_service_lock);
 
     if (reset_gpio_debug) {
+        (void)laser_controller_board_set_tof_illumination(
+            false,
+            0U,
+            LASER_CONTROLLER_SERVICE_TOF_ILLUMINATION_PWM_HZ);
         laser_controller_board_reset_gpio_debug_state();
     }
 }
@@ -1179,6 +1277,8 @@ bool laser_controller_service_set_module_state(
     bool debug_enabled,
     laser_controller_time_ms_t now_ms)
 {
+    bool disable_tof_illumination = false;
+
     if (module >= LASER_CONTROLLER_MODULE_COUNT) {
         return false;
     }
@@ -1186,12 +1286,26 @@ bool laser_controller_service_set_module_state(
     portENTER_CRITICAL(&s_service_lock);
     s_service.status.modules[module].expected_present = expected_present;
     s_service.status.modules[module].debug_enabled = debug_enabled;
+    if (module == LASER_CONTROLLER_MODULE_TOF &&
+        !expected_present &&
+        !debug_enabled &&
+        s_service.status.tof_illumination_enabled) {
+        s_service.status.tof_illumination_enabled = false;
+        disable_tof_illumination = true;
+    }
     laser_controller_service_refresh_modules_locked();
     laser_controller_service_touch_profile_locked();
     laser_controller_service_write_action_locked(
         "Bring-up module expectations updated.",
         now_ms);
     portEXIT_CRITICAL(&s_service_lock);
+
+    if (disable_tof_illumination) {
+        (void)laser_controller_board_set_tof_illumination(
+            false,
+            0U,
+            LASER_CONTROLLER_SERVICE_TOF_ILLUMINATION_PWM_HZ);
+    }
     return true;
 }
 
@@ -1236,6 +1350,25 @@ void laser_controller_service_set_haptic_driver_enable(
             "ERM driver enable requested on GPIO48 in service mode." :
             "ERM driver enable cleared; GPIO48 forced low.",
         now_ms);
+    portEXIT_CRITICAL(&s_service_lock);
+}
+
+void laser_controller_service_get_service_output_requests(
+    bool *ld_rail_enabled,
+    bool *tec_rail_enabled,
+    bool *haptic_driver_enabled)
+{
+    portENTER_CRITICAL(&s_service_lock);
+    if (ld_rail_enabled != NULL) {
+        *ld_rail_enabled = s_service.status.ld_rail_debug_enabled;
+    }
+    if (tec_rail_enabled != NULL) {
+        *tec_rail_enabled = s_service.status.tec_rail_debug_enabled;
+    }
+    if (haptic_driver_enabled != NULL) {
+        *haptic_driver_enabled =
+            s_service.status.haptic_driver_enable_requested;
+    }
     portEXIT_CRITICAL(&s_service_lock);
 }
 
@@ -1447,6 +1580,48 @@ void laser_controller_service_set_tof_config(
         "ToF threshold tuning staged.",
         now_ms);
     portEXIT_CRITICAL(&s_service_lock);
+}
+
+esp_err_t laser_controller_service_set_tof_illumination(
+    bool enabled,
+    uint32_t duty_cycle_pct,
+    uint32_t frequency_hz,
+    laser_controller_time_ms_t now_ms)
+{
+    const uint32_t clamped_duty_cycle_pct =
+        duty_cycle_pct > 100U ? 100U : duty_cycle_pct;
+    const uint32_t requested_frequency_hz =
+        frequency_hz > 0U ?
+            frequency_hz :
+            LASER_CONTROLLER_SERVICE_TOF_ILLUMINATION_PWM_HZ;
+    esp_err_t err = ESP_OK;
+
+    if (enabled &&
+        !laser_controller_service_module_write_enabled(LASER_CONTROLLER_MODULE_TOF)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    err = laser_controller_board_set_tof_illumination(
+        enabled,
+        clamped_duty_cycle_pct,
+        requested_frequency_hz);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    portENTER_CRITICAL(&s_service_lock);
+    s_service.status.tof_illumination_enabled =
+        enabled && clamped_duty_cycle_pct > 0U;
+    s_service.status.tof_illumination_duty_cycle_pct = clamped_duty_cycle_pct;
+    s_service.status.tof_illumination_frequency_hz = requested_frequency_hz;
+    laser_controller_service_write_action_locked(
+        enabled && clamped_duty_cycle_pct > 0U ?
+            "Front illumination staged on GPIO6 in service mode." :
+            "Front illumination forced low on GPIO6.",
+        now_ms);
+    portEXIT_CRITICAL(&s_service_lock);
+
+    return ESP_OK;
 }
 
 esp_err_t laser_controller_service_set_pd_config(
@@ -1675,6 +1850,100 @@ void laser_controller_service_fire_haptic_test(laser_controller_time_ms_t now_ms
                  "Haptic test request staged but hardware did not acknowledge."),
         now_ms);
     portEXIT_CRITICAL(&s_service_lock);
+}
+
+esp_err_t laser_controller_service_fire_haptic_trigger_pattern(
+    uint32_t pulse_count,
+    uint32_t high_ms,
+    uint32_t low_ms,
+    bool release_after,
+    laser_controller_time_ms_t now_ms)
+{
+    laser_controller_service_haptic_config_t haptic_config;
+    bool haptic_driver_enabled = false;
+    esp_err_t err = ESP_OK;
+
+    if (pulse_count == 0U ||
+        pulse_count > LASER_CONTROLLER_SERVICE_HAPTIC_PATTERN_MAX_PULSES ||
+        high_ms < LASER_CONTROLLER_SERVICE_HAPTIC_PATTERN_MIN_MS ||
+        high_ms > LASER_CONTROLLER_SERVICE_HAPTIC_PATTERN_MAX_MS ||
+        low_ms < LASER_CONTROLLER_SERVICE_HAPTIC_PATTERN_MIN_MS ||
+        low_ms > LASER_CONTROLLER_SERVICE_HAPTIC_PATTERN_MAX_MS) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!laser_controller_service_module_write_enabled(LASER_CONTROLLER_MODULE_HAPTIC)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    laser_controller_service_get_service_output_requests(
+        NULL,
+        NULL,
+        &haptic_driver_enabled);
+    if (!haptic_driver_enabled) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    laser_controller_service_get_haptic_config(&haptic_config);
+    if (haptic_config.mode != LASER_CONTROLLER_SERVICE_HAPTIC_MODE_EXTERNAL_EDGE &&
+        haptic_config.mode != LASER_CONTROLLER_SERVICE_HAPTIC_MODE_EXTERNAL_LEVEL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    for (uint32_t pulse_index = 0U; pulse_index < pulse_count; ++pulse_index) {
+        if (!laser_controller_service_set_gpio_override(
+                LASER_CONTROLLER_GPIO_ERM_TRIG_GN_LD_EN,
+                LASER_CONTROLLER_SERVICE_GPIO_MODE_OUTPUT,
+                true,
+                false,
+                false,
+                now_ms)) {
+            err = ESP_ERR_INVALID_STATE;
+            break;
+        }
+        laser_controller_board_apply_debug_gpio_state_now();
+        vTaskDelay(pdMS_TO_TICKS(high_ms));
+
+        if (!laser_controller_service_set_gpio_override(
+                LASER_CONTROLLER_GPIO_ERM_TRIG_GN_LD_EN,
+                LASER_CONTROLLER_SERVICE_GPIO_MODE_OUTPUT,
+                false,
+                false,
+                false,
+                now_ms)) {
+            err = ESP_ERR_INVALID_STATE;
+            break;
+        }
+        laser_controller_board_apply_debug_gpio_state_now();
+
+        if ((pulse_index + 1U) < pulse_count) {
+            vTaskDelay(pdMS_TO_TICKS(low_ms));
+        }
+    }
+
+    if (release_after || err != ESP_OK) {
+        (void)laser_controller_service_set_gpio_override(
+            LASER_CONTROLLER_GPIO_ERM_TRIG_GN_LD_EN,
+            LASER_CONTROLLER_SERVICE_GPIO_MODE_FIRMWARE,
+            false,
+            false,
+            false,
+            now_ms);
+        laser_controller_board_apply_debug_gpio_state_now();
+    }
+
+    portENTER_CRITICAL(&s_service_lock);
+    laser_controller_service_copy_text(
+        s_service.status.last_action,
+        sizeof(s_service.status.last_action),
+        err == ESP_OK ?
+            (release_after ?
+                 "External ERM trigger burst completed and IO37 returned to firmware." :
+                 "External ERM trigger burst completed; IO37 held low under service override.") :
+            "External ERM trigger burst failed before completion.");
+    portEXIT_CRITICAL(&s_service_lock);
+
+    return err;
 }
 
 void laser_controller_service_save_profile(laser_controller_time_ms_t now_ms)

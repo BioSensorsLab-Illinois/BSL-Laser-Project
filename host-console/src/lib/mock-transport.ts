@@ -4,6 +4,7 @@ import {
   makeDefaultBenchControlStatus,
 } from './bench-model'
 import { makeDefaultGpioInspectorStatus } from './gpio-layout'
+import { makeRealtimeTelemetryFromSnapshot } from './live-telemetry'
 import {
   clampTecTempC,
   clampTecWavelengthNm,
@@ -269,7 +270,7 @@ export class MockTransport implements DeviceTransport {
   async connect(): Promise<void> {
     if (this.state.connected) {
       this.emit({ kind: 'transport', status: 'connected', detail: this.label })
-      this.emit({ kind: 'snapshot', snapshot: this.makeSnapshot() })
+      this.emitRealtimeFrame(true)
       return
     }
 
@@ -291,7 +292,7 @@ export class MockTransport implements DeviceTransport {
       ),
     })
     this.emit({ kind: 'transport', status: 'connected', detail: this.label })
-    this.emit({ kind: 'snapshot', snapshot: this.makeSnapshot() })
+    this.emitRealtimeFrame(true)
   }
 
   async disconnect(): Promise<void> {
@@ -612,6 +613,7 @@ export class MockTransport implements DeviceTransport {
         this.state.tecSettlingTicks = 3
         this.state.bringup.serviceModeActive = false
         this.state.bringup.serviceModeRequested = false
+        this.state.bringup.illumination.tof.enabled = false
         this.state.hapticDriverEnabled = false
         this.emit({
           kind: 'event',
@@ -633,6 +635,7 @@ export class MockTransport implements DeviceTransport {
         this.state.serviceMode = false
         this.state.bringup.serviceModeRequested = false
         this.state.bringup.serviceModeActive = false
+        this.state.bringup.illumination.tof.enabled = false
         this.state.systemState = 'SAFE_IDLE'
         this.state.laserRequested = false
         this.state.alignmentRequested = false
@@ -662,6 +665,13 @@ export class MockTransport implements DeviceTransport {
             moduleStatus.debugEnabled = Boolean(command.args.debug_enabled)
             if (!moduleStatus.expectedPresent) {
               this.resetModuleProbeState(module)
+            }
+            if (
+              module === 'tof' &&
+              !moduleStatus.expectedPresent &&
+              !moduleStatus.debugEnabled
+            ) {
+              this.state.bringup.illumination.tof.enabled = false
             }
             this.bumpBringupRevision(`Module ${module} expectations updated.`)
           }
@@ -803,6 +813,28 @@ export class MockTransport implements DeviceTransport {
           this.bumpBringupRevision('ToF debug thresholds updated.')
         }
         break
+      case 'tof_illumination_set':
+        if (typeof command.args?.enabled === 'boolean') {
+          this.state.bringup.illumination.tof.enabled = command.args.enabled
+          if (typeof command.args?.duty_cycle_pct === 'number') {
+            this.state.bringup.illumination.tof.dutyCyclePct = clamp(
+              command.args.duty_cycle_pct,
+              0,
+              100,
+            )
+          }
+          if (typeof command.args?.frequency_hz === 'number') {
+            this.state.bringup.illumination.tof.frequencyHz = clamp(
+              command.args.frequency_hz,
+              5000,
+              100000,
+            )
+          }
+          this.state.bringup.tools.lastAction = command.args.enabled
+            ? `Front illumination staged on GPIO6 at ${this.state.bringup.illumination.tof.dutyCyclePct}% duty.`
+            : 'Front illumination forced off on GPIO6.'
+        }
+        break
       case 'haptic_debug_config':
         if (
           typeof command.args?.effect_id === 'number' &&
@@ -823,6 +855,25 @@ export class MockTransport implements DeviceTransport {
       case 'haptic_debug_fire':
         this.state.bringup.tools.lastI2cOp = 'DRV2605 GO pulse simulated in the mock rig.'
         this.state.bringup.tools.lastAction = 'Haptic test pattern fired.'
+        break
+      case 'haptic_external_trigger_pattern':
+        if (
+          typeof command.args?.pulse_count === 'number' &&
+          typeof command.args?.high_ms === 'number' &&
+          typeof command.args?.low_ms === 'number'
+        ) {
+          this.state.bringup.tools.lastAction =
+            `External ERM trigger burst simulated on shared IO37: ${command.args.pulse_count} pulse(s), ${command.args.high_ms} ms high, ${command.args.low_ms} ms low.`
+          this.emit({
+            kind: 'event',
+            event: this.makeEvent(
+              'warn',
+              'service',
+              'Mock external ERM trigger burst',
+              'Shared IO37 / GN_LD_EN pulse train simulated for GUI bring-up testing.',
+            ),
+          })
+        }
         break
       case 'i2c_scan':
         this.state.bringup.tools.lastI2cScan = this.deriveI2cScan()
@@ -864,7 +915,7 @@ export class MockTransport implements DeviceTransport {
         break
     }
 
-    this.emit({ kind: 'snapshot', snapshot: this.makeSnapshot() })
+    this.emitRealtimeFrame(true)
     this.emit({
       kind: 'commandAck',
       commandId: command.id,
@@ -924,6 +975,7 @@ export class MockTransport implements DeviceTransport {
     this.state.serviceMode = false
     this.state.bringup.serviceModeActive = false
     this.state.bringup.serviceModeRequested = false
+    this.state.bringup.illumination.tof.enabled = false
     this.state.alignmentRequested = false
     this.state.laserRequested = false
 
@@ -936,7 +988,7 @@ export class MockTransport implements DeviceTransport {
         `Mock rig rebooted into ${pkg.packageName} ${pkg.version}.`,
       ),
     })
-    this.emit({ kind: 'snapshot', snapshot: this.makeSnapshot() })
+    this.emitRealtimeFrame(true)
   }
 
   private tick(deltaSeconds: number): void {
@@ -1006,7 +1058,7 @@ export class MockTransport implements DeviceTransport {
       })
     }
 
-    this.emit({ kind: 'snapshot', snapshot: this.makeSnapshot() })
+    this.emitRealtimeFrame(Math.floor(previousUptimeSeconds) !== Math.floor(uptime))
   }
 
   private raiseFault(code: string): void {
@@ -1313,6 +1365,10 @@ export class MockTransport implements DeviceTransport {
         : this.state.serviceMode && this.state.hapticDriverEnabled
     }
 
+    const tofArmed =
+      this.state.bringup.modules.tof.expectedPresent ||
+      this.state.bringup.modules.tof.debugEnabled
+
     return {
       identity: {
         label: 'BSL-HTLS Gen2',
@@ -1392,6 +1448,12 @@ export class MockTransport implements DeviceTransport {
         voltageV: tecVoltageV,
         settlingSecondsRemaining: Math.max(0, Math.ceil(this.state.tecSettlingTicks)),
       },
+      buttons: {
+        stage1Pressed: this.state.alignmentRequested || this.state.laserRequested,
+        stage2Pressed: this.state.laserRequested,
+        stage1Edge: false,
+        stage2Edge: false,
+      },
       peripherals: {
         dac: {
           reachable: this.state.bringup.modules.dac.expectedPresent,
@@ -1443,14 +1505,16 @@ export class MockTransport implements DeviceTransport {
           lastError: 'ESP_OK',
         },
         tof: {
-          reachable: this.state.bringup.modules.tof.expectedPresent,
-          configured: this.state.bringup.modules.tof.expectedPresent,
-          interruptLineHigh: this.state.bringup.modules.tof.expectedPresent,
-          ledCtrlAsserted: false,
-          dataReady: this.state.bringup.modules.tof.expectedPresent,
-          bootState: this.state.bringup.modules.tof.expectedPresent ? 1 : 0,
-          rangeStatus: this.state.bringup.modules.tof.expectedPresent ? 0 : 255,
-          sensorId: this.state.bringup.modules.tof.expectedPresent ? 0xeacc : 0,
+          reachable: tofArmed,
+          configured: tofArmed,
+          interruptLineHigh: tofArmed,
+          ledCtrlAsserted:
+            tofArmed &&
+            this.state.bringup.illumination.tof.enabled,
+          dataReady: tofArmed,
+          bootState: tofArmed ? 1 : 0,
+          rangeStatus: tofArmed ? 0 : 255,
+          sensorId: tofArmed ? 0xeacc : 0,
           distanceMm: Math.round(this.state.distanceM * 1000),
           lastErrorCode: 0,
           lastError: 'ESP_OK',
@@ -1519,6 +1583,19 @@ export class MockTransport implements DeviceTransport {
       category,
       title,
       detail,
+    }
+  }
+
+  private emitRealtimeFrame(includeSnapshot: boolean): void {
+    const snapshot = this.makeSnapshot()
+
+    this.emit({
+      kind: 'telemetry',
+      telemetry: makeRealtimeTelemetryFromSnapshot(snapshot),
+    })
+
+    if (includeSnapshot) {
+      this.emit({ kind: 'snapshot', snapshot })
     }
   }
 

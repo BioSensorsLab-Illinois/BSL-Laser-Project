@@ -15,6 +15,7 @@ import {
   deriveBenchEstimate,
 } from '../lib/bench-model'
 import { formatNumber } from '../lib/format'
+import type { RealtimeTelemetryStore } from '../lib/live-telemetry'
 import {
   clampTecTempC,
   clampTecWavelengthNm,
@@ -23,6 +24,7 @@ import {
   estimateWavelengthFromTempC,
   tecCalibrationPoints,
 } from '../lib/tec-calibration'
+import { useLiveSnapshot } from '../hooks/use-live-snapshot'
 import { HelpHint } from './HelpHint'
 import type {
   BenchTargetMode,
@@ -34,6 +36,7 @@ import type {
 
 type ControlWorkbenchProps = {
   snapshot: DeviceSnapshot
+  telemetryStore: RealtimeTelemetryStore
   transportKind: TransportKind
   transportStatus: TransportStatus
   onIssueCommand: (
@@ -130,11 +133,13 @@ function availabilityBadgeClass(availability: ModuleAvailability): string {
 
 export function ControlWorkbench({
   snapshot,
+  telemetryStore,
   transportKind,
   transportStatus,
   onIssueCommand,
 }: ControlWorkbenchProps) {
-  const estimate = useMemo(() => deriveBenchEstimate(snapshot), [snapshot])
+  const liveSnapshot = useLiveSnapshot(snapshot, telemetryStore)
+  const estimate = useMemo(() => deriveBenchEstimate(liveSnapshot), [liveSnapshot])
   const [serviceArmed, setServiceArmed] = useState(false)
   const [autoFollowPower, setAutoFollowPower] = useState(false)
   const [laserPowerW, setLaserPowerW] = useState(() => formatNumber(estimate.commandedOpticalPowerW, 2))
@@ -206,7 +211,7 @@ export function ControlWorkbench({
     }
 
     const desiredCurrentA = currentFromOpticalPowerW(requestedPowerW)
-    if (Math.abs(desiredCurrentA - snapshot.laser.commandedCurrentA) < 0.02) {
+    if (Math.abs(desiredCurrentA - liveSnapshot.laser.commandedCurrentA) < 0.02) {
       lastAutoPowerRequestRef.current = null
       return
     }
@@ -234,9 +239,9 @@ export function ControlWorkbench({
     }
   }, [
     autoFollowPower,
+    liveSnapshot.laser.commandedCurrentA,
     onIssueCommand,
     requestedPowerW,
-    snapshot.laser.commandedCurrentA,
     writesDisabled,
   ])
 

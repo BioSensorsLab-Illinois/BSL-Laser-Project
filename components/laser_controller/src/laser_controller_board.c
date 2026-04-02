@@ -130,6 +130,13 @@ static void laser_controller_board_normalize_pd_profiles(
 #define LASER_CONTROLLER_PCN_PWM_CHANNEL       LEDC_CHANNEL_0
 #define LASER_CONTROLLER_PCN_PWM_RESOLUTION    LEDC_TIMER_8_BIT
 #define LASER_CONTROLLER_PCN_PWM_DUTY_MAX      ((1U << 8U) - 1U)
+#define LASER_CONTROLLER_TOF_LED_PWM_SPEED_MODE LEDC_LOW_SPEED_MODE
+#define LASER_CONTROLLER_TOF_LED_PWM_TIMER      LEDC_TIMER_1
+#define LASER_CONTROLLER_TOF_LED_PWM_CHANNEL    LEDC_CHANNEL_1
+#define LASER_CONTROLLER_TOF_LED_PWM_RESOLUTION LEDC_TIMER_8_BIT
+#define LASER_CONTROLLER_TOF_LED_PWM_DUTY_MAX   ((1U << 8U) - 1U)
+#define LASER_CONTROLLER_TOF_LED_PWM_MIN_FREQ_HZ 5000U
+#define LASER_CONTROLLER_TOF_LED_PWM_MAX_FREQ_HZ 100000U
 #define LASER_CONTROLLER_DAC_RETRY_MS          500U
 #define LASER_CONTROLLER_DAC_RESET_SETTLE_US   2000U
 #define LASER_CONTROLLER_IMU_RETRY_MS          500U
@@ -203,6 +210,12 @@ typedef struct {
     laser_controller_time_ms_t last_attempt_ms;
     laser_controller_time_ms_t last_sample_ms;
 } laser_controller_board_tof_runtime_t;
+
+typedef struct {
+    bool enabled;
+    uint32_t duty_cycle_pct;
+    uint32_t frequency_hz;
+} laser_controller_board_tof_illumination_t;
 
 static const uint8_t kVl53l1xDefaultConfiguration[] = {
     0x00, 0x00, 0x00, 0x01, 0x02, 0x00, 0x02, 0x08, 0x00, 0x08, 0x10,
@@ -284,11 +297,13 @@ static esp_err_t s_dac_last_error;
 static laser_controller_time_ms_t s_dac_last_attempt_ms;
 static bool s_gpio_ready;
 static bool s_pwm_active;
+static bool s_tof_illumination_pwm_active;
 static laser_controller_pd_snapshot_t s_pd_snapshot;
 static float s_last_ld_voltage_v = -1.0f;
 static float s_last_tec_voltage_v = -1.0f;
 static laser_controller_board_imu_runtime_t s_imu_runtime;
 static laser_controller_board_tof_runtime_t s_tof_runtime;
+static laser_controller_board_tof_illumination_t s_tof_illumination;
 static laser_controller_board_dac_readback_t s_dac_readback;
 static laser_controller_board_pd_readback_t s_pd_readback;
 static laser_controller_board_imu_readback_t s_imu_readback;
@@ -381,7 +396,7 @@ static void laser_controller_board_apply_gpio_overrides(void)
         config.pin_bit_mask = (1ULL << gpio_num);
         config.mode = override_config.mode == LASER_CONTROLLER_SERVICE_GPIO_MODE_INPUT ?
                           GPIO_MODE_INPUT :
-                          GPIO_MODE_OUTPUT;
+                          GPIO_MODE_INPUT_OUTPUT;
         config.pull_up_en =
             override_config.pullup_enabled ? GPIO_PULLUP_ENABLE : GPIO_PULLUP_DISABLE;
         config.pull_down_en =
@@ -577,23 +592,89 @@ static void laser_controller_board_service_report_probe(
     laser_controller_service_report_module_probe(module, detected, healthy);
 }
 
-static void laser_controller_board_apply_tof_sideband_state(bool tof_expected)
+static void laser_controller_board_stop_tof_illumination_pwm(void)
+{
+    if (s_tof_illumination_pwm_active) {
+        (void)ledc_stop(
+            LASER_CONTROLLER_TOF_LED_PWM_SPEED_MODE,
+            LASER_CONTROLLER_TOF_LED_PWM_CHANNEL,
+            0U);
+        s_tof_illumination_pwm_active = false;
+    }
+}
+
+static esp_err_t laser_controller_board_apply_tof_sideband_state_locked(bool tof_armed)
 {
     gpio_config_t config = { 0 };
+    esp_err_t err = ESP_OK;
 
     config.pin_bit_mask = (1ULL << LASER_CONTROLLER_GPIO_TOF_LED_CTRL);
     config.pull_down_en = GPIO_PULLDOWN_DISABLE;
     config.pull_up_en = GPIO_PULLUP_DISABLE;
     config.intr_type = GPIO_INTR_DISABLE;
 
-    if (tof_expected) {
-        config.mode = GPIO_MODE_OUTPUT;
-        (void)gpio_config(&config);
-        (void)gpio_set_level(LASER_CONTROLLER_GPIO_TOF_LED_CTRL, 0);
-    } else {
+    laser_controller_board_stop_tof_illumination_pwm();
+
+    if (!tof_armed) {
         config.mode = GPIO_MODE_INPUT;
         (void)gpio_config(&config);
+        return ESP_OK;
     }
+
+    config.mode = GPIO_MODE_INPUT_OUTPUT;
+    err = gpio_config(&config);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    if (s_tof_illumination.enabled && s_tof_illumination.duty_cycle_pct > 0U) {
+        ledc_timer_config_t timer_config = {
+            .speed_mode = LASER_CONTROLLER_TOF_LED_PWM_SPEED_MODE,
+            .duty_resolution = LASER_CONTROLLER_TOF_LED_PWM_RESOLUTION,
+            .timer_num = LASER_CONTROLLER_TOF_LED_PWM_TIMER,
+            .freq_hz = laser_controller_board_clamp_u32(
+                s_tof_illumination.frequency_hz,
+                LASER_CONTROLLER_TOF_LED_PWM_MIN_FREQ_HZ,
+                LASER_CONTROLLER_TOF_LED_PWM_MAX_FREQ_HZ),
+            .clk_cfg = LEDC_AUTO_CLK,
+            .deconfigure = false,
+        };
+        ledc_channel_config_t channel_config = {
+            .gpio_num = LASER_CONTROLLER_GPIO_TOF_LED_CTRL,
+            .speed_mode = LASER_CONTROLLER_TOF_LED_PWM_SPEED_MODE,
+            .channel = LASER_CONTROLLER_TOF_LED_PWM_CHANNEL,
+            .intr_type = LEDC_INTR_DISABLE,
+            .timer_sel = LASER_CONTROLLER_TOF_LED_PWM_TIMER,
+            .duty = (laser_controller_board_clamp_u32(
+                        s_tof_illumination.duty_cycle_pct,
+                        1U,
+                        100U) *
+                     LASER_CONTROLLER_TOF_LED_PWM_DUTY_MAX) /
+                    100U,
+            .hpoint = 0,
+            .sleep_mode = LEDC_SLEEP_MODE_NO_ALIVE_NO_PD,
+            .flags = { .output_invert = 0 },
+            .deconfigure = false,
+        };
+
+        err = ledc_timer_config(&timer_config);
+        if (err == ESP_OK) {
+            err = ledc_channel_config(&channel_config);
+        }
+
+        if (err == ESP_OK) {
+            s_tof_illumination_pwm_active = true;
+            return ESP_OK;
+        }
+    }
+
+    (void)gpio_set_level(LASER_CONTROLLER_GPIO_TOF_LED_CTRL, 0);
+    return err;
+}
+
+static void laser_controller_board_apply_tof_sideband_state(bool tof_armed)
+{
+    (void)laser_controller_board_apply_tof_sideband_state_locked(tof_armed);
 }
 
 static void laser_controller_board_drive_safe_gpio_levels(
@@ -646,7 +727,7 @@ static esp_err_t laser_controller_board_ensure_gpio_ready(void)
     }
 
     config.pin_bit_mask = output_mask;
-    config.mode = GPIO_MODE_OUTPUT;
+    config.mode = GPIO_MODE_INPUT_OUTPUT;
     config.pull_down_en = GPIO_PULLDOWN_DISABLE;
     config.pull_up_en = GPIO_PULLUP_DISABLE;
     config.intr_type = GPIO_INTR_DISABLE;
@@ -2231,7 +2312,8 @@ static void laser_controller_board_capture_tof_readback(
     laser_controller_board_inputs_t *inputs)
 {
     const bool tof_expected =
-        laser_controller_service_module_expected(LASER_CONTROLLER_MODULE_TOF);
+        laser_controller_service_module_write_enabled(
+            LASER_CONTROLLER_MODULE_TOF);
     bool data_ready = false;
     uint8_t boot_state = 0U;
     uint16_t sensor_id = 0U;
@@ -2266,7 +2348,8 @@ static void laser_controller_board_capture_tof_readback(
     s_tof_readback.interrupt_line_high =
         gpio_get_level(LASER_CONTROLLER_GPIO_TOF_GPIO1_INT) != 0;
     s_tof_readback.led_ctrl_asserted =
-        gpio_get_level(LASER_CONTROLLER_GPIO_TOF_LED_CTRL) != 0;
+        s_tof_illumination.enabled ||
+        (gpio_get_level(LASER_CONTROLLER_GPIO_TOF_LED_CTRL) != 0);
 
     err = laser_controller_board_i2c_probe(LASER_CONTROLLER_VL53L1X_ADDR);
     if (err != ESP_OK) {
@@ -3258,7 +3341,7 @@ static void laser_controller_board_read_imu_inputs(
     const laser_controller_config_t *config,
     laser_controller_time_ms_t now_ms)
 {
-    laser_controller_service_status_t service_status;
+    laser_controller_service_imu_config_t imu_config;
     uint8_t status_reg = 0U;
     uint8_t raw_bytes[12] = { 0 };
     esp_err_t err;
@@ -3267,27 +3350,27 @@ static void laser_controller_board_read_imu_inputs(
         return;
     }
 
-    laser_controller_service_copy_status(&service_status);
-    if (s_imu_runtime.config.odr_hz != service_status.imu_odr_hz ||
-        s_imu_runtime.config.accel_range_g != service_status.imu_accel_range_g ||
-        s_imu_runtime.config.gyro_range_dps != service_status.imu_gyro_range_dps ||
-        s_imu_runtime.config.gyro_enabled != service_status.imu_gyro_enabled ||
-        s_imu_runtime.config.lpf2_enabled != service_status.imu_lpf2_enabled ||
+    laser_controller_service_get_imu_config(&imu_config);
+    if (s_imu_runtime.config.odr_hz != imu_config.odr_hz ||
+        s_imu_runtime.config.accel_range_g != imu_config.accel_range_g ||
+        s_imu_runtime.config.gyro_range_dps != imu_config.gyro_range_dps ||
+        s_imu_runtime.config.gyro_enabled != imu_config.gyro_enabled ||
+        s_imu_runtime.config.lpf2_enabled != imu_config.lpf2_enabled ||
         s_imu_runtime.config.timestamp_enabled !=
-            service_status.imu_timestamp_enabled ||
-        s_imu_runtime.config.bdu_enabled != service_status.imu_bdu_enabled ||
-        s_imu_runtime.config.if_inc_enabled != service_status.imu_if_inc_enabled ||
-        s_imu_runtime.config.i2c_disabled != service_status.imu_i2c_disabled) {
-        s_imu_runtime.config.odr_hz = service_status.imu_odr_hz;
-        s_imu_runtime.config.accel_range_g = service_status.imu_accel_range_g;
-        s_imu_runtime.config.gyro_range_dps = service_status.imu_gyro_range_dps;
-        s_imu_runtime.config.gyro_enabled = service_status.imu_gyro_enabled;
-        s_imu_runtime.config.lpf2_enabled = service_status.imu_lpf2_enabled;
+            imu_config.timestamp_enabled ||
+        s_imu_runtime.config.bdu_enabled != imu_config.bdu_enabled ||
+        s_imu_runtime.config.if_inc_enabled != imu_config.if_inc_enabled ||
+        s_imu_runtime.config.i2c_disabled != imu_config.i2c_disabled) {
+        s_imu_runtime.config.odr_hz = imu_config.odr_hz;
+        s_imu_runtime.config.accel_range_g = imu_config.accel_range_g;
+        s_imu_runtime.config.gyro_range_dps = imu_config.gyro_range_dps;
+        s_imu_runtime.config.gyro_enabled = imu_config.gyro_enabled;
+        s_imu_runtime.config.lpf2_enabled = imu_config.lpf2_enabled;
         s_imu_runtime.config.timestamp_enabled =
-            service_status.imu_timestamp_enabled;
-        s_imu_runtime.config.bdu_enabled = service_status.imu_bdu_enabled;
-        s_imu_runtime.config.if_inc_enabled = service_status.imu_if_inc_enabled;
-        s_imu_runtime.config.i2c_disabled = service_status.imu_i2c_disabled;
+            imu_config.timestamp_enabled;
+        s_imu_runtime.config.bdu_enabled = imu_config.bdu_enabled;
+        s_imu_runtime.config.if_inc_enabled = imu_config.if_inc_enabled;
+        s_imu_runtime.config.i2c_disabled = imu_config.i2c_disabled;
         s_imu_runtime.configured = false;
         s_imu_runtime.identified = false;
         s_imu_runtime.last_error = ESP_OK;
@@ -3485,7 +3568,7 @@ static void laser_controller_board_disable_pcn_pwm_and_drive(bool low_current)
         s_pwm_active = false;
     }
 
-    (void)gpio_set_direction(LASER_CONTROLLER_GPIO_LD_PCN, GPIO_MODE_OUTPUT);
+    (void)gpio_set_direction(LASER_CONTROLLER_GPIO_LD_PCN, GPIO_MODE_INPUT_OUTPUT);
     (void)gpio_set_level(
         LASER_CONTROLLER_GPIO_LD_PCN,
         low_current ? 0 : 1);
@@ -3504,12 +3587,15 @@ void laser_controller_board_init_safe_defaults(void)
     s_dac_ready = false;
     s_dac_last_error = ESP_OK;
     s_dac_last_attempt_ms = 0U;
+    s_tof_illumination_pwm_active = false;
     laser_controller_board_clear_dac_readback();
     laser_controller_board_clear_pd_readback();
     laser_controller_board_clear_imu_readback();
     laser_controller_board_clear_haptic_readback();
     laser_controller_board_clear_tof_runtime();
     laser_controller_board_clear_tof_readback();
+    memset(&s_tof_illumination, 0, sizeof(s_tof_illumination));
+    s_tof_illumination.frequency_hz = LASER_CONTROLLER_TOF_LED_PWM_MIN_FREQ_HZ;
     memset(&s_gpio_inspector, 0, sizeof(s_gpio_inspector));
     laser_controller_board_load_default_imu_config(&s_imu_runtime.config);
 
@@ -3640,6 +3726,18 @@ void laser_controller_board_apply_outputs(const laser_controller_board_outputs_t
     s_last_outputs = *outputs;
     laser_controller_board_drive_safe_gpio_levels(outputs);
     laser_controller_board_apply_gpio_overrides();
+}
+
+void laser_controller_board_apply_debug_gpio_state_now(void)
+{
+    if (!s_gpio_ready) {
+        (void)laser_controller_board_ensure_gpio_ready();
+    }
+
+    laser_controller_board_drive_safe_gpio_levels(&s_last_outputs);
+    laser_controller_board_apply_gpio_overrides();
+    laser_controller_board_refresh_haptic_gpio_levels();
+    laser_controller_board_capture_gpio_inspector();
 }
 
 void laser_controller_board_get_last_outputs(laser_controller_board_outputs_t *outputs)
@@ -3943,6 +4041,8 @@ void laser_controller_board_force_pd_refresh(void)
 
 void laser_controller_board_reset_gpio_debug_state(void)
 {
+    laser_controller_board_stop_tof_illumination_pwm();
+
     if (s_i2c_ready && s_i2c_bus != NULL) {
         (void)i2c_master_bus_wait_all_done(
             s_i2c_bus,
@@ -3973,6 +4073,9 @@ void laser_controller_board_reset_gpio_debug_state(void)
     (void)laser_controller_board_ensure_spi_ready();
     laser_controller_board_drive_safe_gpio_levels(&s_last_outputs);
     laser_controller_board_apply_gpio_overrides();
+    laser_controller_board_apply_tof_sideband_state(
+        laser_controller_service_module_write_enabled(
+            LASER_CONTROLLER_MODULE_TOF));
     laser_controller_board_capture_gpio_inspector();
 }
 
@@ -4206,9 +4309,32 @@ esp_err_t laser_controller_board_configure_haptic_debug(
     return err;
 }
 
+esp_err_t laser_controller_board_set_tof_illumination(
+    bool enabled,
+    uint32_t duty_cycle_pct,
+    uint32_t frequency_hz)
+{
+    if (enabled &&
+        !laser_controller_service_module_write_enabled(LASER_CONTROLLER_MODULE_TOF)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    s_tof_illumination.enabled = enabled && duty_cycle_pct > 0U;
+    s_tof_illumination.duty_cycle_pct =
+        laser_controller_board_clamp_u32(duty_cycle_pct, 0U, 100U);
+    s_tof_illumination.frequency_hz = laser_controller_board_clamp_u32(
+        frequency_hz > 0U ? frequency_hz : LASER_CONTROLLER_TOF_LED_PWM_MIN_FREQ_HZ,
+        LASER_CONTROLLER_TOF_LED_PWM_MIN_FREQ_HZ,
+        LASER_CONTROLLER_TOF_LED_PWM_MAX_FREQ_HZ);
+
+    return laser_controller_board_apply_tof_sideband_state_locked(
+        laser_controller_service_module_write_enabled(
+            LASER_CONTROLLER_MODULE_TOF));
+}
+
 esp_err_t laser_controller_board_fire_haptic_test(void)
 {
-    laser_controller_service_status_t status;
+    laser_controller_service_haptic_config_t haptic_config;
     esp_err_t err;
 
     if (!laser_controller_service_module_write_enabled(LASER_CONTROLLER_MODULE_HAPTIC)) {
@@ -4219,13 +4345,13 @@ esp_err_t laser_controller_board_fire_haptic_test(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    laser_controller_service_copy_status(&status);
+    laser_controller_service_get_haptic_config(&haptic_config);
     err = laser_controller_board_configure_haptic_debug(
-        status.haptic_effect_id,
-        status.haptic_mode,
-        status.haptic_library,
-        status.haptic_actuator,
-        status.haptic_rtp_level);
+        haptic_config.effect_id,
+        haptic_config.mode,
+        haptic_config.library,
+        haptic_config.actuator,
+        haptic_config.rtp_level);
     if (err != ESP_OK) {
         return err;
     }
@@ -4245,7 +4371,7 @@ void laser_controller_board_apply_actuator_targets(
     bool nir_output_enable,
     bool select_driver_low_current)
 {
-    laser_controller_service_status_t service_status;
+    laser_controller_service_dac_runtime_t dac_runtime;
     const float ld_volts_per_amp =
             config != NULL && config->analog.ld_command_volts_per_amp > 0.0f ?
             config->analog.ld_command_volts_per_amp :
@@ -4257,14 +4383,14 @@ void laser_controller_board_apply_actuator_targets(
     float ld_voltage_v;
     float tec_voltage_v;
 
-    laser_controller_service_copy_status(&service_status);
-    if (service_status.service_mode_requested) {
+    laser_controller_service_get_dac_runtime(&dac_runtime);
+    if (dac_runtime.service_mode_requested) {
         ld_voltage_v = laser_controller_board_clamp_float(
-            service_status.dac_ld_channel_v,
+            dac_runtime.dac_ld_channel_v,
             0.0f,
             LASER_CONTROLLER_DAC_FULL_SCALE_V);
         tec_voltage_v = laser_controller_board_clamp_float(
-            service_status.dac_tec_channel_v,
+            dac_runtime.dac_tec_channel_v,
             0.0f,
             2.5f);
     } else {

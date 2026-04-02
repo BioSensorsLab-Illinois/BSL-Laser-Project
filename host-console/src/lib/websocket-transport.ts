@@ -49,7 +49,16 @@ export class WebSocketTransport implements DeviceTransport {
   private scheduleHandshakeProbes(): void {
     this.clearHandshakeProbeTimers()
 
-    for (const delayMs of [60, 180, 420, 900, 1500, 2400]) {
+    const probes: Array<{ delayMs: number; cmd: 'get_status' | 'ping' }> = [
+      { delayMs: 60, cmd: 'get_status' },
+      { delayMs: 180, cmd: 'ping' },
+      { delayMs: 420, cmd: 'ping' },
+      { delayMs: 900, cmd: 'ping' },
+      { delayMs: 1500, cmd: 'ping' },
+      { delayMs: 2400, cmd: 'ping' },
+    ]
+
+    for (const probe of probes) {
       const timerId = window.setTimeout(() => {
         if (!this.active) {
           return
@@ -58,9 +67,9 @@ export class WebSocketTransport implements DeviceTransport {
         void this.sendCommand({
           id: 0,
           type: 'cmd',
-          cmd: 'get_status',
+          cmd: probe.cmd,
         }).catch(() => undefined)
-      }, delayMs)
+      }, probe.delayMs)
 
       this.handshakeProbeTimers.push(timerId)
     }

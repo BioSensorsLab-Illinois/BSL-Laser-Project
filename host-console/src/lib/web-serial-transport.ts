@@ -135,7 +135,16 @@ export class WebSerialTransport implements DeviceTransport {
   private scheduleHandshakeProbes(port: SerialLikePort): void {
     this.clearHandshakeProbeTimers()
 
-    for (const delayMs of [150, 450, 900, 1600, 2600, 3800]) {
+    const probes: Array<{ delayMs: number; cmd: 'get_status' | 'ping' }> = [
+      { delayMs: 150, cmd: 'get_status' },
+      { delayMs: 450, cmd: 'ping' },
+      { delayMs: 900, cmd: 'ping' },
+      { delayMs: 1600, cmd: 'ping' },
+      { delayMs: 2600, cmd: 'ping' },
+      { delayMs: 3800, cmd: 'ping' },
+    ]
+
+    for (const probe of probes) {
       const timerId = window.setTimeout(() => {
         if (!this.active || this.port !== port) {
           return
@@ -144,9 +153,9 @@ export class WebSerialTransport implements DeviceTransport {
         void this.sendCommand({
           id: 0,
           type: 'cmd',
-          cmd: 'get_status',
+          cmd: probe.cmd,
         }).catch(() => undefined)
-      }, delayMs)
+      }, probe.delayMs)
 
       this.handshakeProbeTimers.push(timerId)
     }
