@@ -3,6 +3,7 @@
 #include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
@@ -37,6 +38,23 @@
 #define LASER_CONTROLLER_PD_RECONCILE_RETRY_MS      10000U
 #define LASER_CONTROLLER_PD_COMPARE_VOLTAGE_EPS_V   0.06f
 #define LASER_CONTROLLER_PD_COMPARE_CURRENT_EPS_A   0.02f
+#define LASER_CONTROLLER_DEPLOYMENT_STABILIZE_MS    300U
+#define LASER_CONTROLLER_DEPLOYMENT_PD_WAIT_MS      1200U
+#define LASER_CONTROLLER_DEPLOYMENT_OWNERSHIP_WAIT_MS 1200U
+#define LASER_CONTROLLER_DEPLOYMENT_OUTPUTS_WAIT_MS  800U
+#define LASER_CONTROLLER_DEPLOYMENT_DAC_WAIT_MS      800U
+#define LASER_CONTROLLER_DEPLOYMENT_PERIPHERAL_WAIT_MS 2500U
+#define LASER_CONTROLLER_DEPLOYMENT_READY_WAIT_MS    1200U
+#define LASER_CONTROLLER_DEPLOYMENT_STEP_DELAY_MS    1000U
+#define LASER_CONTROLLER_DEPLOYMENT_RAIL_SEQUENCE_MIN_WAIT_MS 4000U
+#define LASER_CONTROLLER_DEPLOYMENT_READY_MIN_WAIT_MS 3000U
+#define LASER_CONTROLLER_DEPLOYMENT_TEC_RESERVE_W    15.0f
+#define LASER_CONTROLLER_DEPLOYMENT_PERIPHERAL_RESERVE_W 5.0f
+#define LASER_CONTROLLER_DEPLOYMENT_MIN_LD_SOURCE_V  9.0f
+#define LASER_CONTROLLER_DEPLOYMENT_FULL_POWER_W     40.0f
+#define LASER_CONTROLLER_DEPLOYMENT_DEFAULT_TEMP_C   25.0f
+#define LASER_CONTROLLER_DEPLOYMENT_DAC_CODE_MAX     65535U
+#define LASER_CONTROLLER_DEPLOYMENT_DAC_FULL_SCALE_V 2.5f
 
 typedef struct {
     bool state;
@@ -49,6 +67,11 @@ typedef struct {
     bool waiting;
     laser_controller_time_ms_t pending_since_ms;
 } laser_controller_rail_watch_t;
+
+typedef enum {
+    LASER_CONTROLLER_DEPLOYMENT_RAIL_PHASE_TEC = 0,
+    LASER_CONTROLLER_DEPLOYMENT_RAIL_PHASE_LD,
+} laser_controller_deployment_rail_phase_t;
 
 typedef struct {
     bool started;
@@ -76,6 +99,11 @@ typedef struct {
     laser_controller_time_ms_t next_pd_reconcile_ms;
     laser_controller_config_t config;
     laser_controller_state_machine_t state_machine;
+    laser_controller_deployment_status_t deployment;
+    laser_controller_time_ms_t deployment_step_started_ms;
+    laser_controller_time_ms_t deployment_phase_started_ms;
+    uint32_t deployment_substep;
+    bool deployment_step_action_performed;
     laser_controller_board_inputs_t last_inputs;
     laser_controller_board_outputs_t last_outputs;
     laser_controller_safety_decision_t last_decision;
@@ -211,6 +239,795 @@ static laser_controller_nm_t laser_controller_lambda_from_temp(
            ((temp_c - LASER_CONTROLLER_BENCH_MIN_TEMP_C) *
             (LASER_CONTROLLER_BENCH_MAX_LAMBDA_NM - LASER_CONTROLLER_BENCH_MIN_LAMBDA_NM) /
             (LASER_CONTROLLER_BENCH_MAX_TEMP_C - LASER_CONTROLLER_BENCH_MIN_TEMP_C));
+}
+
+static laser_controller_celsius_t laser_controller_temp_from_lambda(
+    const laser_controller_config_t *config,
+    laser_controller_nm_t target_lambda_nm)
+{
+    if (laser_controller_config_has_valid_lut(config)) {
+        for (uint8_t index = 1U; index < config->wavelength_lut.point_count; ++index) {
+            const float lambda_low = config->wavelength_lut.wavelength_nm[index - 1U];
+            const float lambda_high = config->wavelength_lut.wavelength_nm[index];
+
+            if (target_lambda_nm <= lambda_high) {
+                const float temp_low = config->wavelength_lut.target_temp_c[index - 1U];
+                const float temp_high = config->wavelength_lut.target_temp_c[index];
+                const float span = lambda_high - lambda_low;
+                const float ratio = fabsf(span) > 0.0f ?
+                    (target_lambda_nm - lambda_low) / span :
+                    0.0f;
+                return temp_low + ((temp_high - temp_low) * ratio);
+            }
+        }
+
+        return config->wavelength_lut.target_temp_c[
+            config->wavelength_lut.point_count - 1U];
+    }
+
+    if (target_lambda_nm <= LASER_CONTROLLER_BENCH_MIN_LAMBDA_NM) {
+        return LASER_CONTROLLER_BENCH_MIN_TEMP_C;
+    }
+
+    if (target_lambda_nm >= LASER_CONTROLLER_BENCH_MAX_LAMBDA_NM) {
+        return LASER_CONTROLLER_BENCH_MAX_TEMP_C;
+    }
+
+    return LASER_CONTROLLER_BENCH_MIN_TEMP_C +
+           ((target_lambda_nm - LASER_CONTROLLER_BENCH_MIN_LAMBDA_NM) *
+            (LASER_CONTROLLER_BENCH_MAX_TEMP_C - LASER_CONTROLLER_BENCH_MIN_TEMP_C) /
+            (LASER_CONTROLLER_BENCH_MAX_LAMBDA_NM - LASER_CONTROLLER_BENCH_MIN_LAMBDA_NM));
+}
+
+static laser_controller_celsius_t laser_controller_deployment_clamp_target_temp_c(
+    const laser_controller_config_t *config,
+    laser_controller_celsius_t temp_c)
+{
+    const float min_c =
+        config != NULL ? config->thresholds.tec_min_command_c :
+                         LASER_CONTROLLER_BENCH_MIN_TEMP_C;
+    const float max_c =
+        config != NULL ? config->thresholds.tec_max_command_c :
+                         LASER_CONTROLLER_BENCH_MAX_TEMP_C;
+    const float clamp_min =
+        min_c < LASER_CONTROLLER_BENCH_MIN_TEMP_C ?
+            LASER_CONTROLLER_BENCH_MIN_TEMP_C :
+            min_c;
+    const float clamp_max =
+        max_c > LASER_CONTROLLER_BENCH_MAX_TEMP_C ?
+            LASER_CONTROLLER_BENCH_MAX_TEMP_C :
+            max_c;
+
+    if (temp_c < clamp_min) {
+        return clamp_min;
+    }
+
+    if (temp_c > clamp_max) {
+        return clamp_max;
+    }
+
+    return temp_c;
+}
+
+static laser_controller_celsius_t laser_controller_deployment_target_temp_c(
+    const laser_controller_context_t *context,
+    const laser_controller_bench_status_t *bench_status)
+{
+    if (context != NULL && context->deployment.active) {
+        return context->deployment.target.target_temp_c;
+    }
+
+    return bench_status != NULL ? bench_status->target_temp_c :
+                                  LASER_CONTROLLER_DEPLOYMENT_DEFAULT_TEMP_C;
+}
+
+static laser_controller_nm_t laser_controller_deployment_target_lambda_nm(
+    const laser_controller_context_t *context,
+    const laser_controller_bench_status_t *bench_status)
+{
+    if (context != NULL && context->deployment.active) {
+        return context->deployment.target.target_lambda_nm;
+    }
+
+    return bench_status != NULL ? bench_status->target_lambda_nm :
+                                  laser_controller_lambda_from_temp(
+                                      NULL,
+                                      LASER_CONTROLLER_DEPLOYMENT_DEFAULT_TEMP_C);
+}
+
+static laser_controller_amps_t laser_controller_deployment_effective_current_limit(
+    const laser_controller_context_t *context,
+    const laser_controller_config_t *config)
+{
+    const float config_limit =
+        config != NULL ? config->thresholds.max_laser_current_a : 0.0f;
+
+    if (context != NULL && context->deployment.active &&
+        context->deployment.max_laser_current_a > 0.0f) {
+        if (config_limit > 0.0f &&
+            context->deployment.max_laser_current_a > config_limit) {
+            return config_limit;
+        }
+
+        return context->deployment.max_laser_current_a;
+    }
+
+    return config_limit;
+}
+
+static laser_controller_amps_t laser_controller_commanded_laser_current_a(
+    const laser_controller_context_t *context,
+    const laser_controller_config_t *config,
+    const laser_controller_bench_status_t *bench_status,
+    bool nir_output_enable)
+{
+    laser_controller_amps_t requested_current_a =
+        bench_status != NULL ? bench_status->high_state_current_a : 0.0f;
+    const laser_controller_amps_t current_limit =
+        laser_controller_deployment_effective_current_limit(context, config);
+
+    if (!nir_output_enable) {
+        return 0.0f;
+    }
+
+    if (current_limit > 0.0f &&
+        requested_current_a > current_limit) {
+        requested_current_a = current_limit;
+    }
+
+    return requested_current_a < 0.0f ? 0.0f : requested_current_a;
+}
+
+static laser_controller_volts_t laser_controller_deployment_target_temp_to_voltage_v(
+    const laser_controller_config_t *config,
+    laser_controller_celsius_t target_temp_c)
+{
+    const float tec_volts_per_c =
+        config != NULL && config->analog.tec_command_volts_per_c > 0.0f ?
+            config->analog.tec_command_volts_per_c :
+            (LASER_CONTROLLER_DEPLOYMENT_DAC_FULL_SCALE_V / 65.0f);
+    float voltage_v = target_temp_c * tec_volts_per_c;
+
+    if (voltage_v < 0.0f) {
+        voltage_v = 0.0f;
+    }
+
+    if (voltage_v > LASER_CONTROLLER_DEPLOYMENT_DAC_FULL_SCALE_V) {
+        voltage_v = LASER_CONTROLLER_DEPLOYMENT_DAC_FULL_SCALE_V;
+    }
+
+    return voltage_v;
+}
+
+static uint16_t laser_controller_deployment_voltage_to_dac_code(float voltage_v)
+{
+    const float clamped_v =
+        voltage_v < 0.0f ? 0.0f :
+        voltage_v > LASER_CONTROLLER_DEPLOYMENT_DAC_FULL_SCALE_V ?
+            LASER_CONTROLLER_DEPLOYMENT_DAC_FULL_SCALE_V :
+            voltage_v;
+    const float ratio = clamped_v / LASER_CONTROLLER_DEPLOYMENT_DAC_FULL_SCALE_V;
+    const uint32_t code =
+        (uint32_t)lroundf(ratio * (float)LASER_CONTROLLER_DEPLOYMENT_DAC_CODE_MAX);
+
+    return (uint16_t)(code > LASER_CONTROLLER_DEPLOYMENT_DAC_CODE_MAX ?
+                          LASER_CONTROLLER_DEPLOYMENT_DAC_CODE_MAX :
+                          code);
+}
+
+static void laser_controller_deployment_reset_step_status(
+    laser_controller_context_t *context,
+    laser_controller_deployment_step_status_t status)
+{
+    if (context == NULL) {
+        return;
+    }
+
+    for (uint32_t index = 0U;
+         index < LASER_CONTROLLER_DEPLOYMENT_STEP_COUNT;
+         ++index) {
+        context->deployment.step_status[index] = status;
+    }
+
+    context->deployment.step_status[LASER_CONTROLLER_DEPLOYMENT_STEP_NONE] =
+        LASER_CONTROLLER_DEPLOYMENT_STEP_STATUS_INACTIVE;
+}
+
+static void laser_controller_deployment_begin_step(
+    laser_controller_context_t *context,
+    laser_controller_deployment_step_t step,
+    laser_controller_time_ms_t now_ms)
+{
+    if (context == NULL ||
+        step <= LASER_CONTROLLER_DEPLOYMENT_STEP_NONE ||
+        step >= LASER_CONTROLLER_DEPLOYMENT_STEP_COUNT) {
+        return;
+    }
+
+    context->deployment.current_step = step;
+    context->deployment.step_status[step] =
+        LASER_CONTROLLER_DEPLOYMENT_STEP_STATUS_IN_PROGRESS;
+    context->deployment_step_started_ms = now_ms;
+    context->deployment_phase_started_ms = now_ms;
+    context->deployment_substep = 0U;
+    context->deployment_step_action_performed = false;
+}
+
+static bool laser_controller_deployment_step_delay_elapsed(
+    const laser_controller_context_t *context,
+    laser_controller_time_ms_t now_ms)
+{
+    return context == NULL ||
+           context->deployment.current_step <= LASER_CONTROLLER_DEPLOYMENT_STEP_NONE ||
+           context->deployment.current_step >= LASER_CONTROLLER_DEPLOYMENT_STEP_COUNT ||
+           (now_ms - context->deployment_step_started_ms) >=
+               LASER_CONTROLLER_DEPLOYMENT_STEP_DELAY_MS;
+}
+
+static void laser_controller_deployment_complete_current_step(
+    laser_controller_context_t *context,
+    laser_controller_time_ms_t now_ms)
+{
+    laser_controller_deployment_step_t next_step;
+
+    if (context == NULL) {
+        return;
+    }
+
+    if (context->deployment.current_step <= LASER_CONTROLLER_DEPLOYMENT_STEP_NONE ||
+        context->deployment.current_step >= LASER_CONTROLLER_DEPLOYMENT_STEP_COUNT) {
+        return;
+    }
+
+    context->deployment.step_status[context->deployment.current_step] =
+        LASER_CONTROLLER_DEPLOYMENT_STEP_STATUS_PASSED;
+    context->deployment.last_completed_step = context->deployment.current_step;
+    next_step = (laser_controller_deployment_step_t)(context->deployment.current_step + 1U);
+
+    if (next_step >= LASER_CONTROLLER_DEPLOYMENT_STEP_COUNT) {
+        context->deployment.current_step = LASER_CONTROLLER_DEPLOYMENT_STEP_NONE;
+        context->deployment.running = false;
+        context->deployment.ready = true;
+        context->deployment.failed = false;
+        context->deployment.failure_code = LASER_CONTROLLER_FAULT_NONE;
+        context->deployment.failure_reason[0] = '\0';
+        context->deployment_step_started_ms = now_ms;
+        context->deployment_phase_started_ms = now_ms;
+        context->deployment_step_action_performed = false;
+        return;
+    }
+
+    laser_controller_deployment_begin_step(context, next_step, now_ms);
+}
+
+static void laser_controller_deployment_fail(
+    laser_controller_context_t *context,
+    laser_controller_time_ms_t now_ms,
+    laser_controller_fault_code_t failure_code,
+    const char *failure_reason)
+{
+    if (context == NULL) {
+        return;
+    }
+
+    if (context->deployment.current_step > LASER_CONTROLLER_DEPLOYMENT_STEP_NONE &&
+        context->deployment.current_step < LASER_CONTROLLER_DEPLOYMENT_STEP_COUNT) {
+        context->deployment.step_status[context->deployment.current_step] =
+            LASER_CONTROLLER_DEPLOYMENT_STEP_STATUS_FAILED;
+    }
+
+    context->deployment.running = false;
+    context->deployment.ready = false;
+    context->deployment.failed = true;
+    context->deployment.failure_code = failure_code;
+    context->deployment.current_step = LASER_CONTROLLER_DEPLOYMENT_STEP_NONE;
+    context->deployment_step_started_ms = now_ms;
+    context->deployment_phase_started_ms = now_ms;
+    context->deployment_substep = 0U;
+    context->deployment_step_action_performed = false;
+    (void)snprintf(
+        context->deployment.failure_reason,
+        sizeof(context->deployment.failure_reason),
+        "%s",
+        failure_reason != NULL ? failure_reason : "deployment failed");
+    laser_controller_logger_logf(
+        now_ms,
+        "deploy",
+        "deployment failed: %s (%s)",
+        laser_controller_fault_code_name(failure_code),
+        context->deployment.failure_reason);
+}
+
+static void laser_controller_deployment_invalidate_ready(
+    laser_controller_context_t *context,
+    laser_controller_time_ms_t now_ms,
+    laser_controller_fault_code_t failure_code,
+    const char *failure_reason)
+{
+    if (context == NULL ||
+        !context->deployment.active ||
+        !context->deployment.ready) {
+        return;
+    }
+
+    context->deployment.ready = false;
+    context->deployment.failed = true;
+    context->deployment.running = false;
+    context->deployment.current_step = LASER_CONTROLLER_DEPLOYMENT_STEP_NONE;
+    context->deployment.failure_code = failure_code;
+    (void)snprintf(
+        context->deployment.failure_reason,
+        sizeof(context->deployment.failure_reason),
+        "%s",
+        failure_reason != NULL ? failure_reason : "deployment invalidated");
+    laser_controller_logger_logf(
+        now_ms,
+        "deploy",
+        "deployment ready state cleared: %s (%s)",
+        laser_controller_fault_code_name(failure_code),
+        context->deployment.failure_reason);
+}
+
+static const laser_controller_board_gpio_pin_readback_t *
+laser_controller_deployment_find_gpio_pin(
+    const laser_controller_board_inputs_t *inputs,
+    uint32_t gpio_num)
+{
+    if (inputs == NULL) {
+        return NULL;
+    }
+
+    for (size_t index = 0U;
+         index < LASER_CONTROLLER_BOARD_GPIO_INSPECTOR_PIN_COUNT;
+         ++index) {
+        const laser_controller_board_gpio_pin_readback_t *pin =
+            &inputs->gpio_inspector.pins[index];
+
+        if ((uint32_t)pin->gpio_num == gpio_num) {
+            return pin;
+        }
+    }
+
+    return NULL;
+}
+
+static bool laser_controller_deployment_pin_is_low(
+    const laser_controller_board_inputs_t *inputs,
+    uint32_t gpio_num)
+{
+    const laser_controller_board_gpio_pin_readback_t *pin =
+        laser_controller_deployment_find_gpio_pin(inputs, gpio_num);
+
+    return pin != NULL && !pin->level_high;
+}
+
+static bool laser_controller_deployment_pin_is_high(
+    const laser_controller_board_inputs_t *inputs,
+    uint32_t gpio_num)
+{
+    const laser_controller_board_gpio_pin_readback_t *pin =
+        laser_controller_deployment_find_gpio_pin(inputs, gpio_num);
+
+    return pin != NULL && pin->level_high;
+}
+
+static bool laser_controller_deployment_outputs_off_confirmed(
+    const laser_controller_context_t *context)
+{
+    const laser_controller_board_inputs_t *inputs =
+        context != NULL ? &context->last_inputs : NULL;
+
+    return context != NULL &&
+           inputs != NULL &&
+           !context->last_outputs.enable_ld_vin &&
+           !context->last_outputs.enable_tec_vin &&
+           !context->last_outputs.enable_haptic_driver &&
+           !context->last_outputs.enable_alignment_laser &&
+           context->last_outputs.assert_driver_standby &&
+           context->last_outputs.select_driver_low_current &&
+           laser_controller_deployment_pin_is_low(inputs, LASER_CONTROLLER_GPIO_LD_SBDN) &&
+           laser_controller_deployment_pin_is_low(inputs, LASER_CONTROLLER_GPIO_LD_PCN) &&
+           laser_controller_deployment_pin_is_low(inputs, LASER_CONTROLLER_GPIO_PWR_LD_EN) &&
+           laser_controller_deployment_pin_is_low(inputs, LASER_CONTROLLER_GPIO_PWR_TEC_EN) &&
+           laser_controller_deployment_pin_is_low(inputs, LASER_CONTROLLER_GPIO_ERM_EN) &&
+           laser_controller_deployment_pin_is_low(inputs, LASER_CONTROLLER_GPIO_ERM_TRIG_GN_LD_EN) &&
+           !inputs->pcn_pwm_active &&
+           !inputs->tof_illumination_pwm_active;
+}
+
+static bool laser_controller_deployment_ready_posture_confirmed(
+    const laser_controller_context_t *context)
+{
+    const laser_controller_board_inputs_t *inputs =
+        context != NULL ? &context->last_inputs : NULL;
+
+    return context != NULL &&
+           inputs != NULL &&
+           context->last_outputs.enable_ld_vin &&
+           context->last_outputs.enable_tec_vin &&
+           context->last_outputs.assert_driver_standby &&
+           !context->last_outputs.select_driver_low_current &&
+           inputs->ld_rail_pgood &&
+           inputs->tec_rail_pgood &&
+           inputs->driver_loop_good &&
+           laser_controller_deployment_pin_is_low(inputs, LASER_CONTROLLER_GPIO_LD_SBDN) &&
+           laser_controller_deployment_pin_is_high(inputs, LASER_CONTROLLER_GPIO_LD_PCN) &&
+           !inputs->pcn_pwm_active &&
+           !inputs->tof_illumination_pwm_active;
+}
+
+static bool laser_controller_deployment_ownership_reclaimed(
+    const laser_controller_context_t *context)
+{
+    return context != NULL &&
+           !laser_controller_service_mode_requested() &&
+           !laser_controller_service_interlocks_disabled() &&
+           context->state_machine.current != LASER_CONTROLLER_STATE_SERVICE_MODE &&
+           !context->last_inputs.gpio_inspector.any_override_active &&
+           !context->last_inputs.tof_illumination_pwm_active &&
+           !context->last_inputs.pcn_pwm_active;
+}
+
+static void laser_controller_deployment_recompute_power_cap(
+    laser_controller_context_t *context,
+    const laser_controller_config_t *config)
+{
+    float max_current_a =
+        config != NULL ? config->thresholds.max_laser_current_a : 0.0f;
+
+    if (context == NULL || config == NULL) {
+        return;
+    }
+
+    if (context->last_inputs.pd_contract_valid &&
+        context->last_inputs.pd_negotiated_power_w > 0.0f &&
+        context->last_inputs.pd_negotiated_power_w < LASER_CONTROLLER_DEPLOYMENT_FULL_POWER_W) {
+        const float laser_budget_w =
+            context->last_inputs.pd_negotiated_power_w -
+            LASER_CONTROLLER_DEPLOYMENT_TEC_RESERVE_W -
+            LASER_CONTROLLER_DEPLOYMENT_PERIPHERAL_RESERVE_W;
+        const float capped_current_a =
+            laser_budget_w > 0.0f ?
+                (laser_budget_w * 0.9f) / 3.0f :
+                0.0f;
+
+        if (capped_current_a < max_current_a) {
+            max_current_a = capped_current_a;
+        }
+    }
+
+    if (max_current_a < 0.0f) {
+        max_current_a = 0.0f;
+    }
+
+    context->deployment.max_laser_current_a = max_current_a;
+    context->deployment.max_optical_power_w = max_current_a;
+}
+
+static uint32_t laser_controller_deployment_rail_sequence_wait_ms(
+    const laser_controller_config_t *config)
+{
+    uint32_t wait_ms =
+        config != NULL ? config->timeouts.rail_good_timeout_ms : 0U;
+
+    if (wait_ms < LASER_CONTROLLER_DEPLOYMENT_RAIL_SEQUENCE_MIN_WAIT_MS) {
+        wait_ms = LASER_CONTROLLER_DEPLOYMENT_RAIL_SEQUENCE_MIN_WAIT_MS;
+    }
+
+    return wait_ms;
+}
+
+static uint32_t laser_controller_deployment_ready_wait_ms(
+    const laser_controller_config_t *config)
+{
+    uint32_t wait_ms = LASER_CONTROLLER_DEPLOYMENT_READY_WAIT_MS;
+
+    if (config != NULL && config->timeouts.rail_good_timeout_ms > wait_ms) {
+        wait_ms = config->timeouts.rail_good_timeout_ms;
+    }
+    if (wait_ms < LASER_CONTROLLER_DEPLOYMENT_READY_MIN_WAIT_MS) {
+        wait_ms = LASER_CONTROLLER_DEPLOYMENT_READY_MIN_WAIT_MS;
+    }
+
+    return wait_ms;
+}
+
+static void laser_controller_deployment_tick(
+    laser_controller_context_t *context,
+    const laser_controller_config_t *config,
+    laser_controller_time_ms_t now_ms)
+{
+    float actual_lambda_nm = 0.0f;
+    float target_lambda_nm = 0.0f;
+    float lambda_drift_nm = 0.0f;
+    bool lambda_drift_blocked = false;
+    bool tec_temp_adc_blocked = false;
+    bool tec_telemetry_plausible = false;
+    const uint32_t deployment_rail_wait_ms =
+        laser_controller_deployment_rail_sequence_wait_ms(config);
+    const uint32_t deployment_ready_wait_ms =
+        laser_controller_deployment_ready_wait_ms(config);
+
+    if (context == NULL || config == NULL || !context->deployment.active) {
+        return;
+    }
+
+    actual_lambda_nm =
+        laser_controller_lambda_from_temp(config, context->last_inputs.tec_temp_c);
+    target_lambda_nm = context->deployment.target.target_lambda_nm;
+    lambda_drift_nm =
+        actual_lambda_nm > target_lambda_nm ?
+            (actual_lambda_nm - target_lambda_nm) :
+            (target_lambda_nm - actual_lambda_nm);
+    lambda_drift_blocked =
+        lambda_drift_nm > config->thresholds.lambda_drift_limit_nm;
+    tec_temp_adc_blocked =
+        context->last_inputs.tec_temp_adc_voltage_v >
+        config->thresholds.tec_temp_adc_trip_v;
+    tec_telemetry_plausible =
+        context->last_inputs.tec_temp_adc_voltage_v > 0.05f &&
+        context->last_inputs.tec_temp_adc_voltage_v < 3.2f &&
+        fabsf(context->last_inputs.tec_current_a) < 10.0f &&
+        context->last_inputs.tec_voltage_v < 10.0f;
+
+    if (context->deployment.ready && !context->deployment.running) {
+        if (!context->last_inputs.pd_contract_valid ||
+            context->last_inputs.pd_source_voltage_v <
+                LASER_CONTROLLER_DEPLOYMENT_MIN_LD_SOURCE_V) {
+            laser_controller_deployment_invalidate_ready(
+                context,
+                now_ms,
+                LASER_CONTROLLER_FAULT_PD_LOST,
+                "deployment source voltage or PD contract became invalid");
+        } else if (!context->last_inputs.tec_rail_pgood) {
+            laser_controller_deployment_invalidate_ready(
+                context,
+                now_ms,
+                LASER_CONTROLLER_FAULT_TEC_RAIL_BAD,
+                "deployment TEC rail lost PGOOD");
+        } else if (!context->last_inputs.ld_rail_pgood) {
+            laser_controller_deployment_invalidate_ready(
+                context,
+                now_ms,
+                LASER_CONTROLLER_FAULT_LD_RAIL_BAD,
+                "deployment LD rail lost PGOOD");
+        } else if (!context->last_inputs.driver_loop_good) {
+            laser_controller_deployment_invalidate_ready(
+                context,
+                now_ms,
+                LASER_CONTROLLER_FAULT_LD_LOOP_BAD,
+                "deployment loop-good invalidated");
+        }
+        return;
+    }
+
+    if (!context->deployment.running) {
+        return;
+    }
+
+    if (!laser_controller_deployment_step_delay_elapsed(context, now_ms)) {
+        return;
+    }
+
+    switch (context->deployment.current_step) {
+        case LASER_CONTROLLER_DEPLOYMENT_STEP_OWNERSHIP_RECLAIM:
+            if (laser_controller_deployment_ownership_reclaimed(context)) {
+                laser_controller_deployment_complete_current_step(context, now_ms);
+            } else if ((now_ms - context->deployment_step_started_ms) >=
+                       LASER_CONTROLLER_DEPLOYMENT_OWNERSHIP_WAIT_MS) {
+                laser_controller_deployment_fail(
+                    context,
+                    now_ms,
+                    LASER_CONTROLLER_FAULT_SERVICE_OVERRIDE_REJECTED,
+                    "service ownership did not clear before deployment");
+            }
+            break;
+        case LASER_CONTROLLER_DEPLOYMENT_STEP_PD_INSPECT:
+            if (context->last_inputs.pd_contract_valid &&
+                context->last_inputs.pd_source_voltage_v >=
+                    LASER_CONTROLLER_DEPLOYMENT_MIN_LD_SOURCE_V) {
+                laser_controller_deployment_complete_current_step(context, now_ms);
+            } else if ((now_ms - context->deployment_step_started_ms) >=
+                       LASER_CONTROLLER_DEPLOYMENT_PD_WAIT_MS) {
+                laser_controller_deployment_fail(
+                    context,
+                    now_ms,
+                    context->last_inputs.pd_source_voltage_v <
+                            LASER_CONTROLLER_DEPLOYMENT_MIN_LD_SOURCE_V ?
+                        LASER_CONTROLLER_FAULT_PD_INSUFFICIENT :
+                        LASER_CONTROLLER_FAULT_PD_LOST,
+                    "valid PD source with at least 9V was not present");
+            }
+            break;
+        case LASER_CONTROLLER_DEPLOYMENT_STEP_POWER_CAP:
+            laser_controller_deployment_recompute_power_cap(context, config);
+            if (context->deployment.max_laser_current_a <= 0.0f) {
+                laser_controller_deployment_fail(
+                    context,
+                    now_ms,
+                    LASER_CONTROLLER_FAULT_PD_INSUFFICIENT,
+                    "deployment PD budget left no laser operating headroom");
+                break;
+            }
+            laser_controller_logger_logf(
+                now_ms,
+                "deploy",
+                "deployment current cap %.3f A (pd=%.1fW, target=%s %.2f)",
+                context->deployment.max_laser_current_a,
+                context->last_inputs.pd_negotiated_power_w,
+                laser_controller_deployment_target_mode_name(
+                    context->deployment.target.target_mode),
+                context->deployment.target.target_mode ==
+                        LASER_CONTROLLER_DEPLOYMENT_TARGET_MODE_TEMP ?
+                    context->deployment.target.target_temp_c :
+                    context->deployment.target.target_lambda_nm);
+            laser_controller_deployment_complete_current_step(context, now_ms);
+            break;
+        case LASER_CONTROLLER_DEPLOYMENT_STEP_OUTPUTS_OFF:
+            if (laser_controller_deployment_outputs_off_confirmed(context)) {
+                laser_controller_deployment_complete_current_step(context, now_ms);
+            } else if ((now_ms - context->deployment_step_started_ms) >=
+                       LASER_CONTROLLER_DEPLOYMENT_OUTPUTS_WAIT_MS) {
+                laser_controller_deployment_fail(
+                    context,
+                    now_ms,
+                    LASER_CONTROLLER_FAULT_SERVICE_OVERRIDE_REJECTED,
+                    "controlled outputs did not reach the required safe-off posture");
+            }
+            break;
+        case LASER_CONTROLLER_DEPLOYMENT_STEP_STABILIZE_3V3:
+            if ((now_ms - context->deployment_step_started_ms) >=
+                LASER_CONTROLLER_DEPLOYMENT_STABILIZE_MS) {
+                laser_controller_deployment_complete_current_step(context, now_ms);
+            }
+            break;
+        case LASER_CONTROLLER_DEPLOYMENT_STEP_DAC_SAFE_ZERO:
+            if (!context->deployment_step_action_performed) {
+                const esp_err_t dac_err =
+                    laser_controller_board_configure_dac_debug(
+                        LASER_CONTROLLER_SERVICE_DAC_REFERENCE_INTERNAL,
+                        true,
+                        true,
+                        LASER_CONTROLLER_SERVICE_DAC_SYNC_ASYNC);
+                const esp_err_t ld_err =
+                    dac_err == ESP_OK ?
+                        laser_controller_board_set_dac_debug_output(false, 0.0f) :
+                        dac_err;
+                const esp_err_t tec_err =
+                    ld_err == ESP_OK ?
+                        laser_controller_board_set_dac_debug_output(
+                            true,
+                            laser_controller_deployment_target_temp_to_voltage_v(
+                                config,
+                                LASER_CONTROLLER_DEPLOYMENT_DEFAULT_TEMP_C)) :
+                        ld_err;
+
+                context->deployment_step_action_performed = true;
+                context->deployment_phase_started_ms = now_ms;
+                if (tec_err != ESP_OK) {
+                    laser_controller_deployment_fail(
+                        context,
+                        now_ms,
+                        LASER_CONTROLLER_FAULT_INVALID_CONFIG,
+                        "DAC safe-zero initialization failed");
+                }
+                break;
+            }
+            if (context->last_inputs.dac.reachable &&
+                context->last_inputs.dac.configured &&
+                !context->last_inputs.dac.ref_alarm &&
+                context->last_inputs.dac.data_a_reg == 0U &&
+                context->last_inputs.dac.data_b_reg ==
+                    laser_controller_deployment_voltage_to_dac_code(
+                        laser_controller_deployment_target_temp_to_voltage_v(
+                            config,
+                            LASER_CONTROLLER_DEPLOYMENT_DEFAULT_TEMP_C))) {
+                laser_controller_deployment_complete_current_step(context, now_ms);
+            } else if ((now_ms - context->deployment_step_started_ms) >=
+                       LASER_CONTROLLER_DEPLOYMENT_DAC_WAIT_MS) {
+                laser_controller_deployment_fail(
+                    context,
+                    now_ms,
+                    LASER_CONTROLLER_FAULT_INVALID_CONFIG,
+                    "DAC readback did not match safe deployment initialization");
+            }
+            break;
+        case LASER_CONTROLLER_DEPLOYMENT_STEP_PERIPHERALS_VERIFY:
+            if (context->last_inputs.imu_readback.reachable &&
+                context->last_inputs.imu_readback.configured &&
+                context->last_inputs.imu_readback.who_am_i == 0x6CU &&
+                context->last_inputs.tof_readback.reachable &&
+                context->last_inputs.tof_readback.configured &&
+                context->last_inputs.tof_readback.boot_state != 0U &&
+                context->last_inputs.tof_readback.sensor_id == 0xEACCU &&
+                context->last_inputs.haptic_readback.reachable) {
+                laser_controller_deployment_complete_current_step(context, now_ms);
+            } else if ((now_ms - context->deployment_step_started_ms) >=
+                       LASER_CONTROLLER_DEPLOYMENT_PERIPHERAL_WAIT_MS) {
+                laser_controller_deployment_fail(
+                    context,
+                    now_ms,
+                    !context->last_inputs.imu_readback.reachable ||
+                            context->last_inputs.imu_readback.who_am_i != 0x6CU ?
+                        LASER_CONTROLLER_FAULT_IMU_INVALID :
+                    !context->last_inputs.tof_readback.reachable ||
+                            context->last_inputs.tof_readback.sensor_id != 0xEACCU ?
+                        LASER_CONTROLLER_FAULT_TOF_INVALID :
+                        LASER_CONTROLLER_FAULT_SERVICE_OVERRIDE_REJECTED,
+                    "one or more deployment peripherals failed readback verification");
+            }
+            break;
+        case LASER_CONTROLLER_DEPLOYMENT_STEP_RAIL_SEQUENCE:
+            if (!context->deployment_step_action_performed) {
+                context->deployment_substep =
+                    LASER_CONTROLLER_DEPLOYMENT_RAIL_PHASE_TEC;
+                context->deployment_step_action_performed = true;
+                context->deployment_phase_started_ms = now_ms;
+                break;
+            }
+            if (context->deployment_substep ==
+                LASER_CONTROLLER_DEPLOYMENT_RAIL_PHASE_TEC) {
+                if (context->last_inputs.tec_rail_pgood) {
+                    context->deployment_substep =
+                        LASER_CONTROLLER_DEPLOYMENT_RAIL_PHASE_LD;
+                    context->deployment_phase_started_ms = now_ms;
+                } else if ((now_ms - context->deployment_phase_started_ms) >=
+                           deployment_rail_wait_ms) {
+                    laser_controller_deployment_fail(
+                        context,
+                        now_ms,
+                        LASER_CONTROLLER_FAULT_TEC_RAIL_BAD,
+                        "TEC rail PGOOD did not assert during deployment sequencing");
+                }
+                break;
+            }
+            if (context->last_inputs.ld_rail_pgood) {
+                laser_controller_deployment_complete_current_step(context, now_ms);
+            } else if ((now_ms - context->deployment_phase_started_ms) >=
+                       deployment_rail_wait_ms) {
+                laser_controller_deployment_fail(
+                    context,
+                    now_ms,
+                    LASER_CONTROLLER_FAULT_LD_RAIL_BAD,
+                    "LD rail PGOOD did not assert during deployment sequencing");
+            }
+            break;
+        case LASER_CONTROLLER_DEPLOYMENT_STEP_TEC_SETTLE:
+            if (context->last_inputs.tec_rail_pgood &&
+                context->last_inputs.ld_rail_pgood &&
+                context->last_inputs.tec_temp_good &&
+                tec_telemetry_plausible &&
+                !lambda_drift_blocked &&
+                !tec_temp_adc_blocked) {
+                laser_controller_deployment_complete_current_step(context, now_ms);
+            } else if ((now_ms - context->deployment_step_started_ms) >=
+                       config->timeouts.tec_settle_timeout_ms) {
+                laser_controller_deployment_fail(
+                    context,
+                    now_ms,
+                    LASER_CONTROLLER_FAULT_TEC_NOT_SETTLED,
+                    "TEC did not settle to the deployment target");
+            }
+            break;
+        case LASER_CONTROLLER_DEPLOYMENT_STEP_READY_POSTURE:
+            if (laser_controller_deployment_ready_posture_confirmed(context)) {
+                laser_controller_deployment_complete_current_step(context, now_ms);
+                laser_controller_logger_log(
+                    now_ms,
+                    "deploy",
+                    "deployment sequence complete; runtime control unlocked");
+            } else if ((now_ms - context->deployment_step_started_ms) >=
+                       deployment_ready_wait_ms) {
+                laser_controller_deployment_fail(
+                    context,
+                    now_ms,
+                    LASER_CONTROLLER_FAULT_LD_LOOP_BAD,
+                    "deployment ready posture was not confirmed");
+            }
+            break;
+        default:
+            break;
+    }
 }
 
 static uint8_t laser_controller_expected_pd_profile_count(
@@ -474,6 +1291,7 @@ static void laser_controller_publish_runtime_status(
     s_runtime_status.outputs = context->last_outputs;
     s_runtime_status.decision = context->last_decision;
     s_runtime_status.config = config_snapshot;
+    s_runtime_status.deployment = context->deployment;
     portEXIT_CRITICAL(&s_runtime_status_lock);
 }
 
@@ -483,8 +1301,6 @@ static laser_controller_board_outputs_t laser_controller_derive_outputs(
 {
     const bool interlocks_disabled =
         laser_controller_service_interlocks_disabled();
-    const bool nir_requested =
-        decision != NULL && decision->request_nir;
     laser_controller_board_outputs_t outputs = {
         .enable_ld_vin = false,
         .enable_tec_vin = false,
@@ -506,34 +1322,51 @@ static laser_controller_board_outputs_t laser_controller_derive_outputs(
         return outputs;
     }
 
-    if ((!interlocks_disabled && context->fault_latched) ||
-        laser_controller_service_mode_requested()) {
+    if (context->deployment.active) {
+        if (context->deployment.running) {
+            switch (context->deployment.current_step) {
+                case LASER_CONTROLLER_DEPLOYMENT_STEP_RAIL_SEQUENCE:
+                    outputs.enable_tec_vin = true;
+                    outputs.enable_ld_vin =
+                        context->deployment_substep >=
+                        LASER_CONTROLLER_DEPLOYMENT_RAIL_PHASE_LD;
+                    return outputs;
+                case LASER_CONTROLLER_DEPLOYMENT_STEP_TEC_SETTLE:
+                    outputs.enable_tec_vin = true;
+                    outputs.enable_ld_vin = true;
+                    return outputs;
+                case LASER_CONTROLLER_DEPLOYMENT_STEP_READY_POSTURE:
+                    outputs.enable_tec_vin = true;
+                    outputs.enable_ld_vin = true;
+                    outputs.select_driver_low_current = false;
+                    return outputs;
+                default:
+                    return outputs;
+            }
+        }
+
+        if (!context->deployment.ready || context->deployment.failed) {
+            return outputs;
+        }
+
+        outputs.enable_tec_vin = true;
+        outputs.enable_ld_vin = true;
+        outputs.enable_alignment_laser = decision->alignment_output_enable;
+        outputs.assert_driver_standby = !decision->nir_output_enable;
+        outputs.select_driver_low_current = false;
+        if (decision->fault_present &&
+            decision->fault_class == LASER_CONTROLLER_FAULT_CLASS_SYSTEM_MAJOR) {
+            outputs.enable_ld_vin = false;
+            outputs.enable_tec_vin = false;
+            outputs.enable_alignment_laser = false;
+            outputs.assert_driver_standby = true;
+        }
         return outputs;
     }
 
-    if (context->power_tier == LASER_CONTROLLER_POWER_TIER_REDUCED ||
-        context->power_tier == LASER_CONTROLLER_POWER_TIER_FULL) {
-        outputs.enable_tec_vin = true;
-    }
-
-    if (context->power_tier == LASER_CONTROLLER_POWER_TIER_FULL &&
-        (nir_requested ||
-         interlocks_disabled ||
-         (context->last_inputs.tec_rail_pgood &&
-          context->last_inputs.tec_temp_good))) {
-        outputs.enable_ld_vin = true;
-    }
-
-    outputs.enable_alignment_laser = decision->alignment_output_enable;
-    outputs.assert_driver_standby = !nir_requested;
-    outputs.select_driver_low_current = !nir_requested;
-
-    if (decision->fault_present &&
-        decision->fault_class == LASER_CONTROLLER_FAULT_CLASS_SYSTEM_MAJOR) {
-        outputs.enable_ld_vin = false;
-        outputs.enable_tec_vin = false;
-        outputs.enable_alignment_laser = false;
-        outputs.assert_driver_standby = true;
+    if ((!interlocks_disabled && context->fault_latched) ||
+        laser_controller_service_mode_requested()) {
+        return outputs;
     }
 
     return outputs;
@@ -548,6 +1381,13 @@ static laser_controller_state_t laser_controller_derive_state(
 
     if (laser_controller_service_mode_requested()) {
         return LASER_CONTROLLER_STATE_SERVICE_MODE;
+    }
+
+    if (context->deployment.active &&
+        (!context->deployment.ready || context->deployment.running)) {
+        return laser_controller_power_tier_is_operational(context->power_tier) ?
+            LASER_CONTROLLER_STATE_SAFE_IDLE :
+            LASER_CONTROLLER_STATE_PROGRAMMING_ONLY;
     }
 
     if (context->fault_latched && !interlocks_disabled) {
@@ -691,6 +1531,8 @@ static void laser_controller_run_fast_cycle(laser_controller_context_t *context)
             "operational PD tier lost");
     }
 
+    laser_controller_deployment_tick(context, &config_snapshot, now_ms);
+
     memset(&snapshot, 0, sizeof(snapshot));
     snapshot.now_ms = now_ms;
     snapshot.boot_complete = context->boot_complete;
@@ -699,6 +1541,9 @@ static void laser_controller_run_fast_cycle(laser_controller_context_t *context)
     snapshot.service_mode_requested = laser_controller_service_mode_requested();
     snapshot.service_mode_active =
         context->state_machine.current == LASER_CONTROLLER_STATE_SERVICE_MODE;
+    snapshot.deployment_active = context->deployment.active;
+    snapshot.deployment_running = context->deployment.running;
+    snapshot.deployment_ready = context->deployment.ready;
     snapshot.interlocks_disabled =
         laser_controller_service_interlocks_disabled();
     snapshot.allow_missing_imu =
@@ -715,7 +1560,15 @@ static void laser_controller_run_fast_cycle(laser_controller_context_t *context)
     snapshot.last_lambda_drift_blocked = context->lambda_drift_filter.state;
     snapshot.last_tec_temp_adc_blocked = context->tec_temp_adc_filter.state;
     snapshot.power_tier = context->power_tier;
-    snapshot.target_lambda_nm = bench_status.target_lambda_nm;
+    snapshot.host_request_alignment =
+        context->deployment.active && context->deployment.ready &&
+        bench_status.requested_alignment;
+    snapshot.host_request_nir =
+        context->deployment.active && context->deployment.ready &&
+        bench_status.requested_nir;
+    snapshot.target_lambda_nm = laser_controller_deployment_target_lambda_nm(
+        context,
+        &bench_status);
     snapshot.actual_lambda_nm = laser_controller_lambda_from_temp(
         &config_snapshot,
         context->last_inputs.tec_temp_c);
@@ -804,15 +1657,30 @@ static void laser_controller_run_fast_cycle(laser_controller_context_t *context)
     }
     context->last_decision = decision;
     laser_controller_board_apply_outputs(&context->last_outputs);
+    {
+        const laser_controller_celsius_t actuator_target_temp_c =
+            context->deployment.active && context->deployment.running &&
+                    context->deployment.current_step <
+                        LASER_CONTROLLER_DEPLOYMENT_STEP_TEC_SETTLE ?
+                LASER_CONTROLLER_DEPLOYMENT_DEFAULT_TEMP_C :
+                laser_controller_deployment_target_temp_c(context, &bench_status);
+        const laser_controller_amps_t commanded_current_a =
+            laser_controller_commanded_laser_current_a(
+                context,
+                &config_snapshot,
+                &bench_status,
+                decision.nir_output_enable);
+
     laser_controller_board_apply_actuator_targets(
         &config_snapshot,
-        bench_status.high_state_current_a,
-        bench_status.target_temp_c,
+        commanded_current_a,
+        actuator_target_temp_c,
         bench_status.modulation_enabled,
         bench_status.modulation_frequency_hz,
         bench_status.modulation_duty_cycle_pct,
         decision.nir_output_enable,
         context->last_outputs.select_driver_low_current);
+    }
 
     const laser_controller_state_t next_state =
         laser_controller_derive_state(context, &decision);
@@ -901,6 +1769,22 @@ esp_err_t laser_controller_app_start(void)
 
     const laser_controller_time_ms_t now_ms = laser_controller_board_uptime_ms();
     laser_controller_state_machine_init(&s_context.state_machine, now_ms);
+    laser_controller_deployment_reset_step_status(
+        &s_context,
+        LASER_CONTROLLER_DEPLOYMENT_STEP_STATUS_INACTIVE);
+    s_context.deployment.target.target_mode =
+        LASER_CONTROLLER_DEPLOYMENT_TARGET_MODE_TEMP;
+    s_context.deployment.target.target_temp_c =
+        laser_controller_deployment_clamp_target_temp_c(
+            &s_context.config,
+            LASER_CONTROLLER_DEPLOYMENT_DEFAULT_TEMP_C);
+    s_context.deployment.target.target_lambda_nm = laser_controller_lambda_from_temp(
+        &s_context.config,
+        s_context.deployment.target.target_temp_c);
+    s_context.deployment.max_laser_current_a =
+        s_context.config.thresholds.max_laser_current_a;
+    s_context.deployment.max_optical_power_w =
+        s_context.deployment.max_laser_current_a;
 
     s_context.boot_complete = true;
     s_context.power_tier = LASER_CONTROLLER_POWER_TIER_UNKNOWN;
@@ -978,6 +1862,15 @@ bool laser_controller_app_copy_status(laser_controller_runtime_status_t *status)
     portEXIT_CRITICAL(&s_runtime_status_lock);
     laser_controller_bench_copy_status(&status->bench);
     laser_controller_service_copy_status(&status->bringup);
+    if (status->deployment.active) {
+        status->bench.target_mode =
+            status->deployment.target.target_mode ==
+                    LASER_CONTROLLER_DEPLOYMENT_TARGET_MODE_TEMP ?
+                LASER_CONTROLLER_BENCH_TARGET_MODE_TEMP :
+                LASER_CONTROLLER_BENCH_TARGET_MODE_LAMBDA;
+        status->bench.target_temp_c = status->deployment.target.target_temp_c;
+        status->bench.target_lambda_nm = status->deployment.target.target_lambda_nm;
+    }
 
     return status->started;
 }
@@ -1041,6 +1934,16 @@ esp_err_t laser_controller_app_set_runtime_safety_policy(
     portENTER_CRITICAL(&s_context_lock);
     s_context.config.thresholds = policy->thresholds;
     s_context.config.timeouts = policy->timeouts;
+    if (s_context.deployment.active) {
+        s_context.deployment.target.target_temp_c =
+            laser_controller_deployment_clamp_target_temp_c(
+                &candidate,
+                s_context.deployment.target.target_temp_c);
+        s_context.deployment.target.target_lambda_nm = laser_controller_lambda_from_temp(
+            &candidate,
+            s_context.deployment.target.target_temp_c);
+        laser_controller_deployment_recompute_power_cap(&s_context, &candidate);
+    }
     portEXIT_CRITICAL(&s_context_lock);
 
     now_ms = laser_controller_board_uptime_ms();
@@ -1091,6 +1994,9 @@ esp_err_t laser_controller_app_set_runtime_power_policy(
     s_context.power_tier = laser_controller_classify_power_tier(
         &s_context.config,
         &s_context.last_inputs);
+    if (s_context.deployment.active) {
+        laser_controller_deployment_recompute_power_cap(&s_context, &s_context.config);
+    }
     portEXIT_CRITICAL(&s_context_lock);
 
     now_ms = laser_controller_board_uptime_ms();
@@ -1102,6 +2008,213 @@ esp_err_t laser_controller_app_set_runtime_power_policy(
         policy->reduced_mode_min_w,
         policy->reduced_mode_max_w,
         policy->full_mode_min_w);
+    laser_controller_publish_runtime_status(&s_context, now_ms);
+    return ESP_OK;
+}
+
+bool laser_controller_deployment_mode_active(void)
+{
+    bool active = false;
+
+    portENTER_CRITICAL(&s_context_lock);
+    active = s_context.deployment.active;
+    portEXIT_CRITICAL(&s_context_lock);
+    return active;
+}
+
+bool laser_controller_deployment_mode_running(void)
+{
+    bool running = false;
+
+    portENTER_CRITICAL(&s_context_lock);
+    running = s_context.deployment.running;
+    portEXIT_CRITICAL(&s_context_lock);
+    return running;
+}
+
+bool laser_controller_deployment_mode_ready(void)
+{
+    bool ready = false;
+
+    portENTER_CRITICAL(&s_context_lock);
+    ready = s_context.deployment.active && s_context.deployment.ready;
+    portEXIT_CRITICAL(&s_context_lock);
+    return ready;
+}
+
+bool laser_controller_deployment_copy_status(
+    laser_controller_deployment_status_t *status)
+{
+    if (status == NULL) {
+        return false;
+    }
+
+    portENTER_CRITICAL(&s_context_lock);
+    *status = s_context.deployment;
+    portEXIT_CRITICAL(&s_context_lock);
+    return true;
+}
+
+esp_err_t laser_controller_app_enter_deployment_mode(void)
+{
+    const laser_controller_time_ms_t now_ms = laser_controller_board_uptime_ms();
+
+    if (!s_context.started || !s_context.config_valid) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (s_context.deployment.running) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    laser_controller_service_prepare_for_deployment(now_ms);
+    laser_controller_bench_clear_requests(now_ms);
+
+    portENTER_CRITICAL(&s_context_lock);
+    s_context.deployment.active = true;
+    s_context.deployment.running = false;
+    s_context.deployment.ready = false;
+    s_context.deployment.failed = false;
+    s_context.deployment.current_step = LASER_CONTROLLER_DEPLOYMENT_STEP_NONE;
+    s_context.deployment.last_completed_step = LASER_CONTROLLER_DEPLOYMENT_STEP_NONE;
+    s_context.deployment.failure_code = LASER_CONTROLLER_FAULT_NONE;
+    s_context.deployment.failure_reason[0] = '\0';
+    laser_controller_deployment_reset_step_status(
+        &s_context,
+        LASER_CONTROLLER_DEPLOYMENT_STEP_STATUS_INACTIVE);
+    laser_controller_deployment_recompute_power_cap(&s_context, &s_context.config);
+    s_context.deployment_step_started_ms = now_ms;
+    s_context.deployment_phase_started_ms = now_ms;
+    s_context.deployment_substep = 0U;
+    s_context.deployment_step_action_performed = false;
+    portEXIT_CRITICAL(&s_context_lock);
+
+    laser_controller_logger_log(
+        now_ms,
+        "deploy",
+        "deployment mode entered; service writes locked and outputs held safe");
+    laser_controller_publish_runtime_status(&s_context, now_ms);
+    return ESP_OK;
+}
+
+esp_err_t laser_controller_app_exit_deployment_mode(void)
+{
+    const laser_controller_time_ms_t now_ms = laser_controller_board_uptime_ms();
+
+    if (!s_context.started || !s_context.deployment.active ||
+        s_context.deployment.running) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    laser_controller_service_prepare_for_deployment(now_ms);
+    laser_controller_bench_clear_requests(now_ms);
+
+    portENTER_CRITICAL(&s_context_lock);
+    s_context.deployment.active = false;
+    s_context.deployment.running = false;
+    s_context.deployment.ready = false;
+    s_context.deployment.failed = false;
+    s_context.deployment.current_step = LASER_CONTROLLER_DEPLOYMENT_STEP_NONE;
+    s_context.deployment.last_completed_step = LASER_CONTROLLER_DEPLOYMENT_STEP_NONE;
+    s_context.deployment.failure_code = LASER_CONTROLLER_FAULT_NONE;
+    s_context.deployment.failure_reason[0] = '\0';
+    s_context.deployment.max_laser_current_a =
+        s_context.config.thresholds.max_laser_current_a;
+    s_context.deployment.max_optical_power_w =
+        s_context.deployment.max_laser_current_a;
+    laser_controller_deployment_reset_step_status(
+        &s_context,
+        LASER_CONTROLLER_DEPLOYMENT_STEP_STATUS_INACTIVE);
+    s_context.deployment_step_started_ms = now_ms;
+    s_context.deployment_phase_started_ms = now_ms;
+    s_context.deployment_substep = 0U;
+    s_context.deployment_step_action_performed = false;
+    portEXIT_CRITICAL(&s_context_lock);
+
+    laser_controller_logger_log(
+        now_ms,
+        "deploy",
+        "deployment mode exited; controller returned to non-deployed safe supervision");
+    laser_controller_publish_runtime_status(&s_context, now_ms);
+    return ESP_OK;
+}
+
+esp_err_t laser_controller_app_run_deployment_sequence(void)
+{
+    const laser_controller_time_ms_t now_ms = laser_controller_board_uptime_ms();
+
+    if (!s_context.started || !s_context.config_valid ||
+        !s_context.deployment.active || s_context.deployment.running) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    laser_controller_service_prepare_for_deployment(now_ms);
+    laser_controller_bench_clear_requests(now_ms);
+
+    portENTER_CRITICAL(&s_context_lock);
+    s_context.deployment.running = true;
+    s_context.deployment.ready = false;
+    s_context.deployment.failed = false;
+    s_context.deployment.failure_code = LASER_CONTROLLER_FAULT_NONE;
+    s_context.deployment.failure_reason[0] = '\0';
+    laser_controller_deployment_reset_step_status(
+        &s_context,
+        LASER_CONTROLLER_DEPLOYMENT_STEP_STATUS_PENDING);
+    laser_controller_deployment_begin_step(
+        &s_context,
+        LASER_CONTROLLER_DEPLOYMENT_STEP_OWNERSHIP_RECLAIM,
+        now_ms);
+    portEXIT_CRITICAL(&s_context_lock);
+
+    laser_controller_logger_log(
+        now_ms,
+        "deploy",
+        "deployment sequence started");
+    laser_controller_publish_runtime_status(&s_context, now_ms);
+    return ESP_OK;
+}
+
+esp_err_t laser_controller_app_set_deployment_target(
+    const laser_controller_deployment_target_t *target)
+{
+    laser_controller_deployment_target_t sanitized = { 0 };
+    const laser_controller_time_ms_t now_ms = laser_controller_board_uptime_ms();
+
+    if (!s_context.started || !s_context.deployment.active || target == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    sanitized = *target;
+    if (sanitized.target_mode == LASER_CONTROLLER_DEPLOYMENT_TARGET_MODE_LAMBDA) {
+        sanitized.target_temp_c = laser_controller_deployment_clamp_target_temp_c(
+            &s_context.config,
+            laser_controller_temp_from_lambda(
+                &s_context.config,
+                sanitized.target_lambda_nm));
+        sanitized.target_lambda_nm = laser_controller_lambda_from_temp(
+            &s_context.config,
+            sanitized.target_temp_c);
+    } else {
+        sanitized.target_mode = LASER_CONTROLLER_DEPLOYMENT_TARGET_MODE_TEMP;
+        sanitized.target_temp_c = laser_controller_deployment_clamp_target_temp_c(
+            &s_context.config,
+            sanitized.target_temp_c);
+        sanitized.target_lambda_nm = laser_controller_lambda_from_temp(
+            &s_context.config,
+            sanitized.target_temp_c);
+    }
+
+    portENTER_CRITICAL(&s_context_lock);
+    s_context.deployment.target = sanitized;
+    portEXIT_CRITICAL(&s_context_lock);
+
+    laser_controller_logger_logf(
+        now_ms,
+        "deploy",
+        "deployment target -> %s %.2f / %.2f",
+        laser_controller_deployment_target_mode_name(sanitized.target_mode),
+        sanitized.target_temp_c,
+        sanitized.target_lambda_nm);
     laser_controller_publish_runtime_status(&s_context, now_ms);
     return ESP_OK;
 }

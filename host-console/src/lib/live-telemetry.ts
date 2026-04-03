@@ -1,5 +1,6 @@
 import type {
   DeviceSnapshot,
+  DeploymentStep,
   RealtimeTelemetry,
   RealtimeTelemetryPatch,
 } from '../types'
@@ -15,6 +16,17 @@ export interface RealtimeTelemetryController extends RealtimeTelemetryStore {
   publish(telemetry: RealtimeTelemetryPatch): void
   reset(snapshot: DeviceSnapshot): void
   syncFromSnapshot(snapshot: DeviceSnapshot): void
+}
+
+function normalizeDeploymentSteps(
+  steps: Array<Partial<DeploymentStep> | undefined> | DeploymentStep[],
+  fallback: DeploymentStep[],
+): DeploymentStep[] {
+  return steps.map((step, index) => ({
+    key: step?.key ?? fallback[index]?.key ?? `step_${index + 1}`,
+    label: step?.label ?? fallback[index]?.label ?? `Step ${index + 1}`,
+    status: step?.status ?? fallback[index]?.status ?? 'inactive',
+  }))
 }
 
 export function makeRealtimeTelemetryFromSnapshot(
@@ -62,6 +74,10 @@ export function makeRealtimeTelemetryFromSnapshot(
       illumination: {
         tof: { ...snapshot.bringup.illumination.tof },
       },
+    },
+    deployment: {
+      ...snapshot.deployment,
+      steps: snapshot.deployment.steps.map((step) => ({ ...step })),
     },
     fault: {
       latched: snapshot.fault.latched,
@@ -118,6 +134,14 @@ export function mergeRealtimeTelemetryIntoSnapshot(
           ...telemetry.bringup.illumination.tof,
         },
       },
+    },
+    deployment: {
+      ...snapshot.deployment,
+      ...telemetry.deployment,
+      steps:
+        telemetry.deployment?.steps !== undefined
+          ? normalizeDeploymentSteps(telemetry.deployment.steps, snapshot.deployment.steps)
+          : snapshot.deployment.steps,
     },
     fault: {
       ...snapshot.fault,
@@ -184,6 +208,14 @@ function mergeRealtimeTelemetry(
           ...(patch.bringup?.illumination?.tof ?? {}),
         },
       },
+    },
+    deployment: {
+      ...current.deployment,
+      ...(patch.deployment ?? {}),
+      steps:
+        patch.deployment?.steps !== undefined
+          ? normalizeDeploymentSteps(patch.deployment.steps, current.deployment.steps)
+          : current.deployment.steps,
     },
     fault: {
       ...current.fault,

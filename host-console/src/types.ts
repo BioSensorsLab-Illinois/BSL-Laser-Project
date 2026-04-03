@@ -27,6 +27,13 @@ export type EventBus = 'i2c' | 'spi'
 
 export type TransportKind = 'mock' | 'serial' | 'wifi'
 export type WirelessMode = 'softap' | 'station'
+export type DeploymentTargetMode = 'temp' | 'lambda'
+export type DeploymentStepStatus =
+  | 'inactive'
+  | 'pending'
+  | 'in_progress'
+  | 'passed'
+  | 'failed'
 
 export type TransportStatus = 'disconnected' | 'connecting' | 'connected' | 'error'
 
@@ -150,6 +157,29 @@ export interface BenchControlStatus {
   modulationFrequencyHz: number
   modulationDutyCyclePct: number
   lowStateCurrentA: number
+}
+
+export interface DeploymentStep {
+  key: string
+  label: string
+  status: DeploymentStepStatus
+}
+
+export interface DeploymentStatus {
+  active: boolean
+  running: boolean
+  ready: boolean
+  failed: boolean
+  currentStep: string
+  lastCompletedStep: string
+  failureCode: string
+  failureReason: string
+  targetMode: DeploymentTargetMode
+  targetTempC: number
+  targetLambdaNm: number
+  maxLaserCurrentA: number
+  maxOpticalPowerW: number
+  steps: DeploymentStep[]
 }
 
 export interface BringupModuleStatus {
@@ -387,6 +417,23 @@ export interface RealtimeBringupStatus {
   }
 }
 
+export interface RealtimeDeploymentStatus {
+  active: boolean
+  running: boolean
+  ready: boolean
+  failed: boolean
+  currentStep: string
+  lastCompletedStep: string
+  failureCode: string
+  failureReason: string
+  targetMode: DeploymentTargetMode
+  targetTempC: number
+  targetLambdaNm: number
+  maxLaserCurrentA: number
+  maxOpticalPowerW: number
+  steps: DeploymentStep[]
+}
+
 export interface RealtimeFaultSummary {
   latched: boolean
   activeCode: string
@@ -412,6 +459,7 @@ export interface RealtimeTelemetry {
   safety: RealtimeSafetyStatus
   buttons: ButtonRuntimeStatus
   bringup: RealtimeBringupStatus
+  deployment: RealtimeDeploymentStatus
   fault: RealtimeFaultSummary
 }
 
@@ -480,6 +528,7 @@ export interface DeviceSnapshot {
   bench: BenchControlStatus
   safety: SafetyStatus
   bringup: BringupStatus
+  deployment: DeploymentStatus
   fault: FaultSummary
   counters: {
     commsTimeouts: number

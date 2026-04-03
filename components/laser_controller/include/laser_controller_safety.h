@@ -14,10 +14,15 @@ typedef struct {
     bool fault_latched;
     bool service_mode_requested;
     bool service_mode_active;
+    bool deployment_active;
+    bool deployment_running;
+    bool deployment_ready;
     bool interlocks_disabled;
     bool allow_missing_imu;
     bool allow_missing_tof;
     bool allow_missing_buttons;
+    bool host_request_alignment;
+    bool host_request_nir;
     bool last_horizon_blocked;
     bool last_distance_blocked;
     bool last_lambda_drift_blocked;

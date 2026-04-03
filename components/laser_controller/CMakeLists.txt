@@ -27,6 +27,7 @@ idf_component_register(
         "src/laser_controller_board.c"
         "src/laser_controller_comms.c"
         "src/laser_controller_config.c"
+        "src/laser_controller_deployment.c"
         "src/laser_controller_faults.c"
         "src/laser_controller_logger.c"
         "src/laser_controller_safety.c"

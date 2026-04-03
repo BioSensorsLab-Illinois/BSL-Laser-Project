@@ -76,6 +76,7 @@ type BringupWorkbenchProps = {
   telemetryStore: RealtimeTelemetryStore
   transportStatus: TransportStatus
   transportRecovering: boolean
+  deploymentLocked: boolean
   onIssueCommandAwaitAck: (
     cmd: string,
     risk: 'read' | 'write' | 'service' | 'firmware',
@@ -1223,6 +1224,7 @@ export function BringupWorkbench({
   telemetryStore,
   transportStatus,
   transportRecovering,
+  deploymentLocked,
   onIssueCommandAwaitAck,
 }: BringupWorkbenchProps) {
   const initialStoredStateRef = useRef<BringupStoredState | null>(null)
@@ -3617,6 +3619,14 @@ async function setLdSbdnMode(mode: LdSbdnMode) {
           <p className="panel-note">
             If you only want live status or register reads, stay in read-only mode. Service mode is just the guarded write session for staged hardware config and register writes.
           </p>
+
+          {deploymentLocked ? (
+            <div className="note-strip">
+              <span>
+                Deployment mode is active. Bring-up telemetry stays visible, but every bring-up write path is locked until deployment mode is exited.
+              </span>
+            </div>
+          ) : null}
 
           <div className="button-row">
             <button

@@ -81,6 +81,11 @@ Required fields:
 | `get_faults` | active and historical faults | safe read-only |
 | `get_bringup_profile` | fetch service-only module expectations and tuning state | safe read-only |
 | `clear_faults` | request fault clear | service-only; must not clear if recovery criteria fail |
+| `enter_deployment_mode` | enter deployment mode and reclaim ownership from bring-up service paths | deployment-only runtime gate; blocks bring-up writes while active |
+| `exit_deployment_mode` | leave deployment mode and return to non-deployed safe supervision | only allowed when the deployment checklist is not running |
+| `run_deployment_sequence` | run the blocking deployment checklist in firmware | deployment-only; checklist owns sequencing and safe abort |
+| `set_deployment_target` | set the deployment temperature or wavelength target | deployment-only; updates the ready-posture target and checklist setpoint |
+| `set_deployment_safety` | update deployment-mode safety thresholds and timeouts | deployment-only; applies live and may immediately drop active output |
 | `set_laser_power` | stage the bench high-state NIR current request | service-only; host request only, not direct output authority |
 | `set_max_current` | alias for bench high-state NIR current staging | service-only; must never exceed provisioned safety ceiling |
 | `set_runtime_safety` | update runtime safety thresholds, hysteresis, and hold windows | service-only; reject invalid policy values and keep firmware authoritative |
@@ -131,6 +136,8 @@ Current bring-up-specific behavior:
 - `scan_wireless_networks` is intentionally allowed outside service mode so the operator can discover nearby SSIDs before switching the controller into station mode.
 - `scan_wireless_networks` may temporarily pause station reconnect attempts during the scan, then resume them automatically after results are captured.
 - `configure_wireless` is intentionally allowed outside service mode so an operator can move the controller between bench SoftAP and an existing Wi-Fi network without opening a hazardous write session.
+- Runtime control commands such as `set_target_temp`, `set_target_lambda`, `set_laser_power`, `configure_modulation`, `enable_alignment`, and `laser_output_enable` are rejected unless deployment mode is active and the deployment checklist has completed successfully in the current session.
+- While deployment mode is active, bring-up and GPIO-mutating commands stay rejected even if the controller is otherwise online. Read-only status, fault, telemetry, and wireless-management commands remain available.
 - `configure_wireless` accepts `mode:"softap"` or `mode:"station"`. In station mode the host may also provide `ssid` and `password`; if the password is omitted, the controller reuses the saved credential.
 - `i2c_scan`, `i2c_read`, `spi_read`, and `refresh_pd_status` are intentionally allowed outside service mode because they are read-only probes.
 - `set_supply_enable` is intentionally separate from beam-control commands. In `SERVICE_MODE`, it only requests the LD or TEC MPM3530 VIN rail while alignment stays off and the laser driver stays in standby.

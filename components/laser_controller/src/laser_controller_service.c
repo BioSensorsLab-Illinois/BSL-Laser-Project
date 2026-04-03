@@ -8,6 +8,7 @@
 #include "nvs.h"
 
 #include "laser_controller_board.h"
+#include "laser_controller_deployment.h"
 
 #define LASER_CONTROLLER_STUSB4500_ADDR 0x28U
 #define LASER_CONTROLLER_DAC80502_ADDR  0x48U
@@ -1060,6 +1061,11 @@ bool laser_controller_service_module_expected(laser_controller_module_t module)
         return false;
     }
 
+    if (laser_controller_deployment_mode_active() &&
+        laser_controller_deployment_module_required(module)) {
+        return true;
+    }
+
     portENTER_CRITICAL(&s_service_lock);
     expected = s_service.status.modules[module].expected_present;
     portEXIT_CRITICAL(&s_service_lock);
@@ -1072,6 +1078,11 @@ bool laser_controller_service_module_write_enabled(laser_controller_module_t mod
 
     if (module >= LASER_CONTROLLER_MODULE_COUNT) {
         return false;
+    }
+
+    if (laser_controller_deployment_mode_active() &&
+        laser_controller_deployment_module_required(module)) {
+        return true;
     }
 
     portENTER_CRITICAL(&s_service_lock);
@@ -1197,6 +1208,43 @@ void laser_controller_service_set_mode_requested(
         enable ? "Service mode requested from host." :
                  "Service mode request cleared from host.",
         now_ms);
+    portEXIT_CRITICAL(&s_service_lock);
+
+    if (reset_gpio_debug) {
+        (void)laser_controller_board_set_tof_illumination(
+            false,
+            0U,
+            LASER_CONTROLLER_SERVICE_TOF_ILLUMINATION_PWM_HZ);
+        laser_controller_board_reset_gpio_debug_state();
+    }
+}
+
+void laser_controller_service_prepare_for_deployment(
+    laser_controller_time_ms_t now_ms)
+{
+    bool reset_gpio_debug = false;
+
+    portENTER_CRITICAL(&s_service_lock);
+    s_service.status.service_mode_requested = false;
+    s_service.status.interlocks_disabled = false;
+    s_service.status.ld_rail_debug_enabled = false;
+    s_service.status.tec_rail_debug_enabled = false;
+    s_service.status.haptic_driver_enable_requested = false;
+    s_service.status.tof_illumination_enabled = false;
+    s_service.status.tof_illumination_duty_cycle_pct = 0U;
+    if (s_service.status.tof_illumination_frequency_hz == 0U) {
+        s_service.status.tof_illumination_frequency_hz =
+            LASER_CONTROLLER_SERVICE_TOF_ILLUMINATION_PWM_HZ;
+    }
+    memset(
+        s_service.status.gpio_overrides,
+        0,
+        sizeof(s_service.status.gpio_overrides));
+    laser_controller_service_refresh_gpio_override_count_locked();
+    laser_controller_service_write_action_locked(
+        "Deployment mode reclaimed ownership from service mode and cleared bench overrides.",
+        now_ms);
+    reset_gpio_debug = true;
     portEXIT_CRITICAL(&s_service_lock);
 
     if (reset_gpio_debug) {

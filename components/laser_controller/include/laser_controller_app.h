@@ -7,6 +7,7 @@
 #include "laser_controller_bench.h"
 #include "laser_controller_board.h"
 #include "laser_controller_config.h"
+#include "laser_controller_deployment.h"
 #include "laser_controller_faults.h"
 #include "laser_controller_service.h"
 #include "laser_controller_safety.h"
@@ -31,6 +32,7 @@ typedef struct {
     laser_controller_config_t config;
     laser_controller_bench_status_t bench;
     laser_controller_service_status_t bringup;
+    laser_controller_deployment_status_t deployment;
 } laser_controller_runtime_status_t;
 
 typedef struct {

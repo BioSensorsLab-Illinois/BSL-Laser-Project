@@ -200,6 +200,8 @@ void laser_controller_service_report_module_probe(
 void laser_controller_service_set_mode_requested(
     bool enable,
     laser_controller_time_ms_t now_ms);
+void laser_controller_service_prepare_for_deployment(
+    laser_controller_time_ms_t now_ms);
 void laser_controller_service_set_interlocks_disabled(
     bool enabled,
     laser_controller_time_ms_t now_ms);

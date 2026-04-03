@@ -72,6 +72,7 @@ export function InspectorRail({
   const safetySummary = summarizeSafetyChecks(buildSafetyChecks(snapshot))
   const connected = transportStatus === 'connected'
   const interlocksDisabled = snapshot.bringup.interlocksDisabled
+  const deploymentActive = snapshot.deployment.active
   const serviceModeLabel = snapshot.bringup.serviceModeActive
     ? 'Service active'
     : snapshot.bringup.serviceModeRequested
@@ -161,14 +162,16 @@ export function InspectorRail({
         <div className="inspector-link-statuses">
           <span
             className={
-              snapshot.bringup.serviceModeActive
+              deploymentActive
+                ? 'status-badge is-on'
+                : snapshot.bringup.serviceModeActive
                 ? 'status-badge is-on'
                 : snapshot.bringup.serviceModeRequested
                   ? 'status-badge is-warn'
                   : 'status-badge is-off'
             }
           >
-            {serviceModeLabel}
+            {deploymentActive ? 'Deployment active' : serviceModeLabel}
           </span>
           <span
             className={
@@ -180,34 +183,26 @@ export function InspectorRail({
             {interlocksDisabled ? 'Interlocks defeated' : 'Interlocks on'}
           </span>
         </div>
-        <div className="segmented inspector-link-transport">
-          <button
-            type="button"
-            className={transportKind === 'mock' ? 'segmented__button is-active' : 'segmented__button'}
-            onClick={() => {
-              void onSetTransportKind('mock')
-            }}
-          >
-            Mock rig
-          </button>
-          <button
-            type="button"
-            className={transportKind === 'serial' ? 'segmented__button is-active' : 'segmented__button'}
-            onClick={() => {
-              void onSetTransportKind('serial')
-            }}
-          >
-            Web Serial
-          </button>
-          <button
-            type="button"
-            className={transportKind === 'wifi' ? 'segmented__button is-active' : 'segmented__button'}
-            onClick={() => {
-              void onSetTransportKind('wifi')
-            }}
-          >
-            Wireless
-          </button>
+        <div className="transport-mode-picker transport-mode-picker--compact inspector-link-transport">
+          {(
+            [
+              ['mock', 'Mock', 'Logic'],
+              ['serial', 'USB', 'Flash'],
+              ['wifi', 'Wi-Fi', 'AP/STA'],
+            ] as Array<[TransportKind, string, string]>
+          ).map(([kind, label, detail]) => (
+            <button
+              key={kind}
+              type="button"
+              className={transportKind === kind ? 'transport-mode-button is-active' : 'transport-mode-button'}
+              onClick={() => {
+                void onSetTransportKind(kind)
+              }}
+            >
+              <span>{label}</span>
+              <small>{detail}</small>
+            </button>
+          ))}
         </div>
         {transportKind === 'wifi' ? (
           <label className="field-block field-block--compact">
@@ -234,15 +229,18 @@ export function InspectorRail({
           <button
             type="button"
             className="action-button is-inline is-accent"
+            disabled={connected}
             onClick={() => {
               void onConnect()
             }}
           >
             {connected
-              ? 'Refresh link'
-              : transportKind === 'wifi'
-                ? 'Connect wireless'
-                : 'Connect'}
+              ? 'Connected'
+              : transportKind === 'mock'
+                ? 'Start mock rig'
+                : transportKind === 'wifi'
+                  ? 'Connect wireless'
+                  : 'Connect board'}
           </button>
           <button
             type="button"
@@ -257,17 +255,22 @@ export function InspectorRail({
           <button
             type="button"
             className={snapshot.bringup.serviceModeActive ? 'action-button is-inline' : 'action-button is-inline is-accent'}
-            disabled={!connected}
+            disabled={!connected || deploymentActive}
             onClick={() => {
               void onToggleServiceMode()
             }}
+            title={
+              deploymentActive
+                ? 'Exit deployment mode before opening service writes.'
+                : undefined
+            }
           >
             {snapshot.bringup.serviceModeActive ? 'Exit service' : 'Enter service'}
           </button>
           <button
             type="button"
             className="action-button is-inline is-danger"
-            disabled={!connected || (!snapshot.bringup.serviceModeActive && !interlocksDisabled)}
+            disabled={!connected || deploymentActive || (!snapshot.bringup.serviceModeActive && !interlocksDisabled)}
             onClick={() => {
               if (interlocksDisabled) {
                 void onSetInterlocksDisabled(false)
@@ -276,6 +279,9 @@ export function InspectorRail({
               setConfirmDisableInterlocks(true)
             }}
             title={
+              deploymentActive
+                ? 'Deployment mode locks interlock-defeat actions.'
+                :
               interlocksDisabled
                 ? 'Restore normal controller interlock supervision.'
                 : 'Service-only bench override that defeats controller beam interlocks until restored or rebooted.'

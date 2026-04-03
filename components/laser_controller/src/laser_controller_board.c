@@ -3865,6 +3865,8 @@ void laser_controller_board_read_inputs(
     inputs->tof_data_valid = false;
     inputs->tof_data_fresh = false;
     inputs->tof_distance_m = 0.0f;
+    inputs->pcn_pwm_active = s_pwm_active;
+    inputs->tof_illumination_pwm_active = s_tof_illumination_pwm_active;
     laser_controller_board_capture_tof_readback(now_ms, config, inputs);
 
     laser_controller_board_capture_haptic_readback();

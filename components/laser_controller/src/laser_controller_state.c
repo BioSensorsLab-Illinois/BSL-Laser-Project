@@ -43,6 +43,7 @@ bool laser_controller_state_transition_is_allowed(
                    to == LASER_CONTROLLER_STATE_LIMITED_POWER_IDLE ||
                    to == LASER_CONTROLLER_STATE_TEC_WARMUP ||
                    to == LASER_CONTROLLER_STATE_READY_ALIGNMENT ||
+                   to == LASER_CONTROLLER_STATE_READY_NIR ||
                    to == LASER_CONTROLLER_STATE_FAULT_LATCHED ||
                    to == LASER_CONTROLLER_STATE_SERVICE_MODE;
         case LASER_CONTROLLER_STATE_POWER_NEGOTIATION:

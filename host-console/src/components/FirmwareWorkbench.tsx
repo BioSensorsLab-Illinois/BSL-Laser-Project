@@ -41,10 +41,38 @@ export function FirmwareWorkbench({
   )
 
   const readyToTransfer = checklist.every((item) => item.pass || !item.blocking)
-  const canWebFlash = readyToTransfer && supportsFirmwareTransfer && packageDescriptor?.webFlash.supported === true
+  const deploymentLocked = snapshot.deployment.active
+  const canWebFlash =
+    !deploymentLocked &&
+    readyToTransfer &&
+    supportsFirmwareTransfer &&
+    packageDescriptor?.webFlash.supported === true
   const serviceModeActive =
     snapshot.bringup.serviceModeActive || snapshot.session.state === 'SERVICE_MODE'
   const signature = packageDescriptor?.signature ?? null
+  const blockingReasons = useMemo(() => {
+    const reasons: string[] = []
+
+    if (deploymentLocked) {
+      reasons.push('Deployment mode is active. Exit deployment mode before starting a browser flash session.')
+    }
+
+    if (!supportsFirmwareTransfer) {
+      reasons.push('Switch to a live Web Serial session to use browser flashing.')
+    }
+
+    checklist
+      .filter((item) => item.blocking && !item.pass)
+      .forEach((item) => {
+        reasons.push(`${item.label}: ${item.note}`)
+      })
+
+    if (serviceModeActive && !deploymentLocked && readyToTransfer && supportsFirmwareTransfer) {
+      reasons.push('Service mode is active, but that does not block browser flashing by itself.')
+    }
+
+    return reasons.filter((reason, index) => reasons.indexOf(reason) === index)
+  }, [checklist, deploymentLocked, serviceModeActive, supportsFirmwareTransfer])
 
   function formatBuildUtc(value: string | undefined): string {
     if (value === undefined || value.length === 0) {
@@ -278,7 +306,9 @@ export function FirmwareWorkbench({
               className="action-button is-inline is-accent"
               disabled={!canWebFlash}
               title={
-                supportsFirmwareTransfer && packageDescriptor?.webFlash.supported
+                deploymentLocked
+                  ? 'Exit deployment mode before starting a browser flash session.'
+                  : supportsFirmwareTransfer && packageDescriptor?.webFlash.supported
                   ? 'Flash the currently loaded image over Web Serial.'
                   : packageDescriptor?.webFlash.note ?? 'Browser flashing is unavailable on this transport.'
               }
@@ -291,6 +321,28 @@ export function FirmwareWorkbench({
           <p className="inline-help">
             Warnings do not block browser flashing. Service mode is optional prep only and will clear when the ESP32 resets into and out of the flasher.
           </p>
+
+          {!canWebFlash ? (
+            <div className="firmware-blocked-note">
+              <strong>Web Serial flash is currently blocked.</strong>
+              <div className="segment-list">
+                {blockingReasons.map((reason) => (
+                  <div key={reason} className="segment-row">
+                    <div>
+                      <strong>Hold</strong>
+                      <span>{reason}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : null}
+
+          {deploymentLocked ? (
+            <p className="inline-help">
+              Deployment mode is active. Firmware metadata stays readable, but browser flashing is locked until deployment mode is exited.
+            </p>
+          ) : null}
 
           {!supportsFirmwareTransfer ? (
             <p className="inline-help">

@@ -25,6 +25,7 @@ type CommandDeckProps = {
   snapshot: DeviceSnapshot
   transportKind: TransportKind
   transportStatus: TransportStatus
+  deploymentLocked: boolean
   onIssueCommandAwaitAck: (
     cmd: string,
     risk: 'read' | 'write' | 'service' | 'firmware',
@@ -238,6 +239,7 @@ export function CommandDeck({
   snapshot,
   transportKind,
   transportStatus,
+  deploymentLocked,
   onIssueCommandAwaitAck,
 }: CommandDeckProps) {
   const connected = transportStatus === 'connected'
@@ -508,6 +510,14 @@ export function CommandDeck({
             beam control.
           </p>
         </div>
+
+        {deploymentLocked ? (
+          <div className="note-strip">
+            <span>
+              Deployment mode is active. Tooling stays visible for read-only review, but maintenance writes remain locked until deployment mode is exited.
+            </span>
+          </div>
+        ) : null}
 
         <div className="command-grid tools-grid">
         <article className="panel-cutout tools-panel tools-panel--wide">

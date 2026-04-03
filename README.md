@@ -8,10 +8,10 @@ This tree is intentionally safe-by-default and intentionally incomplete for pati
 
 - NIR emission is blocked by default.
 - Green alignment is blocked by default.
-- The default config is intentionally invalid until manufacturing calibration is provisioned.
-- The board layer is still a mock/stub, not real hardware I/O.
+- The default configuration is bench-valid and safe-by-default, but it is not a substitute for per-unit manufacturing calibration.
+- The board layer now contains real bench GPIO, ADC, I2C, SPI, PD, DAC, IMU, ToF, haptic, and wireless code paths. It is still not clinical-ready.
 
-Do not treat the current repository as clinically deployable firmware. Treat it as an auditable bootstrap that preserves the right safety shape while real drivers, calibration tooling, bench validation, and reaction-time measurements are added.
+Do not treat the current repository as clinically deployable firmware. Treat it as a production-candidate bench control stack with explicit safety ownership, deployment-mode sequencing, and substantial remaining validation work before any clinical claim.
 
 The bench image now also includes a Wi‑Fi SoftAP + WebSocket bridge so the host console can stay connected while USB-C is dedicated to the PD power source. That wireless bridge is a bench transport only; it does not change firmware safety ownership and it does not replace USB-based flashing or recovery. Wi‑Fi is intentionally the primary wireless path here; BLE is not the preferred browser transport for this bench because telemetry stability matters more than pairing convenience.
 

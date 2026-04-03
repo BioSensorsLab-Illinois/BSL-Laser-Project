@@ -178,7 +178,6 @@ export function ControlWorkbench({
       ),
     [connected, liveSnapshot],
   )
-  const [serviceArmed, setServiceArmed] = useState(false)
   const [autoFollowPower, setAutoFollowPower] = useState(false)
   const [laserPowerW, setLaserPowerW] = useState(() => formatNumber(estimate.commandedOpticalPowerW, 2))
   const [targetMode, setTargetMode] = useState<BenchTargetMode>(snapshot.bench.targetMode)
@@ -203,7 +202,11 @@ export function ControlWorkbench({
     dutyPct: String(snapshot.bench.modulationDutyCyclePct),
   })
 
-  const writesDisabled = !commandReady || !serviceArmed
+  const deploymentReady =
+    liveSnapshot.deployment.active &&
+    liveSnapshot.deployment.ready &&
+    !liveSnapshot.deployment.running
+  const writesDisabled = !commandReady || !deploymentReady
   const laserAvailability = describeModuleAvailability('Laser path', [
     { key: 'laserDriver', label: 'Laser driver', status: controlModules.laserDriver },
     { key: 'dac', label: 'DAC', status: controlModules.dac },
@@ -226,7 +229,18 @@ export function ControlWorkbench({
     min: tecCalibrationPoints[0].wavelengthNm,
     max: tecCalibrationPoints[tecCalibrationPoints.length - 1].wavelengthNm,
   }
-  const requestedPowerW = Math.min(5, Math.max(0, parseNumber(laserPowerW, estimate.commandedOpticalPowerW)))
+  const deploymentOpticalCapW =
+    liveSnapshot.deployment.active && liveSnapshot.deployment.maxOpticalPowerW > 0
+      ? liveSnapshot.deployment.maxOpticalPowerW
+      : 5
+  const deploymentCurrentCapA =
+    liveSnapshot.deployment.active && liveSnapshot.deployment.maxLaserCurrentA > 0
+      ? liveSnapshot.deployment.maxLaserCurrentA
+      : liveSnapshot.safety.maxLaserCurrentA
+  const requestedPowerW = Math.min(
+    deploymentOpticalCapW,
+    Math.max(0, parseNumber(laserPowerW, estimate.commandedOpticalPowerW)),
+  )
   const requestedTempC =
     targetMode === 'temp'
       ? clampTecTempC(parseNumber(targetTempC, liveSnapshot.tec.targetTempC))
@@ -249,8 +263,6 @@ export function ControlWorkbench({
   const alignmentActive = liveSnapshot.laser.alignmentEnabled
   const sbdnHigh = (liveSbdnPin?.outputEnabled ?? false) && (liveSbdnPin?.levelHigh ?? false)
   const pcnHigh = (livePcnPin?.outputEnabled ?? false) && (livePcnPin?.levelHigh ?? false)
-  const runtimeControlNeedsServiceExit =
-    liveSnapshot.bringup.serviceModeRequested || liveSnapshot.bringup.serviceModeActive
   const nirActionCmd = nirRequested || nirActive ? 'laser_output_disable' : 'laser_output_enable'
   const nirActionLabel = nirRequested || nirActive ? 'Disable NIR Laser' : 'Enable NIR Laser'
   const nirActionTitle = nirActive
@@ -271,25 +283,8 @@ export function ControlWorkbench({
       risk: 'read' | 'write' | 'service' | 'firmware',
       note: string,
       args?: Record<string, number | string | boolean>,
-    ) => {
-      if (liveSnapshot.bringup.serviceModeRequested || liveSnapshot.bringup.serviceModeActive) {
-        const exitResult = await onIssueCommandAwaitAck(
-          'exit_service_mode',
-          'service',
-          'Exit service mode so runtime control can reclaim DAC, rail, and laser-path ownership from bring-up overrides.',
-        )
-        if (!exitResult.ok) {
-          return exitResult
-        }
-      }
-
-      return onIssueCommandAwaitAck(cmd, risk, note, args)
-    },
-    [
-      liveSnapshot.bringup.serviceModeActive,
-      liveSnapshot.bringup.serviceModeRequested,
-      onIssueCommandAwaitAck,
-    ],
+    ) => onIssueCommandAwaitAck(cmd, risk, note, args),
+    [onIssueCommandAwaitAck],
   )
 
   useEffect(() => {
@@ -409,8 +404,12 @@ export function ControlWorkbench({
           <p>
             {transportKind === 'mock'
               ? 'Use this to rehearse the control flow before the full hardware stack is populated.'
-              : runtimeControlNeedsServiceExit
-                ? 'Bring-up service ownership is still active. Control-page writes will first return ownership to the runtime controller, then apply the new request.'
+              : !liveSnapshot.deployment.active
+                ? 'Enter deployment mode and complete the deployment checklist before runtime control is allowed.'
+                : !deploymentReady
+                  ? liveSnapshot.deployment.running
+                    ? 'Deployment checklist is still running. Control writes stay locked until the controller reports ready.'
+                    : 'Deployment mode is active, but runtime control remains locked until the checklist succeeds.'
                 : 'Runtime control requests can be sent without service mode. The GUI expresses intent only; the firmware can still block output.'}
           </p>
         </div>
@@ -420,9 +419,9 @@ export function ControlWorkbench({
             <Activity size={14} />
             Link {connected ? 'ready' : 'offline'}
           </span>
-          <span className={liveSnapshot.bringup.serviceModeActive ? 'status-badge is-on' : 'status-badge'}>
+          <span className={liveSnapshot.deployment.active ? 'status-badge is-on' : 'status-badge'}>
             <ShieldAlert size={14} />
-            Service {liveSnapshot.bringup.serviceModeActive ? 'active' : 'optional'}
+            Deployment {liveSnapshot.deployment.active ? (deploymentReady ? 'ready' : liveSnapshot.deployment.running ? 'running' : 'active') : 'off'}
           </span>
           <span className={liveSnapshot.rails.ld.pgood ? 'status-badge is-on' : 'status-badge is-warn'}>
             <Zap size={14} />
@@ -434,47 +433,13 @@ export function ControlWorkbench({
           </span>
         </div>
 
-        <div className="button-row">
-          <button
-            type="button"
-            className="action-button is-inline"
-            title="Request service mode so bench-control mutations are accepted."
-            disabled={!connected || liveSnapshot.bringup.serviceModeActive}
-            onClick={() =>
-              onIssueCommandAwaitAck(
-                'enter_service_mode',
-                'service',
-                'Enter service mode before bench-side control and tuning.',
-              )
-            }
-          >
-            Enter service mode
-          </button>
-          <button
-            type="button"
-            className="action-button is-inline"
-            title="Leave service mode and return to normal safe supervision."
-            disabled={!connected || !liveSnapshot.bringup.serviceModeActive}
-            onClick={() =>
-              onIssueCommandAwaitAck(
-                'exit_service_mode',
-                'service',
-                'Exit service mode and return to normal safe supervision.',
-              )
-            }
-          >
-            Exit service mode
-          </button>
+        <div className="note-strip">
+          <span>
+            {deploymentReady
+              ? `Deployment current cap ${formatNumber(deploymentCurrentCapA, 2)} A / optical cap ${formatNumber(deploymentOpticalCapW, 2)} W.`
+              : 'Runtime output actions are locked until deployment succeeds in the current session.'}
+          </span>
         </div>
-
-        <label className="arming-toggle is-compact" title="Local arming gate before service writes are sent from this GUI.">
-          <input
-            type="checkbox"
-            checked={serviceArmed}
-            onChange={(event) => setServiceArmed(event.target.checked)}
-          />
-          <span>Bench terminated, eyewear on, interlocks verified, and ready to send service commands.</span>
-        </label>
       </div>
 
       <div className="control-layout">
@@ -515,7 +480,7 @@ export function ControlWorkbench({
                 <input
                   type="range"
                   min="0"
-                  max="5"
+                  max={deploymentOpticalCapW}
                   step="0.1"
                   value={requestedPowerW}
                   disabled={!laserAvailability.available}
@@ -526,7 +491,7 @@ export function ControlWorkbench({
                   <input
                     type="number"
                     min="0"
-                    max="5"
+                    max={deploymentOpticalCapW}
                     step="0.1"
                     value={laserPowerW}
                     disabled={!laserAvailability.available}
@@ -535,7 +500,7 @@ export function ControlWorkbench({
                   />
                   <span className="inline-help">
                     ~{formatNumber(currentFromOpticalPowerW(requestedPowerW), 2)} A at 3.0 V on the diode, capped by a
-                    {` ${formatNumber(liveSnapshot.safety.maxLaserCurrentA, 2)} A`} safety limit.
+                    {` ${formatNumber(deploymentCurrentCapA, 2)} A`} deployment limit.
                   </span>
                 </div>
               </div>

@@ -581,6 +581,22 @@ function makeSeedSnapshot(): DeviceSnapshot {
       tempAdcVoltageV: 0,
     },
     bringup: makeDefaultBringupStatus(),
+    deployment: {
+      active: false,
+      running: false,
+      ready: false,
+      failed: false,
+      currentStep: 'none',
+      lastCompletedStep: 'none',
+      failureCode: 'none',
+      failureReason: '',
+      targetMode: 'temp',
+      targetTempC: 25,
+      targetLambdaNm: 785,
+      maxLaserCurrentA: 5,
+      maxOpticalPowerW: 5,
+      steps: [],
+    },
     fault: {
       latched: false,
       activeCode: 'none',
@@ -653,6 +669,14 @@ function mergeSnapshot(
         ...current.bringup.tools,
         ...(incoming.bringup?.tools ?? {}),
       },
+    },
+    deployment: {
+      ...current.deployment,
+      ...(incoming.deployment ?? {}),
+      steps:
+        incoming.deployment?.steps !== undefined
+          ? incoming.deployment.steps.map((step) => ({ ...step }))
+          : current.deployment.steps,
     },
     fault: { ...current.fault, ...incoming.fault },
     counters: { ...current.counters, ...incoming.counters },

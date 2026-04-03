@@ -125,6 +125,8 @@ typedef struct {
     bool tof_data_valid;
     bool tof_data_fresh;
     laser_controller_distance_m_t tof_distance_m;
+    bool pcn_pwm_active;
+    bool tof_illumination_pwm_active;
     bool driver_loop_good;
     laser_controller_volts_t laser_driver_temp_voltage_v;
     laser_controller_celsius_t laser_driver_temp_c;

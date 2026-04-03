@@ -167,11 +167,20 @@ void laser_controller_safety_evaluate(
         return;
     }
 
+    decision->request_alignment = snapshot->host_request_alignment;
+    decision->request_nir = snapshot->host_request_nir;
+
     if (!snapshot->allow_missing_buttons) {
         decision->request_alignment =
-            hw->button.stage1_pressed && !hw->button.stage2_pressed;
+            decision->request_alignment ||
+            (hw->button.stage1_pressed && !hw->button.stage2_pressed);
         decision->request_nir =
-            hw->button.stage1_pressed && hw->button.stage2_pressed;
+            decision->request_nir ||
+            (hw->button.stage1_pressed && hw->button.stage2_pressed);
+    }
+
+    if (decision->request_nir) {
+        decision->request_alignment = false;
     }
 
     if (!interlocks_disabled &&
@@ -288,7 +297,8 @@ void laser_controller_safety_evaluate(
         }
     }
 
-    if (hw->measured_laser_current_a > config->thresholds.off_current_threshold_a &&
+    if (hw->ld_rail_pgood &&
+        hw->measured_laser_current_a > config->thresholds.off_current_threshold_a &&
         !decision->request_nir) {
         laser_controller_set_fault(
             decision,
@@ -297,7 +307,8 @@ void laser_controller_safety_evaluate(
             "current present while nir not requested");
     }
 
-    if (hw->laser_driver_temp_c > config->thresholds.ld_overtemp_limit_c) {
+    if (hw->ld_rail_pgood &&
+        hw->laser_driver_temp_c > config->thresholds.ld_overtemp_limit_c) {
         laser_controller_set_fault(
             decision,
             LASER_CONTROLLER_FAULT_LD_OVERTEMP,
@@ -317,8 +328,11 @@ void laser_controller_safety_evaluate(
 
     if (!snapshot->boot_complete ||
         (snapshot->fault_latched && !interlocks_disabled) ||
+        !snapshot->deployment_active ||
         snapshot->service_mode_requested ||
-        snapshot->service_mode_active) {
+        snapshot->service_mode_active ||
+        (snapshot->deployment_active && !snapshot->deployment_ready) ||
+        snapshot->deployment_running) {
         decision->allow_alignment = false;
         decision->allow_nir = false;
         decision->alignment_output_enable = false;
