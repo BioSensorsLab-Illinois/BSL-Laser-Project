@@ -32,6 +32,7 @@
 #define LASER_CONTROLLER_COMMS_CMD_PRIORITY   3U
 #define LASER_CONTROLLER_COMMS_TX_PERIOD_MS   20U
 #define LASER_CONTROLLER_COMMS_FAST_TELEMETRY_PERIOD_MS 60U
+#define LASER_CONTROLLER_COMMS_WIRELESS_FAST_TELEMETRY_PERIOD_MS 180U
 #define LASER_CONTROLLER_COMMS_LIVE_TELEMETRY_PERIOD_MS 1000U
 #define LASER_CONTROLLER_COMMS_STATUS_PERIOD_MS    10000U
 #define LASER_CONTROLLER_COMMS_WIRELESS_POST_COMMAND_QUIET_MS 400U
@@ -105,6 +106,12 @@ static bool laser_controller_comms_extract_bool(
     const char *line,
     const char *key,
     bool *value);
+static const laser_controller_board_gpio_pin_readback_t *
+laser_controller_comms_find_gpio_pin(
+    const laser_controller_runtime_status_t *status,
+    uint32_t gpio_num);
+static bool laser_controller_comms_driver_standby_effective(
+    const laser_controller_runtime_status_t *status);
 
 static void laser_controller_comms_output_lock(void)
 {
@@ -443,7 +450,7 @@ static uint32_t laser_controller_comms_encode_laser_flags(
     if (status->decision.nir_output_enable) {
         flags |= (1U << 1);
     }
-    if (status->outputs.assert_driver_standby) {
+    if (laser_controller_comms_driver_standby_effective(status)) {
         flags |= (1U << 2);
     }
     if (status->inputs.driver_loop_good) {
@@ -1219,6 +1226,28 @@ static bool laser_controller_comms_wait_for_haptic_enable(
            status->inputs.haptic_readback.enable_pin_high == enabled;
 }
 
+static bool laser_controller_comms_driver_standby_effective(
+    const laser_controller_runtime_status_t *status)
+{
+    const laser_controller_board_gpio_pin_readback_t *pin =
+        laser_controller_comms_find_gpio_pin(status, LASER_CONTROLLER_GPIO_LD_SBDN);
+
+    if (pin == NULL) {
+        return status != NULL ? status->outputs.assert_driver_standby : true;
+    }
+
+    if (pin->override_active &&
+        pin->override_mode == LASER_CONTROLLER_SERVICE_GPIO_MODE_OUTPUT) {
+        return !pin->level_high;
+    }
+
+    if (!pin->override_active && pin->output_enabled) {
+        return !pin->level_high;
+    }
+
+    return status->outputs.assert_driver_standby;
+}
+
 static const laser_controller_board_gpio_pin_readback_t *
 laser_controller_comms_find_gpio_pin(
     const laser_controller_runtime_status_t *status,
@@ -1268,10 +1297,13 @@ static bool laser_controller_comms_gpio_override_matches(
 
     if (mode == LASER_CONTROLLER_SERVICE_GPIO_MODE_OUTPUT) {
         return pin->override_level_high == level_high &&
+               pin->output_enabled &&
                pin->level_high == level_high;
     }
 
-    return pin->pullup_enabled == pullup_enabled &&
+    return pin->input_enabled &&
+           !pin->output_enabled &&
+           pin->pullup_enabled == pullup_enabled &&
            pin->pulldown_enabled == pulldown_enabled;
 }
 
@@ -1482,21 +1514,25 @@ static void laser_controller_comms_write_snapshot_json(
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        "\"laser\":{\"alignmentEnabled\":%s,\"nirEnabled\":%s,\"driverStandby\":%s,\"measuredCurrentA\":%.3f,\"commandedCurrentA\":%.3f,\"loopGood\":%s,\"driverTempC\":%.2f},",
+        "\"laser\":{\"alignmentEnabled\":%s,\"nirEnabled\":%s,\"driverStandby\":%s,\"commandVoltageV\":%.3f,\"commandedCurrentA\":%.3f,\"currentMonitorVoltageV\":%.3f,\"measuredCurrentA\":%.3f,\"loopGood\":%s,\"driverTempVoltageV\":%.3f,\"driverTempC\":%.2f},",
         status->outputs.enable_alignment_laser ? "true" : "false",
         status->decision.nir_output_enable ? "true" : "false",
-        status->outputs.assert_driver_standby ? "true" : "false",
-        status->inputs.measured_laser_current_a,
+        laser_controller_comms_driver_standby_effective(status) ? "true" : "false",
+        status->bringup.dac_ld_channel_v,
         status->bench.high_state_current_a,
+        status->inputs.laser_current_monitor_voltage_v,
+        status->inputs.measured_laser_current_a,
         status->inputs.driver_loop_good ? "true" : "false",
+        status->inputs.laser_driver_temp_voltage_v,
         status->inputs.laser_driver_temp_c);
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        "\"tec\":{\"targetTempC\":%.2f,\"targetLambdaNm\":%.2f,\"actualLambdaNm\":%.2f,\"tempGood\":%s,\"tempC\":%.2f,\"tempAdcVoltageV\":%.3f,\"currentA\":%.2f,\"voltageV\":%.2f,\"settlingSecondsRemaining\":%u},",
+        "\"tec\":{\"targetTempC\":%.2f,\"targetLambdaNm\":%.2f,\"actualLambdaNm\":%.2f,\"commandVoltageV\":%.3f,\"tempGood\":%s,\"tempC\":%.2f,\"tempAdcVoltageV\":%.3f,\"currentA\":%.2f,\"voltageV\":%.2f,\"settlingSecondsRemaining\":%u},",
         status->bench.target_temp_c,
         status->bench.target_lambda_nm,
         actual_lambda_nm,
+        status->inputs.tec_command_voltage_v,
         status->inputs.tec_temp_good ? "true" : "false",
         status->inputs.tec_temp_c,
         status->inputs.tec_temp_adc_voltage_v,
@@ -1514,7 +1550,8 @@ static void laser_controller_comms_write_snapshot_json(
         laser_controller_bench_target_mode_name(status->bench.target_mode));
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        ",\"requestedNirEnabled\":%s,\"modulationEnabled\":%s,\"modulationFrequencyHz\":%lu,\"modulationDutyCyclePct\":%lu,\"lowStateCurrentA\":%.3f},",
+        ",\"requestedAlignmentEnabled\":%s,\"requestedNirEnabled\":%s,\"modulationEnabled\":%s,\"modulationFrequencyHz\":%lu,\"modulationDutyCyclePct\":%lu,\"lowStateCurrentA\":%.3f},",
+        status->bench.requested_alignment ? "true" : "false",
         status->bench.requested_nir ? "true" : "false",
         status->bench.modulation_enabled ? "true" : "false",
         (unsigned long)status->bench.modulation_frequency_hz,
@@ -1556,9 +1593,10 @@ static void laser_controller_comms_write_snapshot_json(
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        "\"bringup\":{\"serviceModeRequested\":%s,\"serviceModeActive\":%s,\"persistenceDirty\":%s,\"persistenceAvailable\":%s,\"lastSaveOk\":%s,\"profileRevision\":%lu,\"profileName\":",
+        "\"bringup\":{\"serviceModeRequested\":%s,\"serviceModeActive\":%s,\"interlocksDisabled\":%s,\"persistenceDirty\":%s,\"persistenceAvailable\":%s,\"lastSaveOk\":%s,\"profileRevision\":%lu,\"profileName\":",
         status->bringup.service_mode_requested ? "true" : "false",
         status->state == LASER_CONTROLLER_STATE_SERVICE_MODE ? "true" : "false",
+        status->bringup.interlocks_disabled ? "true" : "false",
         status->bringup.persistence_dirty ? "true" : "false",
         status->bringup.persistence_available ? "true" : "false",
         status->bringup.last_save_ok ? "true" : "false",
@@ -1809,13 +1847,16 @@ static void laser_controller_comms_write_command_snapshot_json(
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        "\"laser\":{\"alignmentEnabled\":%s,\"nirEnabled\":%s,\"driverStandby\":%s,\"measuredCurrentA\":%.3f,\"commandedCurrentA\":%.3f,\"loopGood\":%s,\"driverTempC\":%.2f},",
+        "\"laser\":{\"alignmentEnabled\":%s,\"nirEnabled\":%s,\"driverStandby\":%s,\"commandVoltageV\":%.3f,\"commandedCurrentA\":%.3f,\"currentMonitorVoltageV\":%.3f,\"measuredCurrentA\":%.3f,\"loopGood\":%s,\"driverTempVoltageV\":%.3f,\"driverTempC\":%.2f},",
         status->outputs.enable_alignment_laser ? "true" : "false",
         status->decision.nir_output_enable ? "true" : "false",
-        status->outputs.assert_driver_standby ? "true" : "false",
-        status->inputs.measured_laser_current_a,
+        laser_controller_comms_driver_standby_effective(status) ? "true" : "false",
+        status->bringup.dac_ld_channel_v,
         status->bench.high_state_current_a,
+        status->inputs.laser_current_monitor_voltage_v,
+        status->inputs.measured_laser_current_a,
         status->inputs.driver_loop_good ? "true" : "false",
+        status->inputs.laser_driver_temp_voltage_v,
         status->inputs.laser_driver_temp_c);
 
     laser_controller_comms_buffer_append_fmt(
@@ -1841,12 +1882,13 @@ static void laser_controller_comms_write_command_snapshot_json(
         laser_controller_bench_target_mode_name(status->bench.target_mode));
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        ",\"requestedNirEnabled\":%s,\"modulationEnabled\":%s,\"modulationFrequencyHz\":%lu,\"modulationDutyCyclePct\":%lu,\"lowStateCurrentA\":%.3f},",
-        status->bench.requested_nir ? "true" : "false",
-        status->bench.modulation_enabled ? "true" : "false",
-        (unsigned long)status->bench.modulation_frequency_hz,
-        (unsigned long)status->bench.modulation_duty_cycle_pct,
-        status->bench.low_state_current_a);
+            ",\"requestedAlignmentEnabled\":%s,\"requestedNirEnabled\":%s,\"modulationEnabled\":%s,\"modulationFrequencyHz\":%lu,\"modulationDutyCyclePct\":%lu,\"lowStateCurrentA\":%.3f},",
+            status->bench.requested_alignment ? "true" : "false",
+            status->bench.requested_nir ? "true" : "false",
+            status->bench.modulation_enabled ? "true" : "false",
+            (unsigned long)status->bench.modulation_frequency_hz,
+            (unsigned long)status->bench.modulation_duty_cycle_pct,
+            status->bench.low_state_current_a);
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
@@ -1883,9 +1925,10 @@ static void laser_controller_comms_write_command_snapshot_json(
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        "\"bringup\":{\"serviceModeRequested\":%s,\"serviceModeActive\":%s,\"persistenceDirty\":%s,\"persistenceAvailable\":%s,\"lastSaveOk\":%s,\"profileRevision\":%lu,\"profileName\":",
+        "\"bringup\":{\"serviceModeRequested\":%s,\"serviceModeActive\":%s,\"interlocksDisabled\":%s,\"persistenceDirty\":%s,\"persistenceAvailable\":%s,\"lastSaveOk\":%s,\"profileRevision\":%lu,\"profileName\":",
         status->bringup.service_mode_requested ? "true" : "false",
         status->state == LASER_CONTROLLER_STATE_SERVICE_MODE ? "true" : "false",
+        status->bringup.interlocks_disabled ? "true" : "false",
         status->bringup.persistence_dirty ? "true" : "false",
         status->bringup.persistence_available ? "true" : "false",
         status->bringup.last_save_ok ? "true" : "false",
@@ -2015,8 +2058,17 @@ static void laser_controller_comms_write_live_telemetry_json(
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        "\"laser\":{\"commandedCurrentA\":%.3f},",
-        status->bench.high_state_current_a);
+        "\"laser\":{\"alignmentEnabled\":%s,\"nirEnabled\":%s,\"driverStandby\":%s,\"commandVoltageV\":%.3f,\"commandedCurrentA\":%.3f,\"currentMonitorVoltageV\":%.3f,\"measuredCurrentA\":%.3f,\"loopGood\":%s,\"driverTempVoltageV\":%.3f,\"driverTempC\":%.2f},",
+        status->outputs.enable_alignment_laser ? "true" : "false",
+        status->decision.nir_output_enable ? "true" : "false",
+        laser_controller_comms_driver_standby_effective(status) ? "true" : "false",
+        status->bringup.dac_ld_channel_v,
+        status->bench.high_state_current_a,
+        status->inputs.laser_current_monitor_voltage_v,
+        status->inputs.measured_laser_current_a,
+        status->inputs.driver_loop_good ? "true" : "false",
+        status->inputs.laser_driver_temp_voltage_v,
+        status->inputs.laser_driver_temp_c);
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
@@ -2041,9 +2093,10 @@ static void laser_controller_comms_write_live_telemetry_json(
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        "\"bringup\":{\"serviceModeRequested\":%s,\"serviceModeActive\":%s,\"illumination\":{\"tof\":{\"enabled\":%s}}},",
+        "\"bringup\":{\"serviceModeRequested\":%s,\"serviceModeActive\":%s,\"interlocksDisabled\":%s,\"illumination\":{\"tof\":{\"enabled\":%s}}},",
         status->bringup.service_mode_requested ? "true" : "false",
         status->state == LASER_CONTROLLER_STATE_SERVICE_MODE ? "true" : "false",
+        status->bringup.interlocks_disabled ? "true" : "false",
         status->bringup.tof_illumination_enabled ? "true" : "false");
 
     laser_controller_comms_buffer_append_fmt(
@@ -2197,13 +2250,16 @@ static void laser_controller_comms_write_live_snapshot_json(
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        "\"laser\":{\"alignmentEnabled\":%s,\"nirEnabled\":%s,\"driverStandby\":%s,\"measuredCurrentA\":%.3f,\"commandedCurrentA\":%.3f,\"loopGood\":%s,\"driverTempC\":%.2f},",
+        "\"laser\":{\"alignmentEnabled\":%s,\"nirEnabled\":%s,\"driverStandby\":%s,\"commandVoltageV\":%.3f,\"commandedCurrentA\":%.3f,\"currentMonitorVoltageV\":%.3f,\"measuredCurrentA\":%.3f,\"loopGood\":%s,\"driverTempVoltageV\":%.3f,\"driverTempC\":%.2f}",
         status->outputs.enable_alignment_laser ? "true" : "false",
         status->decision.nir_output_enable ? "true" : "false",
-        status->outputs.assert_driver_standby ? "true" : "false",
-        status->inputs.measured_laser_current_a,
+        laser_controller_comms_driver_standby_effective(status) ? "true" : "false",
+        status->bringup.dac_ld_channel_v,
         status->bench.high_state_current_a,
+        status->inputs.laser_current_monitor_voltage_v,
+        status->inputs.measured_laser_current_a,
         status->inputs.driver_loop_good ? "true" : "false",
+        status->inputs.laser_driver_temp_voltage_v,
         status->inputs.laser_driver_temp_c);
 
     laser_controller_comms_buffer_append_fmt(
@@ -2238,9 +2294,10 @@ static void laser_controller_comms_write_live_snapshot_json(
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        "\"bringup\":{\"serviceModeRequested\":%s,\"serviceModeActive\":%s,\"power\":{\"ldRequested\":%s,\"tecRequested\":%s},\"illumination\":{\"tof\":{\"enabled\":%s,\"dutyCyclePct\":%lu,\"frequencyHz\":%lu}}},",
+        "\"bringup\":{\"serviceModeRequested\":%s,\"serviceModeActive\":%s,\"interlocksDisabled\":%s,\"power\":{\"ldRequested\":%s,\"tecRequested\":%s},\"illumination\":{\"tof\":{\"enabled\":%s,\"dutyCyclePct\":%lu,\"frequencyHz\":%lu}}},",
         status->bringup.service_mode_requested ? "true" : "false",
         status->state == LASER_CONTROLLER_STATE_SERVICE_MODE ? "true" : "false",
+        status->bringup.interlocks_disabled ? "true" : "false",
         status->bringup.ld_rail_debug_enabled ? "true" : "false",
         status->bringup.tec_rail_debug_enabled ? "true" : "false",
         status->bringup.tof_illumination_enabled ? "true" : "false",
@@ -2596,9 +2653,10 @@ static void laser_controller_comms_emit_io_status_response(
         bringup_open = true;
         laser_controller_comms_buffer_append_fmt(
             &buffer,
-            "\"serviceModeRequested\":%s,\"serviceModeActive\":%s",
+            "\"serviceModeRequested\":%s,\"serviceModeActive\":%s,\"interlocksDisabled\":%s",
             status->bringup.service_mode_requested ? "true" : "false",
-            status->state == LASER_CONTROLLER_STATE_SERVICE_MODE ? "true" : "false");
+            status->state == LASER_CONTROLLER_STATE_SERVICE_MODE ? "true" : "false",
+            status->bringup.interlocks_disabled ? "true" : "false");
         if (include_power) {
             laser_controller_comms_buffer_append_fmt(
                 &buffer,
@@ -2696,9 +2754,10 @@ static void laser_controller_comms_emit_tool_status_response(
         bringup_open = true;
         laser_controller_comms_buffer_append_fmt(
             &buffer,
-            "\"serviceModeRequested\":%s,\"serviceModeActive\":%s",
+            "\"serviceModeRequested\":%s,\"serviceModeActive\":%s,\"interlocksDisabled\":%s",
             status->bringup.service_mode_requested ? "true" : "false",
-            status->state == LASER_CONTROLLER_STATE_SERVICE_MODE ? "true" : "false");
+            status->state == LASER_CONTROLLER_STATE_SERVICE_MODE ? "true" : "false",
+            status->bringup.interlocks_disabled ? "true" : "false");
         if (include_modules) {
             laser_controller_comms_buffer_append_raw(&buffer, ",");
             laser_controller_comms_write_modules_only_json(&buffer, status);
@@ -2757,9 +2816,10 @@ static void laser_controller_comms_emit_profile_status_response(
         laser_controller_comms_power_tier_name(status->power_tier));
     laser_controller_comms_buffer_append_fmt(
         &buffer,
-        "},\"bringup\":{\"serviceModeRequested\":%s,\"serviceModeActive\":%s,\"persistenceDirty\":%s,\"persistenceAvailable\":%s,\"lastSaveOk\":%s,\"profileRevision\":%lu,\"profileName\":",
+        "},\"bringup\":{\"serviceModeRequested\":%s,\"serviceModeActive\":%s,\"interlocksDisabled\":%s,\"persistenceDirty\":%s,\"persistenceAvailable\":%s,\"lastSaveOk\":%s,\"profileRevision\":%lu,\"profileName\":",
         status->bringup.service_mode_requested ? "true" : "false",
         status->state == LASER_CONTROLLER_STATE_SERVICE_MODE ? "true" : "false",
+        status->bringup.interlocks_disabled ? "true" : "false",
         status->bringup.persistence_dirty ? "true" : "false",
         status->bringup.persistence_available ? "true" : "false",
         status->bringup.last_save_ok ? "true" : "false",
@@ -2831,7 +2891,7 @@ static void laser_controller_comms_emit_bench_status_response(
         status->inputs.tec_rail_pgood ? "true" : "false",
         status->outputs.enable_alignment_laser ? "true" : "false",
         status->decision.nir_output_enable ? "true" : "false",
-        status->outputs.assert_driver_standby ? "true" : "false",
+        laser_controller_comms_driver_standby_effective(status) ? "true" : "false",
         status->inputs.measured_laser_current_a,
         status->bench.high_state_current_a,
         status->inputs.driver_loop_good ? "true" : "false",
@@ -2859,7 +2919,8 @@ static void laser_controller_comms_emit_bench_status_response(
             laser_controller_bench_target_mode_name(status->bench.target_mode));
         laser_controller_comms_buffer_append_fmt(
             &buffer,
-            ",\"requestedNirEnabled\":%s,\"modulationEnabled\":%s,\"modulationFrequencyHz\":%lu,\"modulationDutyCyclePct\":%lu,\"lowStateCurrentA\":%.3f}",
+            ",\"requestedAlignmentEnabled\":%s,\"requestedNirEnabled\":%s,\"modulationEnabled\":%s,\"modulationFrequencyHz\":%lu,\"modulationDutyCyclePct\":%lu,\"lowStateCurrentA\":%.3f}",
+            status->bench.requested_alignment ? "true" : "false",
             status->bench.requested_nir ? "true" : "false",
             status->bench.modulation_enabled ? "true" : "false",
             (unsigned long)status->bench.modulation_frequency_hz,
@@ -2904,9 +2965,10 @@ static void laser_controller_comms_emit_bench_status_response(
 
     laser_controller_comms_buffer_append_fmt(
         &buffer,
-        ",\"bringup\":{\"serviceModeRequested\":%s,\"serviceModeActive\":%s},\"fault\":{\"latched\":%s,\"activeCode\":",
+        ",\"bringup\":{\"serviceModeRequested\":%s,\"serviceModeActive\":%s,\"interlocksDisabled\":%s},\"fault\":{\"latched\":%s,\"activeCode\":",
         status->bringup.service_mode_requested ? "true" : "false",
         status->state == LASER_CONTROLLER_STATE_SERVICE_MODE ? "true" : "false",
+        status->bringup.interlocks_disabled ? "true" : "false",
         status->fault_latched ? "true" : "false");
     laser_controller_comms_write_escaped_string(
         &buffer,
@@ -3299,8 +3361,7 @@ static void laser_controller_comms_handle_command_line(const char *line)
     }
 
     if (!laser_controller_comms_service_mode_active(&status) &&
-        (strcmp(command, "set_laser_power") == 0 ||
-         strcmp(command, "set_max_current") == 0 ||
+        (strcmp(command, "set_max_current") == 0 ||
          strcmp(command, "set_runtime_safety") == 0 ||
          strcmp(command, "set_supply_enable") == 0 ||
          strcmp(command, "set_haptic_enable") == 0 ||
@@ -3310,11 +3371,6 @@ static void laser_controller_comms_handle_command_line(const char *line)
          strcmp(command, "pd_debug_config") == 0 ||
          strcmp(command, "pd_save_firmware_plan") == 0 ||
          strcmp(command, "pd_burn_nvm") == 0 ||
-         strcmp(command, "set_target_temp") == 0 ||
-         strcmp(command, "set_target_lambda") == 0 ||
-         strcmp(command, "laser_output_enable") == 0 ||
-         strcmp(command, "enable_alignment") == 0 ||
-         strcmp(command, "configure_modulation") == 0 ||
          strcmp(command, "apply_bringup_preset") == 0 ||
          strcmp(command, "dac_debug_set") == 0 ||
          strcmp(command, "dac_debug_config") == 0 ||
@@ -3785,12 +3841,10 @@ static void laser_controller_comms_handle_command_line(const char *line)
         bool enabled = false;
         uint32_t frequency_hz = 0U;
         uint32_t duty_cycle_pct = 0U;
-        float low_state_current_a = 0.0f;
 
         if (!laser_controller_comms_extract_bool(line, "\"enabled\":", &enabled) ||
             !laser_controller_comms_extract_uint(line, "\"frequency_hz\":", &frequency_hz) ||
-            !laser_controller_comms_extract_uint(line, "\"duty_cycle_pct\":", &duty_cycle_pct) ||
-            !laser_controller_comms_extract_float(line, "\"low_current_a\":", &low_state_current_a)) {
+            !laser_controller_comms_extract_uint(line, "\"duty_cycle_pct\":", &duty_cycle_pct)) {
             laser_controller_comms_emit_error_response(id, "Missing modulation arguments.");
             return;
         }
@@ -3799,16 +3853,14 @@ static void laser_controller_comms_handle_command_line(const char *line)
             enabled,
             frequency_hz,
             duty_cycle_pct,
-            low_state_current_a,
             now_ms);
         laser_controller_logger_logf(
             now_ms,
             "bench",
-            "pcn modulation staged enabled=%d freq=%lu duty=%lu low=%.3f",
+            "pcn modulation staged enabled=%d freq=%lu duty=%lu",
             enabled,
             (unsigned long)frequency_hz,
-            (unsigned long)duty_cycle_pct,
-            low_state_current_a);
+            (unsigned long)duty_cycle_pct);
         (void)laser_controller_app_copy_status(&status);
         laser_controller_comms_emit_bench_status_response(
             id,
@@ -3949,6 +4001,35 @@ static void laser_controller_comms_handle_command_line(const char *line)
             false,
             true,
             false);
+        return;
+    }
+
+    if (strcmp(command, "set_interlocks_disabled") == 0) {
+        bool enabled = false;
+
+        if (!laser_controller_comms_extract_bool(line, "\"enabled\":", &enabled)) {
+            laser_controller_comms_emit_error_response(
+                id,
+                "Missing interlock override state.");
+            return;
+        }
+
+        if (enabled && !laser_controller_comms_service_mode_active(&status)) {
+            laser_controller_comms_emit_error_response(
+                id,
+                "Enter service mode before disabling controller interlocks.");
+            return;
+        }
+
+        laser_controller_service_set_interlocks_disabled(enabled, now_ms);
+        laser_controller_logger_logf(
+            now_ms,
+            "service",
+            "bench interlock override -> %s",
+            enabled ? "disabled" : "restored");
+        vTaskDelay(pdMS_TO_TICKS(80U));
+        (void)laser_controller_app_copy_status(&status);
+        laser_controller_comms_emit_status_response(id, &status);
         return;
     }
 
@@ -4656,9 +4737,34 @@ static void laser_controller_comms_handle_command_line(const char *line)
 void laser_controller_comms_receive_line(const char *line)
 {
     laser_controller_comms_line_t item = { 0 };
+    char command[32] = { 0 };
     uint32_t id = 0U;
+    bool is_background_probe = false;
 
     if (line == NULL || line[0] == '\0' || s_command_queue == NULL) {
+        return;
+    }
+
+    if (laser_controller_comms_extract_uint(line, "\"id\":", &id) &&
+        id == 0U &&
+        (laser_controller_comms_extract_string(
+             line,
+             "\"cmd\":\"",
+             command,
+             sizeof(command)) ||
+         laser_controller_comms_extract_string(
+             line,
+             "\"command\":\"",
+             command,
+             sizeof(command)))) {
+        is_background_probe =
+            strcmp(command, "ping") == 0 ||
+            strcmp(command, "get_status") == 0;
+    }
+
+    if (is_background_probe &&
+        (s_command_in_flight ||
+         uxQueueMessagesWaiting(s_command_queue) != 0U)) {
         return;
     }
 
@@ -4668,7 +4774,11 @@ void laser_controller_comms_receive_line(const char *line)
         return;
     }
 
-    if (laser_controller_comms_extract_uint(line, "\"id\":", &id)) {
+    if (is_background_probe) {
+        return;
+    }
+
+    if (id != 0U || laser_controller_comms_extract_uint(line, "\"id\":", &id)) {
         laser_controller_comms_emit_error_response(
             id,
             "Controller command queue is full. Wait for the current action to finish and retry.");
@@ -4708,13 +4818,19 @@ static void laser_controller_comms_tx_task(void *argument)
 
         if (laser_controller_app_copy_status(&status)) {
             const laser_controller_time_ms_t now_ms = status.uptime_ms;
+            const bool wireless_clients_active =
+                laser_controller_wireless_has_clients();
             const bool pause_wireless_telemetry =
                 laser_controller_comms_should_pause_wireless_telemetry(now_ms);
+            const laser_controller_time_ms_t fast_telemetry_period_ms =
+                wireless_clients_active ?
+                    LASER_CONTROLLER_COMMS_WIRELESS_FAST_TELEMETRY_PERIOD_MS :
+                    LASER_CONTROLLER_COMMS_FAST_TELEMETRY_PERIOD_MS;
             const bool emit_fast_telemetry =
                 !pause_wireless_telemetry &&
                 (last_fast_telemetry_ms == 0U ||
                 (now_ms - last_fast_telemetry_ms) >=
-                    LASER_CONTROLLER_COMMS_FAST_TELEMETRY_PERIOD_MS);
+                    fast_telemetry_period_ms);
             const bool emit_live_telemetry =
                 !pause_wireless_telemetry &&
                 (last_live_telemetry_ms == 0U ||

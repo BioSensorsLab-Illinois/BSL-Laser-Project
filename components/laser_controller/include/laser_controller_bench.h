@@ -49,7 +49,6 @@ void laser_controller_bench_set_modulation(
     bool enabled,
     uint32_t frequency_hz,
     uint32_t duty_cycle_pct,
-    laser_controller_amps_t low_state_current_a,
     laser_controller_time_ms_t now_ms);
 const char *laser_controller_bench_target_mode_name(
     laser_controller_bench_target_mode_t target_mode);

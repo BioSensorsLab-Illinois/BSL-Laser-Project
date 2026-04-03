@@ -68,6 +68,7 @@ Preserve a firmware architecture where the default answer to any ambiguity is:
   Physical ESP32-S3-WROOM GPIO visualization and service-only pin override tool. Live readback must stay visually separate from staged overrides.
 - [host-console/src/components/ControlWorkbench.tsx](/Users/zz4/BSL/BSL-Laser/host-console/src/components/ControlWorkbench.tsx)
   Bench-only staging UI for laser, TEC, and modulation requests. Firmware must stay authoritative.
+  PCN modulation on this board is frequency-and-duty only. `LISL` is hard grounded, `0 Hz` means DC/static PCN selection, and leaving modulation must restore GPIO21 to normal digital high/low ownership cleanly.
 - [host-console/src/components/BringupWorkbench.tsx](/Users/zz4/BSL/BSL-Laser/host-console/src/components/BringupWorkbench.tsx)
   Module bring-up UI with a Service landing page for guarded policy edits, module planning, and tuning.
 - [host-console/src/components/BusTrafficViewer.tsx](/Users/zz4/BSL/BSL-Laser/host-console/src/components/BusTrafficViewer.tsx)
@@ -85,7 +86,7 @@ Preserve a firmware architecture where the default answer to any ambiguity is:
 
 - Default config now includes a conservative bench LUT so the controller can boot for bring-up.
 - That LUT is not a substitute for per-unit clinical calibration.
-- NIR cannot be enabled from the current repository.
+- Runtime NIR request plumbing exists. A host `laser_output_enable` request should stage `requestedNirEnabled`, and on a valid full-power runtime bench it should then drive the NIR path prerequisites (`TEC rail`, `LD rail`, `SBDN high`, `PCN high`) from the normal controller output path. Bench verification must be done on a board that is not stuck in `PROGRAMMING_ONLY` and does not currently have an active interlock block such as `tof_out_of_range`.
 - Alignment cannot be enabled from the current repository.
 - The firmware now boots bench-safe into `PROGRAMMING_ONLY` when the PD module is not declared present or no valid contract exists.
 - Service-mode command/control over USB Serial/JTAG is working with the current host wire format.
@@ -125,6 +126,8 @@ Preserve a firmware architecture where the default answer to any ambiguity is:
 - Repeated identical bus reads still need their own comms-log entries. Do not rely only on snapshot-diff events for SPI/I2C history, because the operator may intentionally read the same register value many times in a row.
 - The Events workspace should also surface failed host commands directly from command history, not only from derived transport events. A rejected `dac_debug_config` or similar service write must remain visible even if the inspector rail is collapsed.
 - The Tools workspace now also exposes a physical ESP32-S3-WROOM GPIO inspector. That tool must show actual controller readback for each pin (`gpioInspector`) separately from any staged override draft.
+- Analog telemetry pads in the GPIO inspector, especially `GPIO2 / LD_LIO`, `GPIO1 / LD_TMO`, and `GPIO8 / TEC_TMO`, should not be presented as "unused" just because their digital GPIO mode looks idle. For those pins, the preferred truth is the live ADC-backed telemetry value from the controller snapshot.
+- `GPIO13 / LD_SBDN` can be service-overridden independently of the normal firmware output path. Any exported `driverStandby` status must therefore reflect the effective live SBDN state after overrides, not just `last_outputs.assert_driver_standby`, otherwise the GUI will show contradictory standby truth even when the pin itself is stable.
 - `set_gpio_override` and `clear_gpio_overrides` are service-only. They are for controlled bench proving only and must never be repurposed as a hidden runtime control path.
 - The GPIO inspector must keep a one-step escape hatch: `Reset all to firmware` clears every override and hands ownership back to the original firmware logic.
 - Treat transport, boot-strap, and debug pins as hazardous in the UI. `GPIO19/20`, `GPIO43/44`, `GPIO0`, `GPIO46`, `GPIO3`, and `GPIO45` should remain visibly risky because overriding them can drop the link or affect boot behavior.
@@ -134,6 +137,19 @@ Preserve a firmware architecture where the default answer to any ambiguity is:
 - The DAC Bring-up path should explicitly refresh live module state after arming the DAC module plan, and it should retry `dac_debug_config` once after a forced module-plan resync if the controller still reports the DAC write gate as blocked.
 - DAC80502 init on this board needs a short settle period after software reset before follow-on register writes. Without that delay, `dac_debug_config` can fail intermittently with `ESP_ERR_INVALID_RESPONSE` even though the DAC is physically present.
 - DAC80502 on this board is powered from `3.3 V` and drives `0-2.5 V` command nets. With the internal `2.5 V` reference, `REF-DIV=1` is required on this board even at `gain x1`; otherwise `REF-ALARM` forces both outputs to `0 V` even though the DAC data registers still read back correctly.
+- The LD (`LISH`) and TEC (`TMS`) setpoint editors on the Laser-driver and TEC Bring-up pages must stay tied to the exact same DAC channel A/B draft used by the DAC page. There is one DAC shadow plan in the host; changing a setpoint on any of those pages must update the others.
+- The Laser-driver Bring-up page should frame DAC channel A in driver terms: staged `LISH` voltage, equivalent current, live `LIO` monitor voltage, live measured current, raw `TMO` voltage, and derived driver temperature. Show the raw analog terms directly; do not hide them behind a single generic temperature/current label.
+- Laser-driver bring-up should treat the ATLS6A214 current span as `0-6 A` over `0-2.5 V`, but the host bring-up editor must clamp staged writes at `5 A` for safety. Live current meters may still use the full `0-6 A` display span.
+- Laser-driver bring-up should expose service-only `SBDN` control on `GPIO13` in operator-facing terms: `Off`, `On`, `Standby`, plus an `Auto` release option back to firmware ownership. The UI may explain the electrical meaning, but it should not make operators think in raw names like `ON-PU` or `STANDBY-HiZ`. `Standby` should still use a real input / high-impedance override, not a fake digital level.
+- `GPIO13` / `LD_SBDN` overrides must win over the normal actuator-target update loop. If a service override is active, the board layer must not briefly re-drive `SBDN` from the normal standby/output path on the next 5 ms control cycle, or the net will glitch even though the override looks active in software.
+- Laser-driver bring-up should expose service-only `PCN` control on `GPIO21` with explicit `LISL`, `LISH`, and `Firmware` ownership states. This is a temporary bench override path and must not be implied as the normal runtime control scheme.
+- Laser-driver bring-up green control should be a single service-only toggle that directly drives shared `GPIO37 / GN_LD_EN` high or low. Do not route that page through the normal `enable_alignment` runtime request path, because service mode suppresses the normal alignment-output logic.
+- `GPIO21` / `LD_PCN` overrides must win over the normal actuator-target update loop. If a service override is active, the board layer must not immediately re-drive `PCN` from the normal low/high-current runtime path on the next cycle.
+- On the real board, a working `PCN` override must be validated from live GPIO readback, not only from the requested override state. Host UI should show the actual live level and treat request-vs-live mismatch as a faulted condition, not as a successful `LISH` selection.
+- Loop-good, rail-good, DAC reachable/configured, and `REF_ALARM` should all be visible on the Laser-driver page with strong color-coded status tags, because LD bring-up is otherwise too ambiguous when the analog path is only partially alive.
+- `TMO` temperature on the Laser-driver page is only meaningful when the LD controller is not in `OFF-PD` and the LD rail `PGOOD` is high. When either condition is false, the page should show `TMO` as invalid rather than presenting the raw voltage-derived temperature as if it were trustworthy.
+- The TEC Bring-up page must treat DAC channel B / `TMS` voltage as the single writable source of truth, with temperature and wavelength derived from the calibration table. Editing voltage, temperature, or wavelength there must immediately update the other two and stay in sync with the DAC page.
+- The TEC Bring-up page should show a disabled live readback slider for current TEC temperature driven from realtime telemetry, not only a static numeric card. Keep that path at 5 Hz or better; the current target is the existing fast telemetry cadence rather than a slower status snapshot.
 - STUSB4500 PDO writes should verify register readback and trigger PD soft-reset renegotiation before the host treats the apply as complete.
 - The new `pd_save_firmware_plan` path is MCU-owned persistence, not STUSB4500 NVM. It must validate runtime PDO readback first, then save the verified plan into ESP32 NVS.
 - If MCU-owned PDO auto-reconcile is enabled, firmware must compare the saved plan against live STUSB4500 runtime PDO readback and only write the chip when the live table does not already match.
@@ -150,11 +166,28 @@ Preserve a firmware architecture where the default answer to any ambiguity is:
   - password: `bslbench2026`
   - WebSocket URL: `ws://192.168.4.1/ws`
 - Wireless is for monitoring, logs, bring-up, and bench control only. Browser flashing remains USB / Web Serial only.
+- Station mode should preserve the bench AP management path. Do not tear down `BSL-HTLS-Bench` just because the controller also joins an external 2.4 GHz network; operators need a stable recovery/configuration channel for future SSID changes.
+- The host Wi-Fi management controls must stay usable even while the controller is retrying a saved station connection. `stationConnecting` is status, not a UI lock; scan, save-and-join, and restore-bench-AP actions must remain operator-accessible.
+- Host wireless configuration must not implicitly reuse a saved station password when the operator selects a different SSID. Password reuse must stay explicit and auditable so changing networks does not silently keep old credentials alive.
+- The host must not auto-switch itself off the bench AP just because the controller reports a station IP. Moving from `ws://192.168.4.1/ws` to the station endpoint should stay an explicit operator choice.
+- Wireless stability is more important than maximum telemetry cadence. If Wi-Fi/WebSocket starts churning, reduce wireless-side telemetry pressure and avoid dropping clients on the first async send failure.
+- During short wireless reconnects, the host should preserve the last proven live snapshot and keep Bring-up/Control in a recovery posture instead of dropping every module back to `Awaiting probe`. Command gating may pause while reconnecting, but visible module truth should not thrash.
 - Prefer Wi-Fi SoftAP + WebSocket over BLE for the bench host link. BLE is not the primary transport here because browser compatibility and sustained telemetry stability are weaker.
 - Stability priority for wireless is: one dedicated SoftAP, one protocol, one operator laptop. Do not add a second wireless control surface with different semantics unless it is reviewed explicitly.
+- The wireless bridge must always prefer the newest WebSocket client. If the ESP32 client table is full, evict the oldest slot instead of silently ignoring the new browser session.
+- The host must serialize controller commands on `serial` and `wifi`. Background probes, liveness checks, and operator actions must not pile multiple in-flight commands onto the ESP32 command queue.
+- WebSocket handshake probes should stop as soon as the controller sends any valid protocol traffic. Do not keep a startup ping flood running after protocol-ready.
+- The Control page must render from the live merged snapshot, not only the base status snapshot, or staged bench changes will look one-shot and stale. In particular, NIR control should show `requested` vs `active` separately and surface the live prerequisites (`LD/TEC rail`, `SBDN`, `PCN`, `loop good`) instead of looking like a dead button when firmware is still gating output.
+- Runtime bench output requests (`enable_alignment`, `disable_alignment`, `laser_output_enable`, `laser_output_disable`, `set_laser_power`, `set_target_temp`, `set_target_lambda`, `configure_modulation`) must not be trapped behind service mode. Service mode is for bring-up/config/override work; active output requests need to function in normal runtime states because service mode itself suppresses beam output.
+- The Control page must use the acknowledgement-based command path when it first exits bring-up service mode and then applies a runtime command. Fire-and-forget ordering is not reliable enough for `exit_service_mode -> set_target_temp / set_target_lambda / laser_output_enable / laser_output_disable / configure_modulation`.
+- Control-page runtime writes should reclaim ownership from bring-up shadows automatically. If service mode is still active, the host should exit service mode first so later runtime commands really take over DAC, GPIO, rail, and laser-path ownership instead of only updating staged text.
+- The controller snapshot should publish both `requestedAlignmentEnabled` and `requestedNirEnabled`. Without the explicit staged-request fields, the host cannot distinguish `request accepted but still gated` from `button did nothing`.
 - IMU and ToF invalid or stale conditions currently auto-clear in the bench image, but they still disable NIR immediately and remain logged.
 - The bench IMU snapshot now publishes beam-frame pitch, roll, and a relative gyro-integrated yaw for host rendering. Only pitch is currently part of the safety interlock path; roll and yaw are telemetry only until mechanically validated.
+- Host horizon UI must follow controller truth, not a host-only re-derivation. Because the firmware uses hysteresis, a slightly negative pitch can still remain blocked until it clears the lower reset threshold; the GUI should show both trip and clear thresholds instead of implying any negative pitch is automatically safe.
 - Lambda drift and TEC temperature ADC trips currently auto-clear after their configured 2-second default hold windows; they should stay adjustable and auditable.
+- If the host exposes a `disable all interlocks` control, it must stay overt, destructive-styled, confirmation-gated, and routed through the centralized safety path. It must never be hidden in a module page or implemented as an untracked side-channel bypass.
+- The TEC bring-up page should expose the raw analog supervision names directly: `TMS` set voltage, `TMO` thermistor voltage, current temperature, `ITEC`, `VTEC`, `TEMPGD`, and TEC rail `PGOOD`. Do not make operators infer these from renamed generic labels when the controller already has the raw values.
 - Firmware log mirroring to plain `ESP_LOGI` is disabled by default so the JSON host link stays deterministic.
 
 Current bench validation on the attached board:
@@ -171,6 +204,8 @@ Current bench validation on the attached board:
   - `GPIO7` -> optional `GPIO1` interrupt input
   - `GPIO6` -> LED-control sideband, driven low only when the ToF module is explicitly declared present
 - The current ToF bench path now includes a minimal `VL53L1X` ranging sequence derived from ST's published init/start/read/clear flow: boot-state readback, sensor-ID readback, default config load, long-distance mode, timing budget, intermeasurement setup, data-ready polling, range-status decode, and distance-mm readback.
+- Raw `VL53L1X` distance register readback and the controller-promoted ToF distance are intentionally different now. The raw register is still shown for debugging, but the controller distance only promotes `range_status == 0` samples and smooths them with a short rolling filter before exposing them to the rest of the GUI.
+- The ToF-board front illumination path on `GPIO6` / `TPS61169 CTRL` now uses a fixed `20 kHz` service PWM carrier by default. Duty may vary for bring-up, but the default carrier should stay consistent between firmware, protocol readback, and host copy.
 - The host ToF page and protocol now expose actual low-level ToF peripheral truth:
   - `reachable`
   - `configured`
@@ -180,6 +215,7 @@ Current bench validation on the attached board:
   - `rangeStatus`
   - `distanceMm`
 - Host overview/status components may show raw `VL53L1X` distance readback when the peripheral is alive, but they must still keep the safety posture in `hold` until the controller marks the ToF sample `valid` and `fresh`. Do not visually turn a raw peripheral sample into a passed interlock.
+- All safety thresholds, hysteresis, and stale-timeout edits belong only in `Bring-up -> Service`. Module pages may display those live values for context, but they must not own safety writes or shadow copies of the same policy.
 - The Tools/Event decoder should treat `VL53L1X` at `0x29` as a first-class known I2C target. If it does not appear in the dropdown, the operator is almost certainly running a stale browser bundle and needs a hard refresh.
 
 Remaining blockers before claiming hardware-test readiness:

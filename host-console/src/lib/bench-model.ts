@@ -41,6 +41,7 @@ function clamp(value: number, min: number, max: number): number {
 export function makeDefaultBenchControlStatus(): BenchControlStatus {
   return {
     targetMode: 'lambda',
+    requestedAlignmentEnabled: false,
     requestedNirEnabled: false,
     modulationEnabled: false,
     modulationFrequencyHz: 2000,
@@ -67,7 +68,9 @@ export function currentFromOpticalPowerW(opticalPowerW: number): number {
 export function deriveBenchEstimate(snapshot: DeviceSnapshot): BenchEstimate {
   const bench = resolveBenchControlStatus(snapshot)
   const highCurrentA = clamp(snapshot.laser.commandedCurrentA, 0, LASER_FULL_CURRENT_A)
-  const lowCurrentA = clamp(bench.lowStateCurrentA, 0, highCurrentA)
+  const lowCurrentA = bench.modulationEnabled
+    ? 0
+    : clamp(bench.lowStateCurrentA, 0, highCurrentA)
   const dutyFraction =
     snapshot.laser.nirEnabled && bench.modulationEnabled
       ? clamp(bench.modulationDutyCyclePct, 0, 100) / 100

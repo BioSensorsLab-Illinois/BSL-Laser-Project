@@ -28,6 +28,8 @@ export class WebSocketTransport implements DeviceTransport {
 
   private handshakeProbeTimers: number[] = []
 
+  private protocolReady = false
+
   private readonly url: string
 
   constructor(url: string) {
@@ -48,19 +50,17 @@ export class WebSocketTransport implements DeviceTransport {
 
   private scheduleHandshakeProbes(): void {
     this.clearHandshakeProbeTimers()
+    this.protocolReady = false
 
     const probes: Array<{ delayMs: number; cmd: 'get_status' | 'ping' }> = [
-      { delayMs: 60, cmd: 'get_status' },
-      { delayMs: 180, cmd: 'ping' },
-      { delayMs: 420, cmd: 'ping' },
+      { delayMs: 120, cmd: 'get_status' },
       { delayMs: 900, cmd: 'ping' },
-      { delayMs: 1500, cmd: 'ping' },
-      { delayMs: 2400, cmd: 'ping' },
+      { delayMs: 2200, cmd: 'get_status' },
     ]
 
     for (const probe of probes) {
       const timerId = window.setTimeout(() => {
-        if (!this.active) {
+        if (!this.active || this.protocolReady) {
           return
         }
 
@@ -85,7 +85,10 @@ export class WebSocketTransport implements DeviceTransport {
     interpretControllerLine(line, {
       makeEventId: (kind) => this.nextEventId(kind),
       emit: (message) => this.emit(message),
-      onProtocolReady: () => undefined,
+      onProtocolReady: () => {
+        this.protocolReady = true
+        this.clearHandshakeProbeTimers()
+      },
     })
   }
 
@@ -125,6 +128,7 @@ export class WebSocketTransport implements DeviceTransport {
         () => {
           this.active = true
           this.disconnecting = false
+          this.protocolReady = false
           this.emit({
             kind: 'transport',
             status: 'connected',
@@ -161,6 +165,7 @@ export class WebSocketTransport implements DeviceTransport {
         this.clearHandshakeProbeTimers()
         this.active = false
         this.socket = null
+        this.protocolReady = false
 
         if (!this.disconnecting) {
           this.emit({
@@ -176,6 +181,7 @@ export class WebSocketTransport implements DeviceTransport {
       this.active = false
       this.disconnecting = false
       this.clearHandshakeProbeTimers()
+      this.protocolReady = false
       this.emit({
         kind: 'transport',
         status: 'error',
@@ -189,6 +195,7 @@ export class WebSocketTransport implements DeviceTransport {
     this.disconnecting = true
     this.active = false
     this.clearHandshakeProbeTimers()
+    this.protocolReady = false
 
     if (this.socket !== null) {
       const socket = this.socket

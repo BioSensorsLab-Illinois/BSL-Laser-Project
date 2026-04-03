@@ -708,6 +708,36 @@ code {
   gap: 14px;
 }
 
+.controller-wireless-shell {
+  display: grid;
+  gap: 12px;
+}
+
+.controller-wireless-shell__summary {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  align-items: flex-start;
+  padding: 12px 14px;
+  border-radius: 16px;
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--surface-elevated) 84%, transparent);
+}
+
+.controller-wireless-shell__identity {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.controller-wireless-shell__summary .cutout-head {
+  gap: 8px;
+}
+
+.controller-wireless-shell__summary .inline-help {
+  margin: 0;
+}
+
 .panel-cutout--compact {
   padding: 16px;
 }
@@ -830,6 +860,26 @@ code {
   line-height: 1.45;
 }
 
+.field-inline-toggle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--surface-elevated) 84%, transparent);
+  color: var(--text);
+}
+
+.field-inline-toggle input {
+  margin: 0;
+}
+
+.field-inline-toggle span {
+  line-height: 1.4;
+  color: var(--text-soft);
+}
+
 .segmented {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -838,6 +888,10 @@ code {
 
 .segmented.is-three {
   grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.segmented.is-four {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
 .segmented__button,
@@ -1559,6 +1613,11 @@ code {
   background: linear-gradient(180deg, color-mix(in srgb, var(--critical-soft) 30%, var(--surface-elevated)), color-mix(in srgb, var(--line) 60%, var(--surface-soft)));
 }
 
+.gpio-state-dot.is-analog {
+  background: linear-gradient(180deg, color-mix(in srgb, var(--info) 78%, white 8%), color-mix(in srgb, var(--accent-vivid) 62%, var(--info)));
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--info-soft) 46%, transparent);
+}
+
 .gpio-mini-token {
   display: inline-flex;
   align-items: center;
@@ -1732,6 +1791,11 @@ code {
 .gpio-detail-chip.is-mode-idle,
 .gpio-detail-metric.is-mode-idle {
   border-color: color-mix(in srgb, var(--line-strong) 75%, var(--line));
+}
+
+.gpio-detail-metric.is-analog {
+  border-color: color-mix(in srgb, var(--accent) 24%, var(--info));
+  color: color-mix(in srgb, var(--accent-vivid) 48%, var(--info));
 }
 
 .gpio-risk-banner {
@@ -4345,6 +4409,456 @@ code {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
+.bringup-tec {
+  gap: 20px;
+}
+
+.bringup-ld {
+  gap: 22px;
+}
+
+.bringup-ld__lead {
+  margin: -4px 0 0;
+  max-width: 78ch;
+  color: var(--text-soft);
+  line-height: 1.6;
+}
+
+.bringup-ld__layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.05fr) minmax(380px, 0.95fr);
+  gap: 22px;
+  align-items: start;
+}
+
+.bringup-ld__panel {
+  display: grid;
+  gap: 18px;
+  padding: 20px;
+  border: 1px solid var(--line);
+  border-radius: 22px;
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--surface-elevated) 92%, transparent), var(--surface-soft)),
+    var(--surface-soft);
+}
+
+.bringup-ld__panel--live {
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--warning-soft) 24%, var(--surface-elevated)), var(--surface-soft)),
+    var(--surface-soft);
+}
+
+.bringup-ld__section-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: end;
+}
+
+.bringup-ld__section-head strong {
+  display: block;
+  font-size: 1.02rem;
+}
+
+.bringup-ld__section-head small {
+  display: block;
+  margin-top: 6px;
+  color: var(--text-soft);
+  line-height: 1.45;
+}
+
+.bringup-ld__input-grid,
+.bringup-ld__summary-strip,
+.bringup-ld__live-summary-grid,
+.bringup-ld__status-tags,
+.bringup-ld__meter-grid,
+.bringup-ld__mode-grid {
+  display: grid;
+  gap: 14px;
+}
+
+.bringup-ld__input-grid,
+.bringup-ld__summary-strip,
+.bringup-ld__live-summary-grid,
+.bringup-ld__meter-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.bringup-ld__status-tags {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.bringup-ld__mode-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.bringup-ld__mode-switch {
+  display: grid;
+  gap: 12px;
+}
+
+.bringup-ld__mode-switch--sbdn {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.bringup-ld__mode-switch--pcn {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.bringup-ld__live-summary,
+.bringup-ld__live-summary-grid > div,
+.bringup-ld__status-tag,
+.bringup-ld__meter-card,
+.bringup-ld__progress-card,
+.bringup-ld__mode-card {
+  display: grid;
+  align-content: start;
+  gap: 14px;
+  padding: 15px 16px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: color-mix(in srgb, var(--surface-elevated) 88%, transparent);
+}
+
+.bringup-ld__meter-card--register {
+  grid-column: 1 / -1;
+}
+
+.bringup-ld__live-summary span,
+.bringup-ld__live-summary-grid span,
+.bringup-ld__meter-head span,
+.bringup-ld__status-tag span {
+  display: block;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-soft);
+}
+
+.bringup-ld__live-summary strong,
+.bringup-ld__live-summary-grid strong,
+.bringup-ld__meter-head strong,
+.bringup-ld__status-tag strong,
+.bringup-ld__mode-card strong {
+  display: block;
+  margin-top: 4px;
+  font-size: 1.16rem;
+  line-height: 1.12;
+}
+
+.bringup-ld__live-summary small,
+.bringup-ld__live-summary-grid small,
+.bringup-ld__mode-card small,
+.bringup-ld__meter-card small {
+  display: block;
+  margin-top: 6px;
+  color: var(--text-soft);
+  line-height: 1.45;
+}
+
+.bringup-ld__mode-card .bringup-ld__meter-head {
+  align-items: start;
+  margin-bottom: 0;
+}
+
+.bringup-ld__mode-card strong {
+  text-align: right;
+  font-size: clamp(1rem, 1.8vw, 1.65rem);
+  line-height: 1.08;
+}
+
+.bringup-ld__mode-card small {
+  margin-top: 0;
+  min-height: 3.1em;
+}
+
+.bringup-ld__mode-card .segmented__button {
+  white-space: normal;
+  line-height: 1.2;
+}
+
+.bringup-ld__target-slider {
+  background: linear-gradient(90deg, rgba(42, 103, 73, 0.18), rgba(42, 103, 73, 0.62)) !important;
+}
+
+.bringup-ld__status-tag[data-tone='ok'] {
+  border-color: color-mix(in srgb, var(--accent-vivid) 42%, var(--line));
+  background: color-mix(in srgb, var(--accent-soft) 44%, var(--surface-elevated));
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--accent-vivid) 18%, transparent),
+    0 0 22px color-mix(in srgb, var(--accent-vivid) 14%, transparent);
+}
+
+.bringup-ld__status-tag[data-tone='warn'] {
+  border-color: color-mix(in srgb, var(--warning) 42%, var(--line));
+  background: color-mix(in srgb, var(--warning-soft) 54%, var(--surface-elevated));
+}
+
+.bringup-ld__status-tag[data-tone='off'] {
+  border-color: color-mix(in srgb, var(--line-strong) 72%, var(--line));
+  background: color-mix(in srgb, var(--surface-strong) 62%, var(--surface-elevated));
+}
+
+.bringup-ld__status-tag[data-tone='critical'] {
+  border-color: color-mix(in srgb, var(--critical) 54%, var(--line));
+  background: color-mix(in srgb, var(--critical-soft) 58%, var(--surface-elevated));
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--critical) 22%, transparent),
+    0 0 24px color-mix(in srgb, var(--critical) 18%, transparent);
+}
+
+.bringup-ld__status-tag[data-tone='ok'] strong {
+  color: var(--accent-vivid);
+}
+
+.bringup-ld__status-tag[data-tone='warn'] strong {
+  color: var(--warning);
+}
+
+.bringup-ld__status-tag[data-tone='off'] strong {
+  color: var(--text-soft);
+}
+
+.bringup-ld__status-tag[data-tone='critical'] strong {
+  color: var(--critical-strong);
+}
+
+.bringup-ld__meter-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: baseline;
+  margin-bottom: 10px;
+}
+
+.bringup-ld__meter-scale {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 8px;
+  font-family: var(--mono);
+  font-size: 0.68rem;
+  color: var(--text-soft);
+}
+
+.bringup-tec__layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.08fr) minmax(340px, 0.92fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.bringup-tec__panel {
+  display: grid;
+  gap: 16px;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 22px;
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--surface-elevated) 92%, transparent), var(--surface-soft)),
+    var(--surface-soft);
+}
+
+.bringup-tec__panel--live {
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--accent-soft) 20%, var(--surface-elevated)), var(--surface-soft)),
+    var(--surface-soft);
+}
+
+.bringup-tec__input-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.bringup-tec__target-slider {
+  background: linear-gradient(90deg, rgba(19, 80, 59, 0.18), rgba(35, 124, 92, 0.6)) !important;
+}
+
+.bringup-tec__readback-slider {
+  background: linear-gradient(90deg, rgba(93, 111, 104, 0.14), rgba(93, 111, 104, 0.3)) !important;
+  height: 10px !important;
+}
+
+.bringup-tec__readback-slider::-webkit-slider-thumb {
+  background: linear-gradient(135deg, #70877f 0%, #c7d7d0 100%) !important;
+  border-color: rgba(245, 250, 247, 0.9) !important;
+  box-shadow: 0 4px 18px rgba(91, 109, 102, 0.24) !important;
+}
+
+.bringup-tec__live-summary {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.bringup-tec__live-summary > div,
+.bringup-tec__meter-card,
+.bringup-tec__current-card {
+  padding: 15px 16px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: color-mix(in srgb, var(--surface-elevated) 88%, transparent);
+}
+
+.bringup-tec__live-summary span,
+.bringup-tec__meter-head span,
+.bringup-tec__status-tag span {
+  display: block;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-soft);
+}
+
+.bringup-tec__live-summary strong,
+.bringup-tec__meter-head strong,
+.bringup-tec__status-tag strong {
+  display: block;
+  margin-top: 4px;
+  font-size: 1.14rem;
+  line-height: 1.08;
+}
+
+.bringup-tec__live-summary small {
+  display: block;
+  margin-top: 6px;
+  color: var(--text-soft);
+  line-height: 1.45;
+}
+
+.bringup-tec__status-tags {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.bringup-tec__status-tag {
+  padding: 13px 14px;
+  border-radius: 18px;
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--surface-elevated) 86%, transparent);
+}
+
+.bringup-tec__status-tag[data-tone='ok'] {
+  border-color: color-mix(in srgb, var(--accent-vivid) 42%, var(--line));
+  background: color-mix(in srgb, var(--accent-soft) 44%, var(--surface-elevated));
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--accent-vivid) 18%, transparent),
+    0 0 22px color-mix(in srgb, var(--accent-vivid) 14%, transparent);
+}
+
+.bringup-tec__status-tag[data-tone='warn'] {
+  border-color: color-mix(in srgb, var(--warning) 42%, var(--line));
+  background: color-mix(in srgb, var(--warning-soft) 54%, var(--surface-elevated));
+}
+
+.bringup-tec__status-tag[data-tone='off'] {
+  border-color: color-mix(in srgb, var(--line-strong) 72%, var(--line));
+  background: color-mix(in srgb, var(--surface-strong) 62%, var(--surface-elevated));
+}
+
+.bringup-tec__status-tag[data-tone='ok'] strong {
+  color: var(--accent-vivid);
+}
+
+.bringup-tec__status-tag[data-tone='warn'] strong {
+  color: var(--warning);
+}
+
+.bringup-tec__status-tag[data-tone='off'] strong {
+  color: var(--text-soft);
+}
+
+.bringup-tec__meter-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.bringup-tec__meter-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: baseline;
+  margin-bottom: 10px;
+}
+
+.bringup-tec__meter-scale {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 8px;
+  font-family: var(--mono);
+  font-size: 0.68rem;
+  color: var(--text-soft);
+}
+
+.bringup-tec__meter-scale--triple span:nth-child(2) {
+  text-align: center;
+}
+
+.bringup-tec__meter-scale--triple span:last-child {
+  text-align: right;
+}
+
+.bringup-tec__current-card {
+  grid-column: 1 / -1;
+}
+
+.bringup-tec__current-bar {
+  position: relative;
+  height: 16px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: rgba(91, 107, 100, 0.12);
+  margin-top: 10px;
+}
+
+.bringup-tec__current-track {
+  position: absolute;
+  inset: 0;
+  background:
+    linear-gradient(
+      90deg,
+      rgba(104, 117, 111, 0.2) 0%,
+      rgba(104, 117, 111, 0.14) 48%,
+      rgba(104, 117, 111, 0.14) 52%,
+      rgba(104, 117, 111, 0.2) 100%
+    );
+}
+
+.bringup-tec__current-center {
+  position: absolute;
+  left: calc(50% - 1px);
+  top: 0;
+  width: 2px;
+  height: 100%;
+  background: rgba(230, 239, 235, 0.92);
+  box-shadow: 0 0 0 1px rgba(230, 239, 235, 0.18);
+}
+
+.bringup-tec__current-fill {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  border-radius: 999px;
+}
+
+.bringup-tec__current-fill.is-positive {
+  background: linear-gradient(90deg, rgba(35, 124, 92, 0.72), rgba(35, 124, 92, 0.98));
+}
+
+.bringup-tec__current-fill.is-negative {
+  background: linear-gradient(90deg, rgba(201, 121, 48, 0.98), rgba(201, 121, 48, 0.68));
+}
+
+.bringup-tec__current-fill.is-neutral {
+  background: rgba(125, 142, 135, 0.34);
+}
+
 .bringup-illumination-card {
   display: grid;
   gap: 14px;
@@ -4539,6 +5053,10 @@ code {
     flex-direction: column;
   }
 
+  .controller-wireless-shell__summary {
+    flex-direction: column;
+  }
+
   .control-module__body--split,
   .metric-grid.is-two,
   .inspector-link-summary,
@@ -4561,7 +5079,8 @@ code {
   .bringup-fact-grid,
   .bringup-profile-grid,
   .bringup-verification-grid,
-  .bringup-roster__item {
+  .bringup-roster__item,
+  .bringup-ld__section-head {
     grid-template-columns: 1fr;
     flex-direction: column;
     align-items: stretch;
@@ -4577,6 +5096,25 @@ code {
 
   .bringup-nav__meter {
     grid-column: 1 / -1;
+  }
+
+  .bringup-tec__layout,
+  .bringup-ld__layout,
+  .bringup-tec__live-summary,
+  .bringup-tec__status-tags,
+  .bringup-tec__meter-grid,
+  .bringup-tec__input-grid,
+  .bringup-ld__input-grid,
+  .bringup-ld__summary-strip,
+  .bringup-ld__live-summary-grid,
+  .bringup-ld__status-tags,
+  .bringup-ld__meter-grid,
+  .bringup-ld__mode-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .bringup-ld__mode-switch--pcn {
+    grid-template-columns: 1fr;
   }
 
   .gpio-detail-card__net {
@@ -4619,6 +5157,20 @@ code {
   .firmware-metadata,
   .metric-grid.is-two {
     grid-template-columns: 1fr;
+  }
+
+  .bringup-tec__panel,
+  .bringup-ld__panel,
+  .bringup-tec__live-summary > div,
+  .bringup-tec__meter-card,
+  .bringup-tec__current-card,
+  .bringup-ld__live-summary,
+  .bringup-ld__live-summary-grid > div,
+  .bringup-ld__status-tag,
+  .bringup-ld__meter-card,
+  .bringup-ld__progress-card,
+  .bringup-ld__mode-card {
+    padding: 14px;
   }
 
   .file-drop.is-loaded {

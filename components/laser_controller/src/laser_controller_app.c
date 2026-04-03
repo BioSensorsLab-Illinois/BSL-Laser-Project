@@ -481,6 +481,10 @@ static laser_controller_board_outputs_t laser_controller_derive_outputs(
     const laser_controller_context_t *context,
     const laser_controller_safety_decision_t *decision)
 {
+    const bool interlocks_disabled =
+        laser_controller_service_interlocks_disabled();
+    const bool nir_requested =
+        decision != NULL && decision->request_nir;
     laser_controller_board_outputs_t outputs = {
         .enable_ld_vin = false,
         .enable_tec_vin = false,
@@ -502,7 +506,8 @@ static laser_controller_board_outputs_t laser_controller_derive_outputs(
         return outputs;
     }
 
-    if (context->fault_latched || laser_controller_service_mode_requested()) {
+    if ((!interlocks_disabled && context->fault_latched) ||
+        laser_controller_service_mode_requested()) {
         return outputs;
     }
 
@@ -512,14 +517,16 @@ static laser_controller_board_outputs_t laser_controller_derive_outputs(
     }
 
     if (context->power_tier == LASER_CONTROLLER_POWER_TIER_FULL &&
-        context->last_inputs.tec_rail_pgood &&
-        context->last_inputs.tec_temp_good) {
+        (nir_requested ||
+         interlocks_disabled ||
+         (context->last_inputs.tec_rail_pgood &&
+          context->last_inputs.tec_temp_good))) {
         outputs.enable_ld_vin = true;
     }
 
     outputs.enable_alignment_laser = decision->alignment_output_enable;
-    outputs.assert_driver_standby = !decision->nir_output_enable;
-    outputs.select_driver_low_current = !decision->nir_output_enable;
+    outputs.assert_driver_standby = !nir_requested;
+    outputs.select_driver_low_current = !nir_requested;
 
     if (decision->fault_present &&
         decision->fault_class == LASER_CONTROLLER_FAULT_CLASS_SYSTEM_MAJOR) {
@@ -536,11 +543,14 @@ static laser_controller_state_t laser_controller_derive_state(
     const laser_controller_context_t *context,
     const laser_controller_safety_decision_t *decision)
 {
+    const bool interlocks_disabled =
+        laser_controller_service_interlocks_disabled();
+
     if (laser_controller_service_mode_requested()) {
         return LASER_CONTROLLER_STATE_SERVICE_MODE;
     }
 
-    if (context->fault_latched) {
+    if (context->fault_latched && !interlocks_disabled) {
         return LASER_CONTROLLER_STATE_FAULT_LATCHED;
     }
 
@@ -559,6 +569,21 @@ static laser_controller_state_t laser_controller_derive_state(
             }
             return LASER_CONTROLLER_STATE_LIMITED_POWER_IDLE;
         case LASER_CONTROLLER_POWER_TIER_FULL:
+            if (interlocks_disabled) {
+                if (decision->nir_output_enable) {
+                    return LASER_CONTROLLER_STATE_NIR_ACTIVE;
+                }
+                if (decision->alignment_output_enable) {
+                    return LASER_CONTROLLER_STATE_ALIGNMENT_ACTIVE;
+                }
+                if (decision->allow_nir) {
+                    return LASER_CONTROLLER_STATE_READY_NIR;
+                }
+                if (decision->allow_alignment) {
+                    return LASER_CONTROLLER_STATE_READY_ALIGNMENT;
+                }
+                return LASER_CONTROLLER_STATE_SAFE_IDLE;
+            }
             if (!context->last_inputs.tec_rail_pgood) {
                 return LASER_CONTROLLER_STATE_TEC_WARMUP;
             }
@@ -674,6 +699,8 @@ static void laser_controller_run_fast_cycle(laser_controller_context_t *context)
     snapshot.service_mode_requested = laser_controller_service_mode_requested();
     snapshot.service_mode_active =
         context->state_machine.current == LASER_CONTROLLER_STATE_SERVICE_MODE;
+    snapshot.interlocks_disabled =
+        laser_controller_service_interlocks_disabled();
     snapshot.allow_missing_imu =
         snapshot.service_mode_active &&
         !laser_controller_service_module_expected(LASER_CONTROLLER_MODULE_IMU);

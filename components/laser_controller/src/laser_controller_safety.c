@@ -152,6 +152,8 @@ void laser_controller_safety_evaluate(
 {
     const laser_controller_board_inputs_t *hw =
         snapshot != NULL ? snapshot->hw : NULL;
+    const bool interlocks_disabled =
+        snapshot != NULL && snapshot->interlocks_disabled;
 
     memset(decision, 0, sizeof(*decision));
     decision->driver_standby_asserted = true;
@@ -172,7 +174,8 @@ void laser_controller_safety_evaluate(
             hw->button.stage1_pressed && hw->button.stage2_pressed;
     }
 
-    if (!snapshot->allow_missing_buttons &&
+    if (!interlocks_disabled &&
+        !snapshot->allow_missing_buttons &&
         hw->button.stage2_pressed &&
         !hw->button.stage1_pressed) {
         laser_controller_set_fault(
@@ -214,7 +217,9 @@ void laser_controller_safety_evaluate(
             "brownout observed");
     }
 
-    if (!snapshot->allow_missing_imu && !hw->imu_data_valid) {
+    if (!interlocks_disabled &&
+        !snapshot->allow_missing_imu &&
+        !hw->imu_data_valid) {
         laser_controller_set_fault(
             decision,
             LASER_CONTROLLER_FAULT_IMU_INVALID,
@@ -222,7 +227,9 @@ void laser_controller_safety_evaluate(
             "imu invalid");
     }
 
-    if (!snapshot->allow_missing_imu && !hw->imu_data_fresh) {
+    if (!interlocks_disabled &&
+        !snapshot->allow_missing_imu &&
+        !hw->imu_data_fresh) {
         laser_controller_set_fault(
             decision,
             LASER_CONTROLLER_FAULT_IMU_STALE,
@@ -230,7 +237,9 @@ void laser_controller_safety_evaluate(
             "imu stale");
     }
 
-    if (!snapshot->allow_missing_tof && !hw->tof_data_valid) {
+    if (!interlocks_disabled &&
+        !snapshot->allow_missing_tof &&
+        !hw->tof_data_valid) {
         laser_controller_set_fault(
             decision,
             LASER_CONTROLLER_FAULT_TOF_INVALID,
@@ -238,7 +247,9 @@ void laser_controller_safety_evaluate(
             "tof invalid");
     }
 
-    if (!snapshot->allow_missing_tof && !hw->tof_data_fresh) {
+    if (!interlocks_disabled &&
+        !snapshot->allow_missing_tof &&
+        !hw->tof_data_fresh) {
         laser_controller_set_fault(
             decision,
             LASER_CONTROLLER_FAULT_TOF_STALE,
@@ -246,33 +257,35 @@ void laser_controller_safety_evaluate(
             "tof stale");
     }
 
-    decision->horizon_blocked =
-        snapshot->allow_missing_imu ? false :
-        laser_controller_horizon_blocked(config, snapshot);
-    if (decision->horizon_blocked) {
-        laser_controller_set_fault(
-            decision,
-            LASER_CONTROLLER_FAULT_HORIZON_CROSSED,
-            LASER_CONTROLLER_FAULT_CLASS_INTERLOCK_AUTO_CLEAR,
-            "beam pitch above horizon threshold");
-    }
+    if (!interlocks_disabled) {
+        decision->horizon_blocked =
+            snapshot->allow_missing_imu ? false :
+            laser_controller_horizon_blocked(config, snapshot);
+        if (decision->horizon_blocked) {
+            laser_controller_set_fault(
+                decision,
+                LASER_CONTROLLER_FAULT_HORIZON_CROSSED,
+                LASER_CONTROLLER_FAULT_CLASS_INTERLOCK_AUTO_CLEAR,
+                "beam pitch above horizon threshold");
+        }
 
-    decision->distance_blocked =
-        snapshot->allow_missing_tof ? false :
-        laser_controller_distance_blocked(config, snapshot);
-    if (decision->distance_blocked) {
-        laser_controller_set_fault(
-            decision,
-            LASER_CONTROLLER_FAULT_TOF_OUT_OF_RANGE,
-            LASER_CONTROLLER_FAULT_CLASS_INTERLOCK_AUTO_CLEAR,
-            "distance outside allowed window");
-    }
+        decision->distance_blocked =
+            snapshot->allow_missing_tof ? false :
+            laser_controller_distance_blocked(config, snapshot);
+        if (decision->distance_blocked) {
+            laser_controller_set_fault(
+                decision,
+                LASER_CONTROLLER_FAULT_TOF_OUT_OF_RANGE,
+                LASER_CONTROLLER_FAULT_CLASS_INTERLOCK_AUTO_CLEAR,
+                "distance outside allowed window");
+        }
 
-    if (laser_controller_thermal_supervision_active(config, snapshot)) {
-        decision->lambda_drift_blocked =
-            laser_controller_lambda_drift_blocked(config, snapshot);
-        decision->tec_temp_adc_blocked =
-            laser_controller_tec_temp_adc_blocked(config, snapshot);
+        if (laser_controller_thermal_supervision_active(config, snapshot)) {
+            decision->lambda_drift_blocked =
+                laser_controller_lambda_drift_blocked(config, snapshot);
+            decision->tec_temp_adc_blocked =
+                laser_controller_tec_temp_adc_blocked(config, snapshot);
+        }
     }
 
     if (hw->measured_laser_current_a > config->thresholds.off_current_threshold_a &&
@@ -292,7 +305,9 @@ void laser_controller_safety_evaluate(
             "laser driver overtemperature");
     }
 
-    if (hw->ld_rail_pgood && !hw->driver_loop_good) {
+    if (!interlocks_disabled &&
+        hw->ld_rail_pgood &&
+        !hw->driver_loop_good) {
         laser_controller_set_fault(
             decision,
             LASER_CONTROLLER_FAULT_LD_LOOP_BAD,
@@ -301,7 +316,7 @@ void laser_controller_safety_evaluate(
     }
 
     if (!snapshot->boot_complete ||
-        snapshot->fault_latched ||
+        (snapshot->fault_latched && !interlocks_disabled) ||
         snapshot->service_mode_requested ||
         snapshot->service_mode_active) {
         decision->allow_alignment = false;
@@ -319,10 +334,11 @@ void laser_controller_safety_evaluate(
     decision->allow_nir =
         snapshot->power_tier == LASER_CONTROLLER_POWER_TIER_FULL &&
         !decision->fault_present &&
-        hw->ld_rail_pgood &&
-        (!config->require_tec_for_nir ||
-         (hw->tec_rail_pgood && hw->tec_temp_good)) &&
-        hw->driver_loop_good;
+        (interlocks_disabled ||
+         (hw->ld_rail_pgood &&
+          (!config->require_tec_for_nir ||
+           (hw->tec_rail_pgood && hw->tec_temp_good)) &&
+          hw->driver_loop_good));
 
     if (!config->alignment_obeys_interlocks &&
         !decision->fault_present &&

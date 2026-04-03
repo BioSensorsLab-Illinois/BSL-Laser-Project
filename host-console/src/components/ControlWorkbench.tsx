@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Activity,
   Crosshair,
@@ -14,6 +14,10 @@ import {
   currentFromOpticalPowerW,
   deriveBenchEstimate,
 } from '../lib/bench-model'
+import {
+  mergeObservedBringupModules,
+  moduleMeta,
+} from '../lib/bringup'
 import { formatNumber } from '../lib/format'
 import type { RealtimeTelemetryStore } from '../lib/live-telemetry'
 import {
@@ -30,6 +34,7 @@ import type {
   BenchTargetMode,
   BringupModuleStatus,
   DeviceSnapshot,
+  ModuleKey,
   TransportKind,
   TransportStatus,
 } from '../types'
@@ -39,12 +44,17 @@ type ControlWorkbenchProps = {
   telemetryStore: RealtimeTelemetryStore
   transportKind: TransportKind
   transportStatus: TransportStatus
-  onIssueCommand: (
+  transportRecovering: boolean
+  onIssueCommandAwaitAck: (
     cmd: string,
     risk: 'read' | 'write' | 'service' | 'firmware',
     note: string,
     args?: Record<string, number | string | boolean>,
-  ) => Promise<void>
+    options?: {
+      logHistory?: boolean
+      timeoutMs?: number
+    },
+  ) => Promise<{ ok: boolean; note: string }>
 }
 
 function parseNumber(value: string, fallback: number): number {
@@ -65,20 +75,24 @@ function joinLabels(labels: string[]): string {
 
 function describeModuleAvailability(
   label: string,
-  dependencies: Array<{ label: string; status: BringupModuleStatus }>,
+  dependencies: Array<{ key: ModuleKey; label: string; status: BringupModuleStatus }>,
 ): ModuleAvailability {
   const missing = dependencies
     .filter((dependency) => !dependency.status.expectedPresent)
     .map((dependency) => dependency.label)
   const undetected = dependencies
     .filter(
-      (dependency) => dependency.status.expectedPresent && !dependency.status.detected,
+      (dependency) =>
+        dependency.status.expectedPresent &&
+        moduleMeta[dependency.key].validationMode === 'probe' &&
+        !dependency.status.detected,
     )
     .map((dependency) => dependency.label)
   const unhealthy = dependencies
     .filter(
       (dependency) =>
         dependency.status.expectedPresent &&
+        moduleMeta[dependency.key].validationMode === 'probe' &&
         dependency.status.detected &&
         !dependency.status.healthy,
     )
@@ -115,7 +129,7 @@ function describeModuleAvailability(
     available: true,
     state: 'ready',
     label: `${label} ready`,
-    detail: 'Installed modules are detected and healthy.',
+    detail: 'Installed dependencies are available for staged control.',
   }
 }
 
@@ -136,10 +150,34 @@ export function ControlWorkbench({
   telemetryStore,
   transportKind,
   transportStatus,
-  onIssueCommand,
+  transportRecovering,
+  onIssueCommandAwaitAck,
 }: ControlWorkbenchProps) {
   const liveSnapshot = useLiveSnapshot(snapshot, telemetryStore)
+  const commandReady = transportStatus === 'connected'
+  const hasLiveControllerSnapshot = snapshot.identity.firmwareVersion !== 'unavailable'
+  const connected =
+    commandReady ||
+    (hasLiveControllerSnapshot &&
+      (transportRecovering || transportStatus === 'connecting'))
   const estimate = useMemo(() => deriveBenchEstimate(liveSnapshot), [liveSnapshot])
+  const liveSbdnPin = useMemo(
+    () => liveSnapshot.gpioInspector.pins.find((pin) => pin.gpioNum === 13),
+    [liveSnapshot.gpioInspector.pins],
+  )
+  const livePcnPin = useMemo(
+    () => liveSnapshot.gpioInspector.pins.find((pin) => pin.gpioNum === 21),
+    [liveSnapshot.gpioInspector.pins],
+  )
+  const controlModules = useMemo(
+    () =>
+      mergeObservedBringupModules(
+        liveSnapshot.bringup.modules,
+        liveSnapshot,
+        connected,
+      ),
+    [connected, liveSnapshot],
+  )
   const [serviceArmed, setServiceArmed] = useState(false)
   const [autoFollowPower, setAutoFollowPower] = useState(false)
   const [laserPowerW, setLaserPowerW] = useState(() => formatNumber(estimate.commandedOpticalPowerW, 2))
@@ -153,23 +191,29 @@ export function ControlWorkbench({
   const [modulationDutyPct, setModulationDutyPct] = useState(
     String(snapshot.bench.modulationDutyCyclePct),
   )
-  const [lowStateCurrentA, setLowStateCurrentA] = useState(
-    formatNumber(snapshot.bench.lowStateCurrentA, 2),
-  )
   const lastAutoPowerRequestRef = useRef<string | null>(null)
+  const lastSyncedTecDraftRef = useRef({
+    targetMode: snapshot.bench.targetMode,
+    targetTempC: formatNumber(snapshot.tec.targetTempC, 1),
+    targetLambdaNm: formatNumber(snapshot.tec.targetLambdaNm, 1),
+  })
+  const lastSyncedModulationDraftRef = useRef({
+    enabled: snapshot.bench.modulationEnabled,
+    frequencyHz: String(snapshot.bench.modulationFrequencyHz),
+    dutyPct: String(snapshot.bench.modulationDutyCyclePct),
+  })
 
-  const connected = transportStatus === 'connected'
-  const writesDisabled = !connected || !serviceArmed
+  const writesDisabled = !commandReady || !serviceArmed
   const laserAvailability = describeModuleAvailability('Laser path', [
-    { label: 'Laser driver', status: snapshot.bringup.modules.laserDriver },
-    { label: 'DAC', status: snapshot.bringup.modules.dac },
+    { key: 'laserDriver', label: 'Laser driver', status: controlModules.laserDriver },
+    { key: 'dac', label: 'DAC', status: controlModules.dac },
   ])
   const tecAvailability = describeModuleAvailability('TEC target', [
-    { label: 'TEC loop', status: snapshot.bringup.modules.tec },
-    { label: 'DAC', status: snapshot.bringup.modules.dac },
+    { key: 'tec', label: 'TEC loop', status: controlModules.tec },
+    { key: 'dac', label: 'DAC', status: controlModules.dac },
   ])
   const modulationAvailability = describeModuleAvailability('PCN modulation', [
-    { label: 'Laser driver', status: snapshot.bringup.modules.laserDriver },
+    { key: 'laserDriver', label: 'Laser driver', status: controlModules.laserDriver },
   ])
   const laserInteractDisabled = writesDisabled || !laserAvailability.available
   const tecInteractDisabled = writesDisabled || !tecAvailability.available
@@ -185,24 +229,124 @@ export function ControlWorkbench({
   const requestedPowerW = Math.min(5, Math.max(0, parseNumber(laserPowerW, estimate.commandedOpticalPowerW)))
   const requestedTempC =
     targetMode === 'temp'
-      ? clampTecTempC(parseNumber(targetTempC, snapshot.tec.targetTempC))
-      : estimateTempFromWavelengthNm(parseNumber(targetLambdaNm, snapshot.tec.targetLambdaNm))
+      ? clampTecTempC(parseNumber(targetTempC, liveSnapshot.tec.targetTempC))
+      : estimateTempFromWavelengthNm(parseNumber(targetLambdaNm, liveSnapshot.tec.targetLambdaNm))
   const requestedLambdaNm =
     targetMode === 'lambda'
-      ? clampTecWavelengthNm(parseNumber(targetLambdaNm, snapshot.tec.targetLambdaNm))
-      : estimateWavelengthFromTempC(parseNumber(targetTempC, snapshot.tec.targetTempC))
+      ? clampTecWavelengthNm(parseNumber(targetLambdaNm, liveSnapshot.tec.targetLambdaNm))
+      : estimateWavelengthFromTempC(parseNumber(targetTempC, liveSnapshot.tec.targetTempC))
   const requestedDutyPct = Math.min(
-    99,
-    Math.max(1, parseNumber(modulationDutyPct, snapshot.bench.modulationDutyCyclePct)),
+    100,
+    Math.max(0, parseNumber(modulationDutyPct, liveSnapshot.bench.modulationDutyCyclePct)),
   )
   const requestedFrequencyHz = Math.min(
-    50000,
-    Math.max(10, parseNumber(modulationFrequencyHz, snapshot.bench.modulationFrequencyHz)),
+    4000,
+    Math.max(0, parseNumber(modulationFrequencyHz, liveSnapshot.bench.modulationFrequencyHz)),
   )
-  const requestedLowStateCurrentA = Math.min(
-    currentFromOpticalPowerW(requestedPowerW),
-    Math.max(0, parseNumber(lowStateCurrentA, snapshot.bench.lowStateCurrentA)),
+  const nirRequested = liveSnapshot.bench.requestedNirEnabled
+  const nirActive = liveSnapshot.laser.nirEnabled
+  const alignmentRequested = liveSnapshot.bench.requestedAlignmentEnabled
+  const alignmentActive = liveSnapshot.laser.alignmentEnabled
+  const sbdnHigh = (liveSbdnPin?.outputEnabled ?? false) && (liveSbdnPin?.levelHigh ?? false)
+  const pcnHigh = (livePcnPin?.outputEnabled ?? false) && (livePcnPin?.levelHigh ?? false)
+  const runtimeControlNeedsServiceExit =
+    liveSnapshot.bringup.serviceModeRequested || liveSnapshot.bringup.serviceModeActive
+  const nirActionCmd = nirRequested || nirActive ? 'laser_output_disable' : 'laser_output_enable'
+  const nirActionLabel = nirRequested || nirActive ? 'Disable NIR Laser' : 'Enable NIR Laser'
+  const nirActionTitle = nirActive
+    ? 'Drop the NIR output request and return the beam path safe.'
+    : 'Request NIR output through the normal runtime safety gate. If bring-up service control is still active, this page will hand ownership back to runtime first.'
+  const alignmentActionCmd =
+    alignmentRequested || alignmentActive ? 'disable_alignment' : 'enable_alignment'
+  const alignmentActionLabel =
+    alignmentRequested || alignmentActive ? 'Disable Green Laser' : 'Enable Green Laser'
+  const alignmentActionTitle =
+    alignmentRequested || alignmentActive
+      ? 'Drop the green alignment request and return the alignment path safe.'
+      : 'Request the green alignment laser through the normal runtime safety gate. If bring-up service control is still active, this page will hand ownership back to runtime first.'
+
+  const issueRuntimeControlCommand = useCallback(
+    async (
+      cmd: string,
+      risk: 'read' | 'write' | 'service' | 'firmware',
+      note: string,
+      args?: Record<string, number | string | boolean>,
+    ) => {
+      if (liveSnapshot.bringup.serviceModeRequested || liveSnapshot.bringup.serviceModeActive) {
+        const exitResult = await onIssueCommandAwaitAck(
+          'exit_service_mode',
+          'service',
+          'Exit service mode so runtime control can reclaim DAC, rail, and laser-path ownership from bring-up overrides.',
+        )
+        if (!exitResult.ok) {
+          return exitResult
+        }
+      }
+
+      return onIssueCommandAwaitAck(cmd, risk, note, args)
+    },
+    [
+      liveSnapshot.bringup.serviceModeActive,
+      liveSnapshot.bringup.serviceModeRequested,
+      onIssueCommandAwaitAck,
+    ],
   )
+
+  useEffect(() => {
+    const next = {
+      targetMode: liveSnapshot.bench.targetMode,
+      targetTempC: formatNumber(liveSnapshot.tec.targetTempC, 1),
+      targetLambdaNm: formatNumber(liveSnapshot.tec.targetLambdaNm, 1),
+    }
+    const previous = lastSyncedTecDraftRef.current
+
+    if (targetMode === previous.targetMode) {
+      setTargetMode(next.targetMode)
+    }
+    if (targetTempC === previous.targetTempC) {
+      setTargetTempC(next.targetTempC)
+    }
+    if (targetLambdaNm === previous.targetLambdaNm) {
+      setTargetLambdaNm(next.targetLambdaNm)
+    }
+
+    lastSyncedTecDraftRef.current = next
+  }, [
+    liveSnapshot.bench.targetMode,
+    liveSnapshot.tec.targetLambdaNm,
+    liveSnapshot.tec.targetTempC,
+    targetLambdaNm,
+    targetMode,
+    targetTempC,
+  ])
+
+  useEffect(() => {
+    const next = {
+      enabled: liveSnapshot.bench.modulationEnabled,
+      frequencyHz: String(liveSnapshot.bench.modulationFrequencyHz),
+      dutyPct: String(liveSnapshot.bench.modulationDutyCyclePct),
+    }
+    const previous = lastSyncedModulationDraftRef.current
+
+    if (modulationEnabled === previous.enabled) {
+      setModulationEnabled(next.enabled)
+    }
+    if (modulationFrequencyHz === previous.frequencyHz) {
+      setModulationFrequencyHz(next.frequencyHz)
+    }
+    if (modulationDutyPct === previous.dutyPct) {
+      setModulationDutyPct(next.dutyPct)
+    }
+
+    lastSyncedModulationDraftRef.current = next
+  }, [
+    liveSnapshot.bench.modulationDutyCyclePct,
+    liveSnapshot.bench.modulationEnabled,
+    liveSnapshot.bench.modulationFrequencyHz,
+    modulationDutyPct,
+    modulationEnabled,
+    modulationFrequencyHz,
+  ])
 
   useEffect(() => {
     if (!autoFollowPower || writesDisabled) {
@@ -223,7 +367,7 @@ export function ControlWorkbench({
 
     const timerId = window.setTimeout(() => {
       lastAutoPowerRequestRef.current = requestKey
-      void onIssueCommand(
+      void issueRuntimeControlCommand(
         'set_laser_power',
         'write',
         'Auto-follow laser power from the host slider without a separate apply step.',
@@ -239,8 +383,8 @@ export function ControlWorkbench({
     }
   }, [
     autoFollowPower,
+    issueRuntimeControlCommand,
     liveSnapshot.laser.commandedCurrentA,
-    onIssueCommand,
     requestedPowerW,
     writesDisabled,
   ])
@@ -260,12 +404,14 @@ export function ControlWorkbench({
       <div className="control-banner">
         <div className="control-banner__copy">
           <strong>
-            {transportKind === 'mock' ? 'Mock rig is writable.' : 'Live board writes stay service-gated.'}
+            {transportKind === 'mock' ? 'Mock rig is writable.' : 'Live board writes stay locally armed.'}
           </strong>
           <p>
             {transportKind === 'mock'
               ? 'Use this to rehearse the control flow before the full hardware stack is populated.'
-              : 'Use service mode for writes. The GUI expresses intent only; the firmware can still block output.'}
+              : runtimeControlNeedsServiceExit
+                ? 'Bring-up service ownership is still active. Control-page writes will first return ownership to the runtime controller, then apply the new request.'
+                : 'Runtime control requests can be sent without service mode. The GUI expresses intent only; the firmware can still block output.'}
           </p>
         </div>
 
@@ -274,17 +420,17 @@ export function ControlWorkbench({
             <Activity size={14} />
             Link {connected ? 'ready' : 'offline'}
           </span>
-          <span className={snapshot.bringup.serviceModeActive ? 'status-badge is-on' : 'status-badge'}>
+          <span className={liveSnapshot.bringup.serviceModeActive ? 'status-badge is-on' : 'status-badge'}>
             <ShieldAlert size={14} />
-            Service {snapshot.bringup.serviceModeActive ? 'active' : 'required'}
+            Service {liveSnapshot.bringup.serviceModeActive ? 'active' : 'optional'}
           </span>
-          <span className={snapshot.rails.ld.pgood ? 'status-badge is-on' : 'status-badge is-warn'}>
+          <span className={liveSnapshot.rails.ld.pgood ? 'status-badge is-on' : 'status-badge is-warn'}>
             <Zap size={14} />
-            LD rail {snapshot.rails.ld.pgood ? 'PGOOD' : 'waiting'}
+            LD rail {liveSnapshot.rails.ld.pgood ? 'PGOOD' : 'waiting'}
           </span>
-          <span className={snapshot.rails.tec.pgood ? 'status-badge is-on' : 'status-badge is-warn'}>
+          <span className={liveSnapshot.rails.tec.pgood ? 'status-badge is-on' : 'status-badge is-warn'}>
             <Thermometer size={14} />
-            TEC rail {snapshot.rails.tec.pgood ? 'PGOOD' : 'waiting'}
+            TEC rail {liveSnapshot.rails.tec.pgood ? 'PGOOD' : 'waiting'}
           </span>
         </div>
 
@@ -293,9 +439,9 @@ export function ControlWorkbench({
             type="button"
             className="action-button is-inline"
             title="Request service mode so bench-control mutations are accepted."
-            disabled={!connected || snapshot.bringup.serviceModeActive}
+            disabled={!connected || liveSnapshot.bringup.serviceModeActive}
             onClick={() =>
-              onIssueCommand(
+              onIssueCommandAwaitAck(
                 'enter_service_mode',
                 'service',
                 'Enter service mode before bench-side control and tuning.',
@@ -308,9 +454,9 @@ export function ControlWorkbench({
             type="button"
             className="action-button is-inline"
             title="Leave service mode and return to normal safe supervision."
-            disabled={!connected || !snapshot.bringup.serviceModeActive}
+            disabled={!connected || !liveSnapshot.bringup.serviceModeActive}
             onClick={() =>
-              onIssueCommand(
+              onIssueCommandAwaitAck(
                 'exit_service_mode',
                 'service',
                 'Exit service mode and return to normal safe supervision.',
@@ -389,7 +535,7 @@ export function ControlWorkbench({
                   />
                   <span className="inline-help">
                     ~{formatNumber(currentFromOpticalPowerW(requestedPowerW), 2)} A at 3.0 V on the diode, capped by a
-                    {` ${formatNumber(snapshot.safety.maxLaserCurrentA, 2)} A`} safety limit.
+                    {` ${formatNumber(liveSnapshot.safety.maxLaserCurrentA, 2)} A`} safety limit.
                   </span>
                 </div>
               </div>
@@ -401,10 +547,10 @@ export function ControlWorkbench({
                   title="Apply the current power setting once."
                   disabled={laserInteractDisabled}
                   onClick={() =>
-                    onIssueCommand(
+                    issueRuntimeControlCommand(
                       'set_laser_power',
                       'write',
-                      'Update the high-state laser power setpoint for bench testing.',
+                      'Return ownership from bring-up service mode if needed, then update the high-state laser power setpoint for bench testing.',
                       {
                         optical_power_w: requestedPowerW,
                         current_a: currentFromOpticalPowerW(requestedPowerW),
@@ -417,102 +563,104 @@ export function ControlWorkbench({
                 <button
                   type="button"
                   className="action-button is-inline is-accent"
-                  title="Request NIR output through the firmware safety gate."
+                  title={nirActionTitle}
                   disabled={laserInteractDisabled}
                   onClick={() =>
-                    onIssueCommand(
-                      'laser_output_enable',
-                      'service',
-                      'Request NIR laser enable through the firmware gate.',
-                    )
-                  }
-                >
-                  Enable NIR Laser
-                </button>
-                <button
-                  type="button"
-                  className="action-button is-inline"
-                  title="Force the host-side NIR request low."
-                  disabled={!connected || !laserAvailability.available}
-                  onClick={() =>
-                    onIssueCommand(
-                      'laser_output_disable',
+                    issueRuntimeControlCommand(
+                      nirActionCmd,
                       'write',
-                      'Drop the NIR output request and return the beam path safe.',
+                      nirRequested || nirActive
+                        ? 'Drop the NIR output request and return the beam path safe.'
+                        : 'Return ownership from bring-up service mode if needed, then request NIR laser enable through the runtime safety gate.',
                     )
                   }
                 >
-                  Laser safe off
+                  {nirActionLabel}
                 </button>
                 <button
                   type="button"
                   className="action-button is-inline"
-                  title="Request the green alignment laser for terminated bench aiming checks."
+                  title={alignmentActionTitle}
                   disabled={laserInteractDisabled}
                   onClick={() =>
-                    onIssueCommand(
-                      'enable_alignment',
-                      'service',
-                      'Request the green alignment laser for terminated bench aiming checks.',
-                    )
-                  }
-                >
-                  Green laser on
-                </button>
-                <button
-                  type="button"
-                  className="action-button is-inline"
-                  title="Drop any host-requested green alignment laser output."
-                  disabled={!connected || !laserAvailability.available}
-                  onClick={() =>
-                    onIssueCommand(
-                      'disable_alignment',
+                    issueRuntimeControlCommand(
+                      alignmentActionCmd,
                       'write',
-                      'Drop any host-requested green alignment laser output.',
+                      alignmentRequested || alignmentActive
+                        ? 'Drop any host-requested green alignment laser output.'
+                        : 'Return ownership from bring-up service mode if needed, then request the green alignment laser for terminated bench aiming checks.',
                     )
                   }
                 >
-                  Green laser off
+                  {alignmentActionLabel}
                 </button>
               </div>
             </div>
 
             <div className={laserAvailability.available ? 'control-module__column' : 'control-module__column is-muted'}>
               <div className="status-badges is-stack">
-                <span className={snapshot.safety.allowNir ? 'status-badge is-on' : 'status-badge is-warn'}>
+                <span className={liveSnapshot.safety.allowNir ? 'status-badge is-on' : 'status-badge is-warn'}>
                   <ScanLine size={14} />
-                  NIR laser {snapshot.safety.allowNir ? 'permitted' : 'blocked'}
+                  NIR laser {liveSnapshot.safety.allowNir ? 'permitted' : 'blocked'}
                 </span>
-                <span className={snapshot.laser.loopGood ? 'status-badge is-on' : 'status-badge is-warn'}>
+                <span className={alignmentRequested ? 'status-badge is-on' : 'status-badge'}>
+                  <Crosshair size={14} />
+                  Green request {alignmentRequested ? 'staged' : 'clear'}
+                </span>
+                <span className={liveSnapshot.bench.requestedNirEnabled ? 'status-badge is-on' : 'status-badge'}>
+                  <Activity size={14} />
+                  NIR request {liveSnapshot.bench.requestedNirEnabled ? 'staged' : 'clear'}
+                </span>
+                <span className={liveSnapshot.laser.loopGood ? 'status-badge is-on' : 'status-badge is-warn'}>
                   <Sparkles size={14} />
-                  Loop {snapshot.laser.loopGood ? 'good' : 'degraded'}
+                  Loop {liveSnapshot.laser.loopGood ? 'good' : 'degraded'}
                 </span>
-                <span className={snapshot.rails.ld.pgood ? 'status-badge is-on' : 'status-badge is-warn'}>
+                <span className={liveSnapshot.rails.ld.enabled ? 'status-badge is-on' : 'status-badge is-warn'}>
                   <Zap size={14} />
-                  LD rail {snapshot.rails.ld.pgood ? 'good' : 'not good'}
+                  LD rail {liveSnapshot.rails.ld.enabled ? 'enabled' : 'off'}
+                </span>
+                <span className={liveSnapshot.rails.ld.pgood ? 'status-badge is-on' : 'status-badge is-warn'}>
+                  <Zap size={14} />
+                  LD rail {liveSnapshot.rails.ld.pgood ? 'good' : 'not good'}
+                </span>
+                <span className={liveSnapshot.rails.tec.enabled ? 'status-badge is-on' : 'status-badge is-warn'}>
+                  <Thermometer size={14} />
+                  TEC rail {liveSnapshot.rails.tec.enabled ? 'enabled' : 'off'}
+                </span>
+                <span className={liveSnapshot.rails.tec.pgood ? 'status-badge is-on' : 'status-badge is-warn'}>
+                  <Thermometer size={14} />
+                  TEC rail {liveSnapshot.rails.tec.pgood ? 'good' : 'not good'}
+                </span>
+                <span className={sbdnHigh ? 'status-badge is-on' : 'status-badge is-warn'}>
+                  <ScanLine size={14} />
+                  SBDN {sbdnHigh ? 'high' : 'not high'}
+                </span>
+                <span className={pcnHigh ? 'status-badge is-on' : 'status-badge is-warn'}>
+                  <Waves size={14} />
+                  PCN {pcnHigh ? 'high' : 'not high'}
                 </span>
               </div>
 
               <div className="metric-grid is-two">
                 <div className="metric-card">
                   <span>Commanded current</span>
-                  <strong>{formatNumber(snapshot.laser.commandedCurrentA, 2)} A</strong>
+                  <strong>{formatNumber(liveSnapshot.laser.commandedCurrentA, 2)} A</strong>
                   <small>host requested high-state current</small>
                 </div>
                 <div className="metric-card">
                   <span>Measured current</span>
-                  <strong>{formatNumber(snapshot.laser.measuredCurrentA, 2)} A</strong>
+                  <strong>{formatNumber(liveSnapshot.laser.measuredCurrentA, 2)} A</strong>
                   <small>driver monitor readback</small>
                 </div>
                 <div className="metric-card">
                   <span>Optical estimate</span>
                   <strong>{formatNumber(estimate.averageOpticalPowerW, 2)} W</strong>
-                  <small>{snapshot.laser.nirEnabled ? 'beam request active' : 'beam path safe'}</small>
+                  <small>{liveSnapshot.laser.nirEnabled ? 'beam request active' : nirRequested ? 'request staged, waiting on prerequisites' : 'beam path safe'}</small>
                 </div>
                 <div className="metric-card">
                   <span>Driver temp</span>
-                  <strong>{formatNumber(snapshot.laser.driverTempC, 1)} °C</strong>
-                  <small>{snapshot.laser.driverStandby ? 'standby asserted' : 'standby released'}</small>
+                  <strong>{formatNumber(liveSnapshot.laser.driverTempC, 1)} °C</strong>
+                  <small>{liveSnapshot.laser.driverStandby ? 'standby asserted' : 'standby released'}</small>
                 </div>
               </div>
             </div>
@@ -563,9 +711,9 @@ export function ControlWorkbench({
                   disabled={!tecAvailability.available}
                   title="Overwrite the editor with the latest live controller targets."
                   onClick={() => {
-                    setTargetMode(snapshot.bench.targetMode)
-                    setTargetLambdaNm(formatNumber(snapshot.tec.targetLambdaNm, 1))
-                    setTargetTempC(formatNumber(snapshot.tec.targetTempC, 1))
+                    setTargetMode(liveSnapshot.bench.targetMode)
+                    setTargetLambdaNm(formatNumber(liveSnapshot.tec.targetLambdaNm, 1))
+                    setTargetTempC(formatNumber(liveSnapshot.tec.targetTempC, 1))
                   }}
                 >
                   Sync live
@@ -645,16 +793,16 @@ export function ControlWorkbench({
                 disabled={tecInteractDisabled}
                 onClick={() =>
                   targetMode === 'lambda'
-                    ? onIssueCommand(
+                    ? issueRuntimeControlCommand(
                         'set_target_lambda',
                         'write',
-                        'Set the wavelength target from the host bench panel.',
+                        'Return ownership from bring-up service mode if needed, then set the wavelength target from the host bench panel.',
                         { lambda_nm: requestedLambdaNm },
                       )
-                    : onIssueCommand(
+                    : issueRuntimeControlCommand(
                         'set_target_temp',
                         'write',
-                        'Set the TEC temperature target from the host bench panel.',
+                        'Return ownership from bring-up service mode if needed, then set the TEC temperature target from the host bench panel.',
                         { temp_c: requestedTempC },
                       )
                 }
@@ -667,23 +815,23 @@ export function ControlWorkbench({
               <div className="metric-grid is-two">
                 <div className="metric-card">
                   <span>Actual lambda</span>
-                  <strong>{formatNumber(snapshot.tec.actualLambdaNm, 2)} nm</strong>
-                  <small>{formatNumber(snapshot.safety.lambdaDriftNm, 2)} nm drift from target</small>
+                  <strong>{formatNumber(liveSnapshot.tec.actualLambdaNm, 2)} nm</strong>
+                  <small>{formatNumber(liveSnapshot.safety.lambdaDriftNm, 2)} nm drift from target</small>
                 </div>
                 <div className="metric-card">
                   <span>TEC temp</span>
-                  <strong>{formatNumber(snapshot.tec.tempC, 2)} °C</strong>
-                  <small>{snapshot.tec.tempGood ? 'settled' : 'still settling'}</small>
+                  <strong>{formatNumber(liveSnapshot.tec.tempC, 2)} °C</strong>
+                  <small>{liveSnapshot.tec.tempGood ? 'settled' : 'still settling'}</small>
                 </div>
                 <div className="metric-card">
                   <span>Temp ADC</span>
-                  <strong>{formatNumber(snapshot.tec.tempAdcVoltageV, 3)} V</strong>
-                  <small>trip at {formatNumber(snapshot.safety.tecTempAdcTripV, 3)} V</small>
+                  <strong>{formatNumber(liveSnapshot.tec.tempAdcVoltageV, 3)} V</strong>
+                  <small>trip at {formatNumber(liveSnapshot.safety.tecTempAdcTripV, 3)} V</small>
                 </div>
                 <div className="metric-card">
                   <span>TEC rail</span>
-                  <strong>{snapshot.rails.tec.pgood ? 'PGOOD' : 'Waiting'}</strong>
-                  <small>{formatNumber(snapshot.tec.voltageV, 2)} V at {formatNumber(snapshot.tec.currentA, 2)} A</small>
+                  <strong>{liveSnapshot.rails.tec.pgood ? 'PGOOD' : 'Waiting'}</strong>
+                  <small>{formatNumber(liveSnapshot.tec.voltageV, 2)} V at {formatNumber(liveSnapshot.tec.currentA, 2)} A</small>
                 </div>
               </div>
             </div>
@@ -696,7 +844,7 @@ export function ControlWorkbench({
               <Waves size={16} />
               <strong>PCN modulation</strong>
             </div>
-            <HelpHint text="Bench PWM by switching between LISH and LISL using the PCN pin. This is staged through the firmware so the hard safety path still owns SBDN." />
+            <HelpHint text="Bench PWM on the PCN pin. On this board LISL is fixed at ground, so modulation only stages enable, frequency, and duty. When modulation is off, PCN returns to normal digital high or low control." />
           </div>
 
           <div className="control-module__banner">
@@ -715,35 +863,27 @@ export function ControlWorkbench({
                 disabled={!modulationAvailability.available}
                 onChange={(event) => setModulationEnabled(event.target.checked)}
               />
-              <span>Switch between LISH and LISL using the PCN pin for bench PWM testing.</span>
+              <span>Use PWM on PCN for LD bench modulation. LISL stays fixed low on this board.</span>
             </label>
 
             <div className="field-grid">
               <label className="field">
-                <span>Frequency (Hz)</span>
-                <input
-                  type="number"
-                  min="10"
-                  max="50000"
-                  step="10"
-                  value={modulationFrequencyHz}
-                  disabled={!modulationAvailability.available}
-                  title="Set the PCN modulation frequency in hertz."
-                  onChange={(event) => setModulationFrequencyHz(event.target.value)}
-                />
-              </label>
-              <label className="field">
-                <span>LISL current (A)</span>
+                <span>Frequency (DC to 4 kHz)</span>
                 <input
                   type="number"
                   min="0"
-                  max={currentFromOpticalPowerW(requestedPowerW)}
-                  step="0.05"
-                  value={lowStateCurrentA}
+                  max="4000"
+                  step="1"
+                  value={modulationFrequencyHz}
                   disabled={!modulationAvailability.available}
-                  title="Set the low-state current used when PCN selects LISL."
-                  onChange={(event) => setLowStateCurrentA(event.target.value)}
+                  title="Set the PCN modulation frequency. Use 0 for a DC/static leg selection."
+                  onChange={(event) => setModulationFrequencyHz(event.target.value)}
                 />
+                <span className="inline-help">
+                  {requestedFrequencyHz === 0
+                    ? 'DC mode. Duty below 50% drives LISL/low, 50% or above drives LISH/high.'
+                    : 'PWM mode. GPIO21 is temporarily owned by the hardware PWM block during modulation.'}
+                </span>
               </label>
             </div>
 
@@ -754,8 +894,8 @@ export function ControlWorkbench({
               </div>
               <input
                 type="range"
-                min="1"
-                max="99"
+                min="0"
+                max="100"
                 step="1"
                 value={requestedDutyPct}
                 disabled={!modulationAvailability.available}
@@ -770,15 +910,14 @@ export function ControlWorkbench({
               title="Apply the staged PCN modulation profile."
               disabled={modulationInteractDisabled}
               onClick={() =>
-                onIssueCommand(
+                issueRuntimeControlCommand(
                   'configure_modulation',
                   'write',
-                  'Configure PCN-based high/low current modulation from the host bench panel.',
+                  'Return ownership from bring-up service mode if needed, then configure PCN PWM modulation from the host bench panel.',
                   {
                     enabled: modulationEnabled,
                     frequency_hz: requestedFrequencyHz,
                     duty_cycle_pct: requestedDutyPct,
-                    low_current_a: requestedLowStateCurrentA,
                   },
                 )
               }
@@ -801,7 +940,7 @@ export function ControlWorkbench({
             <div className={laserAvailability.available ? 'metric-card' : 'metric-card is-muted'}>
               <span>Optical output</span>
               <strong>{formatNumber(estimate.averageOpticalPowerW, 2)} W</strong>
-              <small>{snapshot.laser.nirEnabled ? 'average live output' : 'beam path off'}</small>
+              <small>{liveSnapshot.laser.nirEnabled ? 'average live output' : 'beam path off'}</small>
             </div>
             <div className={laserAvailability.available ? 'metric-card' : 'metric-card is-muted'}>
               <span>Laser electrical</span>
@@ -816,7 +955,7 @@ export function ControlWorkbench({
             <div className={tecAvailability.available ? 'metric-card' : 'metric-card is-muted'}>
               <span>TEC electrical</span>
               <strong>{formatNumber(estimate.tecElectricalPowerW, 2)} W</strong>
-              <small>{formatNumber(snapshot.tec.currentA, 2)} A × {formatNumber(snapshot.tec.voltageV, 2)} V</small>
+              <small>{formatNumber(liveSnapshot.tec.currentA, 2)} A × {formatNumber(liveSnapshot.tec.voltageV, 2)} V</small>
             </div>
             <div className={tecAvailability.available ? 'metric-card' : 'metric-card is-muted'}>
               <span>TEC cooling power</span>
@@ -831,29 +970,29 @@ export function ControlWorkbench({
           </div>
 
           <div className="status-badges">
-            <span className={laserAvailability.available ? snapshot.laser.nirEnabled ? 'status-badge is-on' : 'status-badge' : 'status-badge is-off'}>
+            <span className={laserAvailability.available ? liveSnapshot.laser.nirEnabled ? 'status-badge is-on' : 'status-badge' : 'status-badge is-off'}>
               <ScanLine size={14} />
-              NIR laser {snapshot.laser.nirEnabled ? 'on' : 'off'}
+              NIR laser {liveSnapshot.laser.nirEnabled ? 'on' : 'off'}
             </span>
-            <span className={laserAvailability.available ? snapshot.laser.alignmentEnabled ? 'status-badge is-on' : 'status-badge' : 'status-badge is-off'}>
+            <span className={laserAvailability.available ? alignmentActive ? 'status-badge is-on' : 'status-badge' : 'status-badge is-off'}>
               <Crosshair size={14} />
-              Green laser {snapshot.laser.alignmentEnabled ? 'on' : 'off'}
+              Green laser {alignmentActive ? 'on' : 'off'}
             </span>
-            <span className={tecAvailability.available ? snapshot.tec.tempGood ? 'status-badge is-on' : 'status-badge is-warn' : 'status-badge is-off'}>
+            <span className={tecAvailability.available ? liveSnapshot.tec.tempGood ? 'status-badge is-on' : 'status-badge is-warn' : 'status-badge is-off'}>
               <Thermometer size={14} />
-              TEC {snapshot.tec.tempGood ? 'settled' : 'settling'}
+              TEC {liveSnapshot.tec.tempGood ? 'settled' : 'settling'}
             </span>
-            <span className={tecAvailability.available ? snapshot.safety.lambdaDriftBlocked ? 'status-badge is-warn' : 'status-badge is-on' : 'status-badge is-off'}>
+            <span className={tecAvailability.available ? liveSnapshot.safety.lambdaDriftBlocked ? 'status-badge is-warn' : 'status-badge is-on' : 'status-badge is-off'}>
               <Sparkles size={14} />
-              Lambda drift {snapshot.safety.lambdaDriftBlocked ? 'tripped' : 'stable'}
+              Lambda drift {liveSnapshot.safety.lambdaDriftBlocked ? 'tripped' : 'stable'}
             </span>
-            <span className={tecAvailability.available ? snapshot.safety.tecTempAdcBlocked ? 'status-badge is-warn' : 'status-badge is-on' : 'status-badge is-off'}>
+            <span className={tecAvailability.available ? liveSnapshot.safety.tecTempAdcBlocked ? 'status-badge is-warn' : 'status-badge is-on' : 'status-badge is-off'}>
               <Thermometer size={14} />
-              Temp ADC {snapshot.safety.tecTempAdcBlocked ? 'high' : 'clear'}
+              Temp ADC {liveSnapshot.safety.tecTempAdcBlocked ? 'high' : 'clear'}
             </span>
-            <span className={snapshot.fault.latched ? 'status-badge is-critical' : 'status-badge is-on'}>
+            <span className={liveSnapshot.fault.latched ? 'status-badge is-critical' : 'status-badge is-on'}>
               <ShieldAlert size={14} />
-              Fault {snapshot.fault.latched ? snapshot.fault.activeCode : snapshot.fault.activeCode === 'none' ? 'clear' : snapshot.fault.activeCode}
+              Fault {liveSnapshot.fault.latched ? liveSnapshot.fault.activeCode : liveSnapshot.fault.activeCode === 'none' ? 'clear' : liveSnapshot.fault.activeCode}
             </span>
           </div>
         </article>

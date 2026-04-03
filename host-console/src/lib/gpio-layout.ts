@@ -10,7 +10,10 @@ export type GpioModuleSignalClass =
   | 'usb'
   | 'debug'
 
-export type GpioAnalogTelemetry = 'tecTempAdc'
+export type GpioAnalogTelemetry =
+  | 'tecTempAdc'
+  | 'ldCurrentMonitor'
+  | 'ldDriverTemp'
 
 export type GpioModulePinMeta = {
   gpioNum: number
@@ -59,8 +62,8 @@ export const gpioModulePins: GpioModulePinMeta[] = [
   { gpioNum: 42, modulePin: 35, side: 'right', signalClass: 'control', netName: 'IMU_INT2', label: 'IMU INT2', detail: 'IMU interrupt/data-ready assist input.' },
   { gpioNum: 44, modulePin: 36, side: 'right', signalClass: 'debug', netName: 'ESP_RX', label: 'UART0 RX', detail: 'Onboard debug UART RX.', riskNote: 'Overriding debug UART pins can break wired debug sessions.' },
   { gpioNum: 43, modulePin: 37, side: 'right', signalClass: 'debug', netName: 'ESP_TX', label: 'UART0 TX', detail: 'Onboard debug UART TX.', riskNote: 'Overriding debug UART pins can break wired debug sessions.' },
-  { gpioNum: 2, modulePin: 38, side: 'right', signalClass: 'analog', netName: 'LD_LIO', label: 'Laser current monitor', detail: 'Analog laser current telemetry input.' },
-  { gpioNum: 1, modulePin: 39, side: 'right', signalClass: 'analog', netName: 'LD_TMO', label: 'Laser temp monitor', detail: 'Analog laser driver temperature input.' },
+  { gpioNum: 2, modulePin: 38, side: 'right', signalClass: 'analog', netName: 'LD_LIO', label: 'Laser current monitor', detail: 'Analog laser current telemetry input.', analogTelemetry: 'ldCurrentMonitor' },
+  { gpioNum: 1, modulePin: 39, side: 'right', signalClass: 'analog', netName: 'LD_TMO', label: 'Laser temp monitor', detail: 'Analog laser driver temperature input.', analogTelemetry: 'ldDriverTemp' },
 ]
 
 export function makeDefaultGpioInspectorStatus(): GpioInspectorStatus {

@@ -3,7 +3,11 @@ import { useEffect, useRef, useState } from 'react'
 import { useLiveSnapshot } from '../hooks/use-live-snapshot'
 import type { RealtimeTelemetryStore } from '../lib/live-telemetry'
 import { formatNumber } from '../lib/format'
-import { computePitchMarginPercent } from '../lib/presentation'
+import {
+  computePitchMarginPercent,
+  getHorizonPitchClearDeg,
+  getHorizonPitchLimitDeg,
+} from '../lib/presentation'
 import { ProgressMeter } from './ProgressMeter'
 import type { DeviceSnapshot } from '../types'
 
@@ -55,12 +59,12 @@ export function ImuPostureCard({
   const liveSnapshot = useLiveSnapshot(snapshot, telemetryStore)
   const pitchDeg = liveSnapshot.imu.beamPitchDeg
   const rollDeg = liveSnapshot.imu.beamRollDeg
-  const pitchLimitDeg = liveSnapshot.imu.beamPitchLimitDeg
-  const marginDeg = pitchLimitDeg - pitchDeg
+  const pitchLimitDeg = getHorizonPitchLimitDeg(liveSnapshot)
+  const clearPitchDeg = getHorizonPitchClearDeg(liveSnapshot)
   const pitchMarginPercent = computePitchMarginPercent(liveSnapshot)
   const streamReady = liveSnapshot.imu.valid && liveSnapshot.imu.fresh
-  const belowHorizon = streamReady && pitchDeg < pitchLimitDeg
-  const tone = !streamReady ? 'warning' : belowHorizon ? 'steady' : 'critical'
+  const controllerSafe = streamReady && !liveSnapshot.safety.horizonBlocked
+  const tone = !streamReady ? 'warning' : controllerSafe ? 'steady' : 'critical'
 
   const [displayPose, setDisplayPose] = useState<DisplayPose>({
     pitchDeg,
@@ -147,7 +151,16 @@ export function ImuPostureCard({
           <span className={streamReady ? 'status-badge is-steady' : 'status-badge is-warning'}>
             {streamReady ? 'Fresh stream' : 'Awaiting live stream'}
           </span>
-          <span className="status-badge is-muted">Pitch + roll only</span>
+          <span className={controllerSafe ? 'status-badge is-steady' : 'status-badge is-warn'}>
+            {!streamReady
+              ? 'Awaiting interlock truth'
+              : controllerSafe
+                ? 'Controller clear'
+                : 'Controller blocked'}
+          </span>
+          <span className="status-badge is-muted">
+            Trip {formatNumber(pitchLimitDeg, 1)}° / clear {formatNumber(clearPitchDeg, 1)}°
+          </span>
         </div>
       </div>
 
@@ -314,12 +327,12 @@ export function ImuPostureCard({
           <strong>{formatNumber(rollDeg, 1)} deg</strong>
         </div>
         <div>
-          <span>Threshold</span>
+          <span>Trip threshold</span>
           <strong>{formatNumber(pitchLimitDeg, 1)} deg</strong>
         </div>
         <div>
-          <span>Margin</span>
-          <strong>{formatNumber(marginDeg, 1)} deg</strong>
+          <span>Clear threshold</span>
+          <strong>{formatNumber(clearPitchDeg, 1)} deg</strong>
         </div>
         <div>
           <span>Stream</span>
@@ -327,16 +340,30 @@ export function ImuPostureCard({
         </div>
         <div>
           <span>State</span>
-          <strong>{!streamReady ? 'Waiting' : belowHorizon ? 'Below horizon' : 'Above horizon'}</strong>
+          <strong>
+            {!streamReady
+              ? 'Waiting'
+              : controllerSafe
+                ? 'Controller clear'
+                : 'Blocked until clear'}
+          </strong>
         </div>
       </div>
 
-      <ProgressMeter value={pitchMarginPercent} tone={tone} compact />
+      <ProgressMeter
+        value={controllerSafe ? pitchMarginPercent : 0}
+        tone={tone}
+        compact
+      />
 
       <p className="inline-help">
         The attitude view is now pitch and roll only. Pitch shifts the horizon vertically,
         roll rotates it around the reticle, and the center reticle stays fixed so the motion
         reads like an instrument instead of a decorative 3D object.
+      </p>
+      <p className="inline-help">
+        Horizon interlock state follows controller truth, including hysteresis. A slightly
+        negative pitch can still remain blocked until it clears the lower reset threshold.
       </p>
     </article>
   )

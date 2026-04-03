@@ -126,10 +126,13 @@ typedef struct {
     bool tof_data_fresh;
     laser_controller_distance_m_t tof_distance_m;
     bool driver_loop_good;
+    laser_controller_volts_t laser_driver_temp_voltage_v;
     laser_controller_celsius_t laser_driver_temp_c;
+    laser_controller_volts_t laser_current_monitor_voltage_v;
     laser_controller_amps_t measured_laser_current_a;
     bool tec_temp_good;
     laser_controller_celsius_t tec_temp_c;
+    laser_controller_volts_t tec_command_voltage_v;
     laser_controller_volts_t tec_temp_adc_voltage_v;
     laser_controller_amps_t tec_current_a;
     laser_controller_volts_t tec_voltage_v;

@@ -1,5 +1,7 @@
+import { useState } from 'react'
 import { Cpu, Download, MemoryStick, Plug, TriangleAlert } from 'lucide-react'
 
+import { ConfirmActionDialog } from './ConfirmActionDialog'
 import { ProgressMeter } from './ProgressMeter'
 import { formatRelativeUptime, formatShortTime } from '../lib/format'
 import {
@@ -41,6 +43,7 @@ type InspectorRailProps = {
   onConnect: () => Promise<void> | void
   onDisconnect: () => Promise<void> | void
   onToggleServiceMode: () => Promise<void> | void
+  onSetInterlocksDisabled: (enabled: boolean) => Promise<void> | void
 }
 
 export function InspectorRail({
@@ -62,10 +65,13 @@ export function InspectorRail({
   onConnect,
   onDisconnect,
   onToggleServiceMode,
+  onSetInterlocksDisabled,
 }: InspectorRailProps) {
+  const [confirmDisableInterlocks, setConfirmDisableInterlocks] = useState(false)
   const recentCommands = commands.slice(0, 6)
   const safetySummary = summarizeSafetyChecks(buildSafetyChecks(snapshot))
   const connected = transportStatus === 'connected'
+  const interlocksDisabled = snapshot.bringup.interlocksDisabled
   const serviceModeLabel = snapshot.bringup.serviceModeActive
     ? 'Service active'
     : snapshot.bringup.serviceModeRequested
@@ -164,6 +170,15 @@ export function InspectorRail({
           >
             {serviceModeLabel}
           </span>
+          <span
+            className={
+              interlocksDisabled
+                ? 'status-badge is-critical'
+                : 'status-badge is-off'
+            }
+          >
+            {interlocksDisabled ? 'Interlocks defeated' : 'Interlocks on'}
+          </span>
         </div>
         <div className="segmented inspector-link-transport">
           <button
@@ -249,8 +264,32 @@ export function InspectorRail({
           >
             {snapshot.bringup.serviceModeActive ? 'Exit service' : 'Enter service'}
           </button>
+          <button
+            type="button"
+            className="action-button is-inline is-danger"
+            disabled={!connected || (!snapshot.bringup.serviceModeActive && !interlocksDisabled)}
+            onClick={() => {
+              if (interlocksDisabled) {
+                void onSetInterlocksDisabled(false)
+                return
+              }
+              setConfirmDisableInterlocks(true)
+            }}
+            title={
+              interlocksDisabled
+                ? 'Restore normal controller interlock supervision.'
+                : 'Service-only bench override that defeats controller beam interlocks until restored or rebooted.'
+            }
+          >
+            {interlocksDisabled ? 'Restore interlocks' : 'Disable interlocks'}
+          </button>
         </div>
         <p className="inline-help">{transportDetail}</p>
+        {interlocksDisabled ? (
+          <p className="inline-help">
+            Bench override active. Horizon, range, lambda, TEC, button, and loop interlocks are defeated until restored or the controller reboots.
+          </p>
+        ) : null}
         {firmwareProgress !== null ? (
           <>
             <ProgressMeter
@@ -264,6 +303,24 @@ export function InspectorRail({
           </>
         ) : null}
       </section>
+      {confirmDisableInterlocks ? (
+        <ConfirmActionDialog
+          title="Disable all interlocks?"
+          detail="This is a dangerous bench override. The controller will stop enforcing normal beam interlocks until you restore them or reboot."
+          confirmLabel="Disable interlocks"
+          tone="critical"
+          bullets={[
+            'Only use this on a terminated bench with eyewear on.',
+            'This override is not persisted to NVS, but it remains active until restored or reboot.',
+            'System-major protections still remain; this defeats the normal beam-interlock path.',
+          ]}
+          onCancel={() => setConfirmDisableInterlocks(false)}
+          onConfirm={() => {
+            setConfirmDisableInterlocks(false)
+            void onSetInterlocksDisabled(true)
+          }}
+        />
+      ) : null}
 
       <section className={deviceLinkLost ? 'inspector-block offline-dim' : 'inspector-block'}>
         <div className="inspector-block__head">

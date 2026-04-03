@@ -114,6 +114,14 @@ export function clampTecTempC(tempC: number): number {
   return clamp(tempC, tecCalibrationPoints[0].tempC, tecCalibrationPoints[tecCalibrationPoints.length - 1].tempC)
 }
 
+export function clampTecVoltageV(tecVoltageV: number): number {
+  return clamp(
+    tecVoltageV,
+    tecCalibrationPoints[0].tecVoltageV,
+    tecCalibrationPoints[tecCalibrationPoints.length - 1].tecVoltageV,
+  )
+}
+
 export function clampTecWavelengthNm(wavelengthNm: number): number {
   const min = tempByWavelengthTable[0].x
   const max = tempByWavelengthTable[tempByWavelengthTable.length - 1].x
@@ -128,6 +136,18 @@ export function estimateTempFromWavelengthNm(wavelengthNm: number): number {
   return interpolate(tempByWavelengthTable, clampTecWavelengthNm(wavelengthNm))
 }
 
+export function estimateTempFromTecVoltageV(tecVoltageV: number): number {
+  return inferTempFromVoltage(clampTecVoltageV(tecVoltageV))
+}
+
 export function estimateTecVoltageFromTempC(tempC: number): number {
   return interpolate(voltageByTempTable, clampTecTempC(tempC))
+}
+
+export function estimateTecVoltageFromWavelengthNm(wavelengthNm: number): number {
+  return estimateTecVoltageFromTempC(estimateTempFromWavelengthNm(wavelengthNm))
+}
+
+export function estimateWavelengthFromTecVoltageV(tecVoltageV: number): number {
+  return estimateWavelengthFromTempC(estimateTempFromTecVoltageV(tecVoltageV))
 }

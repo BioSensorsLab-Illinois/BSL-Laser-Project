@@ -677,14 +677,12 @@ export class MockTransport implements DeviceTransport {
       case 'configure_modulation':
         this.state.modulationEnabled = Boolean(command.args?.enabled)
         if (typeof command.args?.frequency_hz === 'number') {
-          this.state.modulationFrequencyHz = clamp(command.args.frequency_hz, 10, 50000)
+          this.state.modulationFrequencyHz = clamp(command.args.frequency_hz, 0, 4000)
         }
         if (typeof command.args?.duty_cycle_pct === 'number') {
-          this.state.modulationDutyCyclePct = clamp(command.args.duty_cycle_pct, 1, 99)
+          this.state.modulationDutyCyclePct = clamp(command.args.duty_cycle_pct, 0, 100)
         }
-        if (typeof command.args?.low_current_a === 'number') {
-          this.state.lowStateCurrentA = clamp(command.args.low_current_a, 0, this.state.laserHighCurrentA)
-        }
+        this.state.lowStateCurrentA = 0
         break
       case 'reboot':
         this.state.systemState = 'BOOT_INIT'
@@ -693,6 +691,7 @@ export class MockTransport implements DeviceTransport {
         this.state.tecSettlingTicks = 3
         this.state.bringup.serviceModeActive = false
         this.state.bringup.serviceModeRequested = false
+        this.state.bringup.interlocksDisabled = false
         this.state.bringup.illumination.tof.enabled = false
         this.state.hapticDriverEnabled = false
         this.emit({
@@ -768,6 +767,11 @@ export class MockTransport implements DeviceTransport {
           this.bumpBringupRevision(
             `${String(command.args.rail).toUpperCase()} rail service request ${command.args.enabled ? 'enabled' : 'disabled'}.`,
           )
+        }
+        break
+      case 'set_interlocks_disabled':
+        if (typeof command.args?.enabled === 'boolean') {
+          this.state.bringup.interlocksDisabled = command.args.enabled
         }
         break
       case 'set_haptic_enable':
@@ -1448,6 +1452,7 @@ export class MockTransport implements DeviceTransport {
     const tofArmed =
       this.state.bringup.modules.tof.expectedPresent ||
       this.state.bringup.modules.tof.debugEnabled
+    const interlocksDisabled = this.state.bringup.interlocksDisabled
 
     return {
       identity: {
@@ -1508,15 +1513,24 @@ export class MockTransport implements DeviceTransport {
         alignmentEnabled,
         nirEnabled,
         driverStandby: !nirEnabled,
+        commandVoltageV: this.state.bringup.tuning.dacLdChannelV,
         measuredCurrentA,
         commandedCurrentA: this.state.laserHighCurrentA,
+        currentMonitorVoltageV: measuredCurrentA / 2.4,
         loopGood: !this.state.faultLatched,
+        driverTempVoltageV:
+          (192.5576 -
+            (29.4 + measuredCurrentA * 2.6 + Math.sin(this.state.uptimeSeconds / 11) * 0.8)) /
+          90.104,
         driverTempC: 29.4 + measuredCurrentA * 2.6 + Math.sin(this.state.uptimeSeconds / 11) * 0.8,
       },
       tec: {
         targetTempC: this.state.targetTempC,
         targetLambdaNm: this.state.targetLambdaNm,
         actualLambdaNm,
+        commandVoltageV: this.state.serviceMode
+          ? this.state.bringup.tuning.dacTecChannelV
+          : Math.max(0, Math.min(2.5, this.state.targetTempC * (2.5 / 65))),
         tempGood: tecReady,
         tempC: tecActualTemp,
         tempAdcVoltageV,
@@ -1600,6 +1614,7 @@ export class MockTransport implements DeviceTransport {
       bench: {
         ...benchDefaults,
         targetMode: this.state.targetMode,
+        requestedAlignmentEnabled: this.state.alignmentRequested,
         requestedNirEnabled: this.state.laserRequested,
         modulationEnabled: this.state.modulationEnabled,
         modulationFrequencyHz: this.state.modulationFrequencyHz,
@@ -1608,19 +1623,23 @@ export class MockTransport implements DeviceTransport {
       },
       safety: {
         ...this.state.safety,
-        allowAlignment: !this.state.faultLatched && !horizonBlocked && !distanceBlocked,
+        allowAlignment: interlocksDisabled
+          ? !this.state.faultLatched
+          : !this.state.faultLatched && !horizonBlocked && !distanceBlocked,
         allowNir:
-          !this.state.faultLatched &&
-          !horizonBlocked &&
-          !distanceBlocked &&
-          !lambdaDriftBlocked &&
-          !tecTempAdcBlocked &&
-          this.state.powerTier === 'full' &&
-          tecReady,
-        horizonBlocked,
-        distanceBlocked,
-        lambdaDriftBlocked,
-        tecTempAdcBlocked,
+          interlocksDisabled
+            ? !this.state.faultLatched && this.state.powerTier === 'full'
+            : !this.state.faultLatched &&
+              !horizonBlocked &&
+              !distanceBlocked &&
+              !lambdaDriftBlocked &&
+              !tecTempAdcBlocked &&
+              this.state.powerTier === 'full' &&
+              tecReady,
+        horizonBlocked: interlocksDisabled ? false : horizonBlocked,
+        distanceBlocked: interlocksDisabled ? false : distanceBlocked,
+        lambdaDriftBlocked: interlocksDisabled ? false : lambdaDriftBlocked,
+        tecTempAdcBlocked: interlocksDisabled ? false : tecTempAdcBlocked,
         actualLambdaNm,
         targetLambdaNm: this.state.targetLambdaNm,
         lambdaDriftNm,

@@ -18,7 +18,8 @@
 #define LASER_CONTROLLER_SERVICE_PROFILE_VER   4U
 #define LASER_CONTROLLER_SERVICE_PROFILE_VER_MIN 3U
 #define LASER_CONTROLLER_SERVICE_DAC_MAX_V     2.5f
-#define LASER_CONTROLLER_SERVICE_TOF_ILLUMINATION_PWM_HZ 5000U
+#define LASER_CONTROLLER_SERVICE_DEFAULT_TEC_CHANNEL_V 0.821104f
+#define LASER_CONTROLLER_SERVICE_TOF_ILLUMINATION_PWM_HZ 20000U
 #define LASER_CONTROLLER_SERVICE_HAPTIC_PATTERN_MAX_PULSES 12U
 #define LASER_CONTROLLER_SERVICE_HAPTIC_PATTERN_MIN_MS     10U
 #define LASER_CONTROLLER_SERVICE_HAPTIC_PATTERN_MAX_MS     600U
@@ -770,7 +771,7 @@ static void laser_controller_service_apply_core_preset_locked(const char *profil
     s_service.status.modules[LASER_CONTROLLER_MODULE_PD].debug_enabled = true;
 
     s_service.status.dac_ld_channel_v = 0.0f;
-    s_service.status.dac_tec_channel_v = 0.0f;
+    s_service.status.dac_tec_channel_v = LASER_CONTROLLER_SERVICE_DEFAULT_TEC_CHANNEL_V;
     s_service.status.dac_reference = LASER_CONTROLLER_SERVICE_DAC_REFERENCE_INTERNAL;
     s_service.status.dac_gain_2x = true;
     s_service.status.dac_ref_div = true;
@@ -832,6 +833,7 @@ static void laser_controller_service_apply_core_preset_locked(const char *profil
 static void laser_controller_service_apply_manual_defaults_locked(const char *profile_name)
 {
     laser_controller_service_apply_core_preset_locked(profile_name);
+    s_service.status.interlocks_disabled = false;
 
     for (uint32_t index = 0U; index < LASER_CONTROLLER_MODULE_COUNT; ++index) {
         s_service.status.modules[index].expected_present = false;
@@ -1040,6 +1042,16 @@ bool laser_controller_service_mode_requested(void)
     return requested;
 }
 
+bool laser_controller_service_interlocks_disabled(void)
+{
+    bool enabled;
+
+    portENTER_CRITICAL(&s_service_lock);
+    enabled = s_service.status.interlocks_disabled;
+    portEXIT_CRITICAL(&s_service_lock);
+    return enabled;
+}
+
 bool laser_controller_service_module_expected(laser_controller_module_t module)
 {
     bool expected = false;
@@ -1194,6 +1206,20 @@ void laser_controller_service_set_mode_requested(
             LASER_CONTROLLER_SERVICE_TOF_ILLUMINATION_PWM_HZ);
         laser_controller_board_reset_gpio_debug_state();
     }
+}
+
+void laser_controller_service_set_interlocks_disabled(
+    bool enabled,
+    laser_controller_time_ms_t now_ms)
+{
+    portENTER_CRITICAL(&s_service_lock);
+    s_service.status.interlocks_disabled = enabled;
+    laser_controller_service_write_action_locked(
+        enabled ?
+            "All beam interlocks disabled by explicit bench override." :
+            "All beam interlocks restored to normal controller supervision.",
+        now_ms);
+    portEXIT_CRITICAL(&s_service_lock);
 }
 
 bool laser_controller_service_apply_preset(
@@ -1410,6 +1436,8 @@ bool laser_controller_service_set_gpio_override(
     }
     laser_controller_service_refresh_gpio_override_count_locked();
     portEXIT_CRITICAL(&s_service_lock);
+
+    laser_controller_board_apply_debug_gpio_state_now();
     return true;
 }
 

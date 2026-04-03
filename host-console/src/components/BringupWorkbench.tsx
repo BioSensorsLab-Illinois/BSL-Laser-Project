@@ -34,11 +34,30 @@ import {
   makeDefaultPdProfiles,
   moduleKeys,
   moduleMeta,
+  observeBringupModuleStatus,
   pdCurrentOptions,
   pdVoltageOptions,
 } from '../lib/bringup'
 import { formatNumber } from '../lib/format'
+import {
+  clampLdCommandCurrentA,
+  clampLdCommandVoltageV,
+  estimateLdCurrentFromVoltageV,
+  estimateLdDiodeElectricalPowerW,
+  estimateLdSupplyDrawW,
+} from '../lib/ld-calibration'
 import type { UiTone } from '../lib/presentation'
+import {
+  clampTecTempC,
+  clampTecVoltageV,
+  clampTecWavelengthNm,
+  estimateTecVoltageFromTempC,
+  estimateTecVoltageFromWavelengthNm,
+  estimateTempFromTecVoltageV,
+  estimateWavelengthFromTecVoltageV,
+  tecCalibrationPoints,
+} from '../lib/tec-calibration'
+import { useLiveSnapshot } from '../hooks/use-live-snapshot'
 import type {
   BringupModuleMap,
   BringupModuleStatus,
@@ -56,6 +75,7 @@ type BringupWorkbenchProps = {
   snapshot: DeviceSnapshot
   telemetryStore: RealtimeTelemetryStore
   transportStatus: TransportStatus
+  transportRecovering: boolean
   onIssueCommandAwaitAck: (
     cmd: string,
     risk: 'read' | 'write' | 'service' | 'firmware',
@@ -173,6 +193,9 @@ type HapticPatternDraft = {
   hazardAccepted: boolean
 }
 
+type LdSbdnMode = 'firmware' | 'off-pd' | 'on-pu' | 'standby-hiz'
+type LdPcnMode = 'firmware' | 'lisl' | 'lish'
+
 type ProbeRequest = {
   id: string
   cmd: string
@@ -203,9 +226,12 @@ const BRINGUP_HAPTIC_ENABLE_WAIT_MS = 1200
 const BRINGUP_HAPTIC_PATTERN_MAX_PULSES = 12
 const BRINGUP_HAPTIC_PATTERN_MIN_MS = 10
 const BRINGUP_HAPTIC_PATTERN_MAX_MS = 600
-const TOF_ILLUMINATION_PWM_HZ = 5000
+const TOF_ILLUMINATION_PWM_HZ = 20000
 const DAC80502_BOARD_SPAN_V = 2.5
 const DAC80502_CODE_MAX = 0xffff
+const LD_CURRENT_FULL_SCALE_A = 6
+const LD_CURRENT_UI_MAX_A = 5
+const LD_TEMP_MONITOR_MAX_V = 2.5
 
 const bringupPages: PageDefinition[] = [
   {
@@ -458,9 +484,14 @@ function makeFormState(snapshot: DeviceSnapshot): BringupFormState {
 
 function sanitizeDacDraft(form: BringupFormState): BringupFormState {
   const dacRefDiv = form.dacReferenceMode === 'internal' ? true : form.dacRefDiv
+  const dacLdVoltage = formatNumber(
+    clampLdCommandVoltageV(parseNumber(form.dacLdVoltage, 0)),
+    3,
+  )
 
   return {
     ...form,
+    dacLdVoltage,
     dacRefDiv,
   }
 }
@@ -489,13 +520,331 @@ function makeStoredState(snapshot: DeviceSnapshot): BringupStoredState {
   return {
     version: 9,
     activePage: 'workflow',
-    form: makeFormState(snapshot),
+    form: sanitizeDacDraft(makeFormState(snapshot)),
     i2cAddress: '0x48',
     i2cRegister: '0x00',
     i2cValue: '0x00',
     spiDevice: 'imu',
     spiRegister: '0x0F',
     spiValue: '0x00',
+  }
+}
+
+function makeTecDisplaySample(snapshot: DeviceSnapshot) {
+  return {
+    tempC: snapshot.tec.tempC,
+    actualLambdaNm: snapshot.tec.actualLambdaNm,
+    commandVoltageV: snapshot.tec.commandVoltageV,
+    tempGood: snapshot.tec.tempGood,
+    tempAdcVoltageV: snapshot.tec.tempAdcVoltageV,
+    currentA: snapshot.tec.currentA,
+    voltageV: snapshot.tec.voltageV,
+    railPgood: snapshot.rails.tec.pgood,
+    railEnabled: snapshot.rails.tec.enabled,
+  }
+}
+
+const DEFAULT_TEC_BRINGUP_TEMP_C = 25
+const DEFAULT_TEC_BRINGUP_VOLTAGE_V = estimateTecVoltageFromTempC(DEFAULT_TEC_BRINGUP_TEMP_C)
+const LD_TRANSIENT_DIP_HOLD_MS = 750
+
+function findGpioPin(snapshot: DeviceSnapshot, gpioNum: number) {
+  return snapshot.gpioInspector.pins.find((pin) => pin.gpioNum === gpioNum)
+}
+
+function describeLdSbdnMode(snapshot: DeviceSnapshot) {
+  const pin = findGpioPin(snapshot, 13)
+
+  if (pin === undefined) {
+    return {
+      mode: 'firmware' as const,
+      label: 'GPIO13 unavailable',
+      tone: 'off' as const,
+      detail: 'GPIO inspector has not published LD_SBDN yet.',
+    }
+  }
+
+  if (pin.overrideActive) {
+    if (pin.overrideMode === 'input') {
+      return {
+        mode: 'standby-hiz' as const,
+        label: 'Standby',
+        tone: 'warn' as const,
+        detail: 'GPIO13 is released to high impedance so SBDN sits in the standby threshold window.',
+      }
+    }
+
+    if (pin.overrideMode === 'output') {
+      return pin.overrideLevelHigh
+        ? {
+            mode: 'on-pu' as const,
+            label: 'On',
+            tone: 'ok' as const,
+            detail: 'GPIO13 is being driven high.',
+          }
+        : {
+            mode: 'off-pd' as const,
+            label: 'Off',
+            tone: 'off' as const,
+            detail: 'GPIO13 is being pulled low for fast shutdown.',
+          }
+    }
+  }
+
+  if (!pin.outputEnabled && pin.inputEnabled) {
+    return {
+      mode: 'standby-hiz' as const,
+      label: 'Standby',
+      tone: 'warn' as const,
+      detail: 'Firmware currently leaves GPIO13 high impedance for standby.',
+    }
+  }
+
+  if (pin.outputEnabled && pin.levelHigh) {
+    return {
+      mode: 'on-pu' as const,
+      label: 'On',
+      tone: 'ok' as const,
+      detail: 'Firmware currently drives GPIO13 high.',
+    }
+  }
+
+  if (pin.outputEnabled && !pin.levelHigh) {
+    return {
+      mode: 'off-pd' as const,
+      label: 'Off',
+      tone: 'off' as const,
+      detail: 'Firmware currently drives GPIO13 low.',
+    }
+  }
+
+  return {
+    mode: 'firmware' as const,
+    label: 'Auto',
+    tone: 'off' as const,
+    detail: 'GPIO13 is still under the normal firmware state machine.',
+  }
+}
+
+function describeLdPcnMode(snapshot: DeviceSnapshot) {
+  const pin = findGpioPin(snapshot, 21)
+
+  if (pin === undefined) {
+    return {
+      mode: 'firmware' as const,
+      label: 'GPIO21 unavailable',
+      tone: 'off' as const,
+      detail: 'GPIO inspector has not published LD_PCN yet.',
+    }
+  }
+
+  if (pin.overrideActive && pin.overrideMode === 'output') {
+    if (pin.levelHigh !== pin.overrideLevelHigh) {
+      return pin.overrideLevelHigh
+        ? {
+            mode: 'lish' as const,
+            label: 'LISH requested / live low',
+            tone: 'critical' as const,
+            detail: 'GPIO21 override requested high, but the live pin is still low.',
+          }
+        : {
+            mode: 'lisl' as const,
+            label: 'LISL requested / live high',
+            tone: 'critical' as const,
+            detail: 'GPIO21 override requested low, but the live pin is still high.',
+          }
+    }
+
+    return pin.overrideLevelHigh
+      ? {
+          mode: 'lish' as const,
+          label: 'LISH path',
+          tone: 'ok' as const,
+          detail: 'GPIO21 override is actively driving the high-current LISH leg.',
+        }
+      : {
+          mode: 'lisl' as const,
+          label: 'LISL path',
+          tone: 'warn' as const,
+          detail: 'GPIO21 override is actively driving the low-current LISL leg.',
+        }
+  }
+
+  if (pin.outputEnabled) {
+    return pin.levelHigh
+      ? {
+          mode: 'lish' as const,
+          label: 'LISH path',
+          tone: 'ok' as const,
+          detail: 'Firmware currently drives GPIO21 high.',
+        }
+      : {
+          mode: 'lisl' as const,
+          label: 'LISL path',
+          tone: 'warn' as const,
+          detail: 'Firmware currently drives GPIO21 low.',
+        }
+  }
+
+  return {
+    mode: 'firmware' as const,
+    label: 'Firmware-owned',
+    tone: 'off' as const,
+    detail: 'GPIO21 is still under the normal firmware state machine.',
+  }
+}
+
+function describeGreenIo37State(snapshot: DeviceSnapshot) {
+  const pin = findGpioPin(snapshot, 37)
+
+  if (pin === undefined) {
+    return {
+      enabled: false,
+      label: 'GPIO37 unavailable',
+      tone: 'off' as const,
+      owner: 'No telemetry',
+      detail: 'GPIO inspector has not published the shared ERM / green-laser net yet.',
+    }
+  }
+
+  if (pin.overrideActive && pin.overrideMode === 'output') {
+    return pin.overrideLevelHigh
+      ? {
+          enabled: true,
+          label: 'High',
+          tone: 'ok' as const,
+          owner: 'Service override',
+          detail: 'GPIO37 is being driven high directly on the shared GN_LD_EN / ERM_TRIG net.',
+        }
+      : {
+          enabled: false,
+          label: 'Low',
+          tone: 'off' as const,
+          owner: 'Service override',
+          detail: 'GPIO37 is being driven low directly on the shared GN_LD_EN / ERM_TRIG net.',
+        }
+  }
+
+  if (pin.outputEnabled) {
+    return pin.levelHigh
+      ? {
+          enabled: true,
+          label: 'High',
+          tone: 'ok' as const,
+          owner: 'Firmware',
+          detail: 'Firmware currently drives GPIO37 high.',
+        }
+      : {
+          enabled: false,
+          label: 'Low',
+          tone: 'off' as const,
+          owner: 'Firmware',
+          detail: 'Firmware currently drives GPIO37 low.',
+        }
+  }
+
+  return {
+    enabled: pin.levelHigh,
+    label: pin.levelHigh ? 'Floating high' : 'Hi-Z / low',
+    tone: pin.levelHigh ? ('warning' as const) : ('off' as const),
+    owner: 'High-Z',
+    detail: 'GPIO37 is not actively driven. This shared net can be misleading when left floating.',
+  }
+}
+
+type LdDisplaySample = {
+  commandVoltageV: number
+  commandCurrentA: number
+  measuredCurrentA: number
+  currentMonitorVoltageV: number
+  driverTempVoltageV: number
+  driverTempC: number
+  diodeElectricalPowerW: number
+  supplyDrawW: number
+  loopGood: boolean
+  railEnabled: boolean
+  railPgood: boolean
+  pcnMode: ReturnType<typeof describeLdPcnMode>['mode']
+  dipHoldUntilMs: number
+}
+
+function makeLdDisplaySample(snapshot: DeviceSnapshot): LdDisplaySample {
+  const commandVoltageV = clampLdCommandVoltageV(
+    snapshot.laser.commandVoltageV || snapshot.bringup.tuning.dacLdChannelV,
+  )
+  const measuredCurrentA = Math.max(0, snapshot.laser.measuredCurrentA)
+  const diodeElectricalPowerW = estimateLdDiodeElectricalPowerW(measuredCurrentA)
+
+  return {
+    commandVoltageV,
+    commandCurrentA: estimateLdCurrentFromVoltageV(commandVoltageV),
+    measuredCurrentA,
+    currentMonitorVoltageV: Math.max(0, snapshot.laser.currentMonitorVoltageV),
+    driverTempVoltageV: Math.max(0, snapshot.laser.driverTempVoltageV),
+    driverTempC: snapshot.laser.driverTempC,
+    diodeElectricalPowerW,
+    supplyDrawW: estimateLdSupplyDrawW(measuredCurrentA),
+    loopGood: snapshot.laser.loopGood,
+    railEnabled: snapshot.rails.ld.enabled,
+    railPgood: snapshot.rails.ld.pgood,
+    pcnMode: describeLdPcnMode(snapshot).mode,
+    dipHoldUntilMs: 0,
+  }
+}
+
+function reconcileLdDisplaySample(
+  previous: LdDisplaySample,
+  next: LdDisplaySample,
+) {
+  const now = window.performance.now()
+  const pcnModeChanged = previous.pcnMode !== next.pcnMode
+  const railStateChanged =
+    previous.railEnabled !== next.railEnabled ||
+    previous.railPgood !== next.railPgood
+  const commandShifted =
+    Math.abs(previous.commandVoltageV - next.commandVoltageV) >= 0.05
+
+  if (pcnModeChanged || railStateChanged || commandShifted) {
+    return {
+      ...next,
+      dipHoldUntilMs: 0,
+    }
+  }
+
+  const likelyTransientCurrentDip =
+    previous.measuredCurrentA >= 0.2 &&
+    next.measuredCurrentA <= Math.max(0.03, previous.measuredCurrentA * 0.2) &&
+    next.currentMonitorVoltageV <= Math.max(0.02, previous.currentMonitorVoltageV * 0.35) &&
+    next.commandVoltageV >= 0.05 &&
+    next.railEnabled &&
+    next.railPgood
+
+  if (!likelyTransientCurrentDip) {
+    return {
+      ...next,
+      dipHoldUntilMs: 0,
+    }
+  }
+
+  if (previous.dipHoldUntilMs > 0 && previous.dipHoldUntilMs <= now) {
+    return {
+      ...next,
+      dipHoldUntilMs: 0,
+    }
+  }
+
+  const holdUntilMs =
+    previous.dipHoldUntilMs > now
+      ? previous.dipHoldUntilMs
+      : now + LD_TRANSIENT_DIP_HOLD_MS
+
+  return {
+    ...next,
+    measuredCurrentA: previous.measuredCurrentA,
+    currentMonitorVoltageV: previous.currentMonitorVoltageV,
+    diodeElectricalPowerW: previous.diodeElectricalPowerW,
+    supplyDrawW: previous.supplyDrawW,
+    dipHoldUntilMs: holdUntilMs,
   }
 }
 
@@ -568,7 +917,7 @@ function mergePlannedAndLiveModules(
       return merged
     }
 
-    const observed = observeModuleStatus(module, snapshot)
+    const observed = observeBringupModuleStatus(module, snapshot)
     return {
       ...merged,
       detected: merged.detected || observed.detected,
@@ -585,108 +934,6 @@ function mergePlannedAndLiveModules(
     pd: mergeModuleStatus('pd', planned.pd, live.pd),
     laserDriver: mergeModuleStatus('laserDriver', planned.laserDriver, live.laserDriver),
     tec: mergeModuleStatus('tec', planned.tec, live.tec),
-  }
-}
-
-function observeModuleStatus(
-  module: ModuleKey,
-  snapshot: DeviceSnapshot,
-): Pick<BringupModuleStatus, 'detected' | 'healthy'> {
-  switch (module) {
-    case 'imu': {
-      const peripheral = snapshot.peripherals.imu
-      const detected =
-        peripheral.reachable ||
-        peripheral.configured ||
-        peripheral.whoAmI === 0x6c ||
-        snapshot.imu.valid ||
-        snapshot.imu.fresh
-      const healthy =
-        snapshot.imu.valid ||
-        snapshot.imu.fresh ||
-        (peripheral.reachable && peripheral.configured)
-      return { detected, healthy }
-    }
-    case 'dac': {
-      const peripheral = snapshot.peripherals.dac
-      const registerReadbackSeen =
-        peripheral.syncReg !== 0 ||
-        peripheral.configReg !== 0 ||
-        peripheral.gainReg !== 0 ||
-        peripheral.statusReg !== 0 ||
-        peripheral.dataAReg !== 0 ||
-        peripheral.dataBReg !== 0
-      const detected = peripheral.reachable || peripheral.configured || registerReadbackSeen
-      const healthy = peripheral.reachable && (peripheral.configured || registerReadbackSeen)
-      return { detected, healthy }
-    }
-    case 'haptic': {
-      const peripheral = snapshot.peripherals.haptic
-      const registerReadbackSeen =
-        peripheral.modeReg !== 0 ||
-        peripheral.libraryReg !== 0 ||
-        peripheral.feedbackReg !== 0 ||
-        peripheral.goReg !== 0
-      const detected =
-        peripheral.reachable ||
-        peripheral.enablePinHigh ||
-        peripheral.triggerPinHigh ||
-        registerReadbackSeen
-      return { detected, healthy: peripheral.reachable }
-    }
-    case 'tof': {
-      const peripheral = snapshot.peripherals.tof
-      const detected =
-        peripheral.reachable ||
-        peripheral.configured ||
-        peripheral.sensorId !== 0 ||
-        peripheral.dataReady ||
-        snapshot.tof.valid ||
-        snapshot.tof.fresh
-      const healthy =
-        snapshot.tof.valid ||
-        snapshot.tof.fresh ||
-        (peripheral.reachable && (peripheral.configured || peripheral.sensorId !== 0))
-      return { detected, healthy }
-    }
-    case 'pd': {
-      const peripheral = snapshot.peripherals.pd
-      const detected =
-        peripheral.reachable ||
-        peripheral.attached ||
-        snapshot.pd.contractValid ||
-        snapshot.pd.sourceVoltageV > 0 ||
-        snapshot.pd.sourceCurrentA > 0
-      const healthy = peripheral.reachable || snapshot.pd.contractValid
-      return { detected, healthy }
-    }
-    case 'buttons': {
-      const detected =
-        snapshot.buttons.stage1Pressed ||
-        snapshot.buttons.stage2Pressed ||
-        snapshot.buttons.stage1Edge ||
-        snapshot.buttons.stage2Edge
-      return { detected, healthy: detected }
-    }
-    case 'laserDriver': {
-      const detected =
-        snapshot.rails.ld.enabled ||
-        snapshot.rails.ld.pgood ||
-        snapshot.laser.measuredCurrentA > 0 ||
-        snapshot.laser.driverTempC !== 0
-      const healthy = snapshot.rails.ld.pgood || snapshot.laser.loopGood
-      return { detected, healthy }
-    }
-    case 'tec': {
-      const detected =
-        snapshot.rails.tec.enabled ||
-        snapshot.rails.tec.pgood ||
-        snapshot.tec.tempC !== 0 ||
-        snapshot.tec.currentA !== 0 ||
-        snapshot.tec.voltageV !== 0
-      const healthy = snapshot.rails.tec.pgood || snapshot.tec.tempGood
-      return { detected, healthy }
-    }
   }
 }
 
@@ -975,6 +1222,7 @@ export function BringupWorkbench({
   snapshot,
   telemetryStore,
   transportStatus,
+  transportRecovering,
   onIssueCommandAwaitAck,
 }: BringupWorkbenchProps) {
   const initialStoredStateRef = useRef<BringupStoredState | null>(null)
@@ -997,6 +1245,7 @@ export function BringupWorkbench({
   const [hapticPattern, setHapticPattern] = useState<HapticPatternDraft>(
     makeDefaultHapticPatternDraft,
   )
+  const [tecSliderMode, setTecSliderMode] = useState<'temp' | 'lambda'>('temp')
   const [tofIlluminationDutyPct, setTofIlluminationDutyPct] = useState(() =>
     String(
       snapshot.bringup.illumination.tof.dutyCyclePct > 0
@@ -1005,11 +1254,17 @@ export function BringupWorkbench({
     ),
   )
 
-  const connected = transportStatus === 'connected'
-  const serviceModeRequested = connected && snapshot.bringup.serviceModeRequested
-  const serviceModeActive = connected && snapshot.bringup.serviceModeActive
-  const readsDisabled = !connected || operation !== null
-  const writesDisabled = !connected || operation !== null
+  const commandReady = transportStatus === 'connected'
+  const hasLiveControllerSnapshot = snapshot.identity.firmwareVersion !== 'unavailable'
+  const connected =
+    commandReady ||
+    (hasLiveControllerSnapshot &&
+      (transportRecovering || transportStatus === 'connecting'))
+  const liveSnapshot = useLiveSnapshot(snapshot, telemetryStore)
+  const serviceModeRequested = commandReady && snapshot.bringup.serviceModeRequested
+  const serviceModeActive = commandReady && snapshot.bringup.serviceModeActive
+  const readsDisabled = !commandReady || operation !== null
+  const writesDisabled = !commandReady || operation !== null
   const liveModules = connected ? snapshot.bringup.modules : form.modules
   const displayModules = useMemo(
     () => mergePlannedAndLiveModules(snapshot, form.modules, liveModules, connected),
@@ -1017,7 +1272,7 @@ export function BringupWorkbench({
   )
   const livePdProfiles = snapshot.bringup.tuning.pdProfiles ?? makeDefaultPdProfiles()
   const overallProgress = overallBringupPercent(displayModules, connected)
-  const powerPageScore = powerSupplyScore(snapshot, connected)
+  const powerPageScore = powerSupplyScore(liveSnapshot, connected)
   const livePageModule =
     activePage !== 'workflow' && activePage !== 'power'
       ? displayModules[activePage]
@@ -1033,6 +1288,7 @@ export function BringupWorkbench({
   const probeBusyRef = useRef(false)
   const moduleSyncBusyRef = useRef(false)
   const latestSnapshotRef = useRef(snapshot)
+  const latestLiveSnapshotRef = useRef(liveSnapshot)
   const probeCycleRef = useRef<ProbeCycleState>({
     signature: '',
     nextIndex: 0,
@@ -1040,6 +1296,12 @@ export function BringupWorkbench({
     lastProbeAtMs: 0,
   })
   const lastModuleSyncFailureRef = useRef('')
+  const [ldDisplaySample, setLdDisplaySample] = useState(() =>
+    makeLdDisplaySample(liveSnapshot),
+  )
+  const [tecDisplaySample, setTecDisplaySample] = useState(() =>
+    makeTecDisplaySample(liveSnapshot),
+  )
   const desiredModulePlanSignature = useMemo(
     () => modulePlanSignature(form.modules),
     [form.modules],
@@ -1050,7 +1312,86 @@ export function BringupWorkbench({
   }, [snapshot])
 
   useEffect(() => {
-    if (!connected) {
+    latestLiveSnapshotRef.current = liveSnapshot
+  }, [liveSnapshot])
+
+  useEffect(() => {
+    if (!commandReady || serviceModeRequested || serviceModeActive) {
+      return
+    }
+
+    const nextLdVoltage = formatNumber(
+      clampLdCommandVoltageV(liveSnapshot.laser.commandVoltageV),
+      3,
+    )
+    const nextTecVoltage = formatNumber(
+      clampTecVoltageV(liveSnapshot.tec.commandVoltageV),
+      3,
+    )
+
+    setForm((current) => {
+      if (
+        current.dacLdVoltage === nextLdVoltage &&
+        current.dacTecVoltage === nextTecVoltage
+      ) {
+        return current
+      }
+
+      return sanitizeDacDraft({
+        ...current,
+        dacLdVoltage: nextLdVoltage,
+        dacTecVoltage: nextTecVoltage,
+      })
+    })
+  }, [
+    commandReady,
+    liveSnapshot.laser.commandVoltageV,
+    liveSnapshot.tec.commandVoltageV,
+    serviceModeActive,
+    serviceModeRequested,
+  ])
+
+  useEffect(() => {
+    if (activePage !== 'laserDriver') {
+      return
+    }
+
+    const syncLdDisplay = () => {
+      setLdDisplaySample((current) =>
+        reconcileLdDisplaySample(
+          current,
+          makeLdDisplaySample(latestLiveSnapshotRef.current),
+        ),
+      )
+    }
+
+    syncLdDisplay()
+    const timerId = window.setInterval(syncLdDisplay, 500)
+
+    return () => {
+      window.clearInterval(timerId)
+    }
+  }, [activePage])
+
+  useEffect(() => {
+    if (activePage !== 'tec') {
+      return
+    }
+
+    const syncTecDisplay = () => {
+      setTecDisplaySample(makeTecDisplaySample(latestLiveSnapshotRef.current))
+    }
+
+    syncTecDisplay()
+    const timerId = window.setInterval(syncTecDisplay, 1000)
+
+    return () => {
+      window.clearInterval(timerId)
+    }
+  }, [activePage])
+
+  useEffect(() => {
+    if (!commandReady) {
       moduleSyncBusyRef.current = false
       probeBusyRef.current = false
       probeCycleRef.current = {
@@ -1061,7 +1402,7 @@ export function BringupWorkbench({
       }
       lastModuleSyncFailureRef.current = ''
     }
-  }, [connected])
+  }, [commandReady])
 
   useEffect(() => {
     const liveDuty = snapshot.bringup.illumination.tof.dutyCyclePct
@@ -1074,7 +1415,7 @@ export function BringupWorkbench({
   ])
 
   useEffect(() => {
-    if (!connected) {
+    if (!commandReady) {
       return
     }
 
@@ -1135,7 +1476,7 @@ export function BringupWorkbench({
     return () => {
       window.clearInterval(timerId)
     }
-  }, [connected, form.modules, onIssueCommandAwaitAck])
+  }, [commandReady, form.modules, onIssueCommandAwaitAck])
 
   function dismissOperation() {
     const resolve = operationConfirmResolveRef.current
@@ -1240,16 +1581,27 @@ export function BringupWorkbench({
   }
 
   function patchModule(module: ModuleKey, patch: Partial<BringupModuleStatus>) {
-    setForm((current) => ({
-      ...current,
-      modules: {
-        ...current.modules,
-        [module]: {
-          ...current.modules[module],
-          ...patch,
+    setForm((current) => {
+      const nextModule = {
+        ...current.modules[module],
+        ...patch,
+      }
+      const shouldSeedTecDefault =
+        module === 'tec' &&
+        (nextModule.expectedPresent || nextModule.debugEnabled) &&
+        parseNumber(current.dacTecVoltage, 0) <= 0.001
+
+      return {
+        ...current,
+        dacTecVoltage: shouldSeedTecDefault
+          ? formatNumber(DEFAULT_TEC_BRINGUP_VOLTAGE_V, 3)
+          : current.dacTecVoltage,
+        modules: {
+          ...current.modules,
+          [module]: nextModule,
         },
-      },
-    }))
+      }
+    })
   }
 
   function patchPdProfile(
@@ -1437,7 +1789,7 @@ export function BringupWorkbench({
   }
 
   async function ensureServiceMode(label: string): Promise<boolean> {
-    if (!connected) {
+    if (!commandReady) {
       setDraftNote('Connect the board before starting a write session.')
       return false
     }
@@ -1515,7 +1867,7 @@ export function BringupWorkbench({
       refreshAfter?: boolean
     },
   ): Promise<boolean> {
-    if (!connected) {
+    if (!commandReady) {
       setDraftNote('Board is offline. The local bench plan is still saved in this browser.')
       return false
     }
@@ -1692,7 +2044,7 @@ export function BringupWorkbench({
 
     saveHostDraft()
 
-    if (!connected) {
+    if (!commandReady) {
       setDraftNote(
         `${moduleMeta[module].label} plan saved locally. Connect the board when you want to mirror it.`,
       )
@@ -1721,7 +2073,7 @@ export function BringupWorkbench({
   async function saveProfileName() {
     saveHostDraft()
 
-    if (!connected) {
+    if (!commandReady) {
       setDraftNote('Profile name saved locally. Connect the board when you want to mirror it.')
       return
     }
@@ -1744,7 +2096,7 @@ export function BringupWorkbench({
   }
 
   async function requestServiceMode() {
-    if (!connected) {
+    if (!commandReady) {
       setDraftNote('Connect the board before starting a write session.')
       return
     }
@@ -1781,6 +2133,8 @@ export function BringupWorkbench({
   }
 
   async function applySafetyPolicy() {
+    const safetyArgs = buildSafetyPolicyArgs()
+
     await runCommandSequence(
       'Apply runtime safety policy',
       'Runtime safety thresholds applied to the controller.',
@@ -1791,91 +2145,95 @@ export function BringupWorkbench({
           risk: 'service',
           note: 'Update runtime safety thresholds, hysteresis, and timeout policy from the bring-up service page.',
           requireService: true,
-          args: {
-            horizon_threshold_deg: parseNumber(
-              form.safetyHorizonThresholdDeg,
-              snapshot.safety.horizonThresholdDeg,
-            ),
-            horizon_hysteresis_deg: parseNumber(
-              form.safetyHorizonHysteresisDeg,
-              snapshot.safety.horizonHysteresisDeg,
-            ),
-            tof_min_range_m: parseNumber(
-              form.safetyTofMinRangeM,
-              snapshot.safety.tofMinRangeM,
-            ),
-            tof_max_range_m: parseNumber(
-              form.safetyTofMaxRangeM,
-              snapshot.safety.tofMaxRangeM,
-            ),
-            tof_hysteresis_m: parseNumber(
-              form.safetyTofHysteresisM,
-              snapshot.safety.tofHysteresisM,
-            ),
-            imu_stale_ms: Math.round(
-              parseNumber(form.safetyImuStaleMs, snapshot.safety.imuStaleMs),
-            ),
-            tof_stale_ms: Math.round(
-              parseNumber(form.safetyTofStaleMs, snapshot.safety.tofStaleMs),
-            ),
-            rail_good_timeout_ms: Math.round(
-              parseNumber(
-                form.safetyRailGoodTimeoutMs,
-                snapshot.safety.railGoodTimeoutMs,
-              ),
-            ),
-            lambda_drift_limit_nm: parseNumber(
-              form.safetyLambdaDriftLimitNm,
-              snapshot.safety.lambdaDriftLimitNm,
-            ),
-            lambda_drift_hysteresis_nm: parseNumber(
-              form.safetyLambdaDriftHysteresisNm,
-              snapshot.safety.lambdaDriftHysteresisNm,
-            ),
-            lambda_drift_hold_ms: Math.round(
-              parseNumber(
-                form.safetyLambdaDriftHoldMs,
-                snapshot.safety.lambdaDriftHoldMs,
-              ),
-            ),
-            ld_overtemp_limit_c: parseNumber(
-              form.safetyLdOvertempLimitC,
-              snapshot.safety.ldOvertempLimitC,
-            ),
-            tec_temp_adc_trip_v: parseNumber(
-              form.safetyTecTempAdcTripV,
-              snapshot.safety.tecTempAdcTripV,
-            ),
-            tec_temp_adc_hysteresis_v: parseNumber(
-              form.safetyTecTempAdcHysteresisV,
-              snapshot.safety.tecTempAdcHysteresisV,
-            ),
-            tec_temp_adc_hold_ms: Math.round(
-              parseNumber(
-                form.safetyTecTempAdcHoldMs,
-                snapshot.safety.tecTempAdcHoldMs,
-              ),
-            ),
-            tec_min_command_c: parseNumber(
-              form.safetyTecMinCommandC,
-              snapshot.safety.tecMinCommandC,
-            ),
-            tec_max_command_c: parseNumber(
-              form.safetyTecMaxCommandC,
-              snapshot.safety.tecMaxCommandC,
-            ),
-            tec_ready_tolerance_c: parseNumber(
-              form.safetyTecReadyToleranceC,
-              snapshot.safety.tecReadyToleranceC,
-            ),
-            max_laser_current_a: parseNumber(
-              form.safetyMaxLaserCurrentA,
-              snapshot.safety.maxLaserCurrentA,
-            ),
-          },
+          args: safetyArgs,
         },
       ],
     )
+  }
+
+  function buildSafetyPolicyArgs() {
+    return {
+      horizon_threshold_deg: parseNumber(
+        form.safetyHorizonThresholdDeg,
+        snapshot.safety.horizonThresholdDeg,
+      ),
+      horizon_hysteresis_deg: parseNumber(
+        form.safetyHorizonHysteresisDeg,
+        snapshot.safety.horizonHysteresisDeg,
+      ),
+      tof_min_range_m: parseNumber(
+        form.safetyTofMinRangeM,
+        snapshot.safety.tofMinRangeM,
+      ),
+      tof_max_range_m: parseNumber(
+        form.safetyTofMaxRangeM,
+        snapshot.safety.tofMaxRangeM,
+      ),
+      tof_hysteresis_m: parseNumber(
+        form.safetyTofHysteresisM,
+        snapshot.safety.tofHysteresisM,
+      ),
+      imu_stale_ms: Math.round(
+        parseNumber(form.safetyImuStaleMs, snapshot.safety.imuStaleMs),
+      ),
+      tof_stale_ms: Math.round(
+        parseNumber(form.safetyTofStaleMs, snapshot.safety.tofStaleMs),
+      ),
+      rail_good_timeout_ms: Math.round(
+        parseNumber(
+          form.safetyRailGoodTimeoutMs,
+          snapshot.safety.railGoodTimeoutMs,
+        ),
+      ),
+      lambda_drift_limit_nm: parseNumber(
+        form.safetyLambdaDriftLimitNm,
+        snapshot.safety.lambdaDriftLimitNm,
+      ),
+      lambda_drift_hysteresis_nm: parseNumber(
+        form.safetyLambdaDriftHysteresisNm,
+        snapshot.safety.lambdaDriftHysteresisNm,
+      ),
+      lambda_drift_hold_ms: Math.round(
+        parseNumber(
+          form.safetyLambdaDriftHoldMs,
+          snapshot.safety.lambdaDriftHoldMs,
+        ),
+      ),
+      ld_overtemp_limit_c: parseNumber(
+        form.safetyLdOvertempLimitC,
+        snapshot.safety.ldOvertempLimitC,
+      ),
+      tec_temp_adc_trip_v: parseNumber(
+        form.safetyTecTempAdcTripV,
+        snapshot.safety.tecTempAdcTripV,
+      ),
+      tec_temp_adc_hysteresis_v: parseNumber(
+        form.safetyTecTempAdcHysteresisV,
+        snapshot.safety.tecTempAdcHysteresisV,
+      ),
+      tec_temp_adc_hold_ms: Math.round(
+        parseNumber(
+          form.safetyTecTempAdcHoldMs,
+          snapshot.safety.tecTempAdcHoldMs,
+        ),
+      ),
+      tec_min_command_c: parseNumber(
+        form.safetyTecMinCommandC,
+        snapshot.safety.tecMinCommandC,
+      ),
+      tec_max_command_c: parseNumber(
+        form.safetyTecMaxCommandC,
+        snapshot.safety.tecMaxCommandC,
+      ),
+      tec_ready_tolerance_c: parseNumber(
+        form.safetyTecReadyToleranceC,
+        snapshot.safety.tecReadyToleranceC,
+      ),
+      max_laser_current_a: parseNumber(
+        form.safetyMaxLaserCurrentA,
+        snapshot.safety.maxLaserCurrentA,
+      ),
+    }
   }
 
   function moduleStateStep(module: ModuleKey, detail: string) {
@@ -1998,6 +2356,95 @@ export function BringupWorkbench({
     )
   }
 
+  async function applySingleDacShadowChannel(
+    channel: 'ld' | 'tec',
+    stagedVoltage: string,
+  ) {
+    const preparedForm = ensureModuleDebugWrite(sanitizeDacDraft(form), 'dac')
+
+    if (preparedForm !== form) {
+      setForm(preparedForm)
+      if (!form.modules.dac.expectedPresent && !form.modules.dac.debugEnabled) {
+        setDraftNote('DAC debug tooling was auto-enabled for this write so the controller can accept DAC commands.')
+      }
+    }
+
+    const channelLabel = channel === 'ld' ? 'LD' : 'TEC'
+    const readbackRegister = channel === 'ld' ? 0x08 : 0x09
+    const snapshotFallback =
+      channel === 'ld'
+        ? snapshot.bringup.tuning.dacLdChannelV
+        : snapshot.bringup.tuning.dacTecChannelV
+
+    await runCommandSequence(
+      `Apply ${channelLabel} setpoint`,
+      `${channelLabel} DAC shadow setpoint applied and read back.`,
+      [
+        {
+          detail: 'Syncing DAC module plan...',
+          cmd: 'set_module_state',
+          risk: 'write',
+          note: 'Sync the DAC module plan before applying DAC channel settings.',
+          args: {
+            module: toFirmwareModuleName('dac'),
+            expected_present: preparedForm.modules.dac.expectedPresent,
+            debug_enabled: preparedForm.modules.dac.debugEnabled,
+          },
+        },
+        {
+          detail: 'Applying DAC reference and update policy...',
+          cmd: 'dac_debug_config',
+          risk: 'service',
+          note: 'Keep the DAC reference, gain, divider, and update mode aligned before writing a single channel setpoint.',
+          requireService: true,
+          args: {
+            reference_mode: preparedForm.dacReferenceMode,
+            gain_2x: preparedForm.dacGain2x,
+            ref_div: preparedForm.dacRefDiv,
+            sync_mode: preparedForm.dacSyncMode,
+          },
+          retryOnModuleBlocked: {
+            module: 'dac',
+            expectedPresent: preparedForm.modules.dac.expectedPresent,
+            debugEnabled: preparedForm.modules.dac.debugEnabled,
+            label: moduleMeta.dac.label,
+          },
+        },
+        {
+          detail: `Staging ${channelLabel} DAC shadow voltage...`,
+          cmd: 'dac_debug_set',
+          risk: 'service',
+          note: `Stage the DAC ${channelLabel} channel shadow voltage.`,
+          requireService: true,
+          args: {
+            channel,
+            voltage_v: parseNumber(stagedVoltage, snapshotFallback),
+          },
+        },
+        {
+          detail: 'Checking DAC status register for reference alarm...',
+          cmd: 'i2c_read',
+          risk: 'read',
+          note: 'Read back DAC80502 STATUS to confirm REF-ALARM is clear after the channel write.',
+          args: {
+            address: 0x48,
+            reg: 0x07,
+          },
+        },
+        {
+          detail: `Reading back DAC ${channelLabel} data register...`,
+          cmd: 'i2c_read',
+          risk: 'read',
+          note: `Read back DAC80502 ${channelLabel} data register to confirm the staged output code.`,
+          args: {
+            address: 0x48,
+            reg: readbackRegister,
+          },
+        },
+      ],
+    )
+  }
+
   async function applyImuProfile() {
     await runCommandSequence(
       'Apply IMU tuning',
@@ -2026,37 +2473,6 @@ export function BringupWorkbench({
             bdu_enabled: form.imuBduEnabled,
             if_inc_enabled: form.imuIfIncEnabled,
             i2c_disabled: form.imuI2cDisabled,
-          },
-        },
-      ],
-    )
-  }
-
-  async function applyTofProfile() {
-    await runCommandSequence(
-      'Apply ToF limits',
-      'ToF limits staged in the controller bring-up state.',
-      [
-        moduleStateStep('tof', 'Syncing ToF module plan...'),
-        {
-          detail: 'Applying ToF safety window...',
-          cmd: 'tof_debug_config',
-          risk: 'service',
-          note: 'Stage ToF debug thresholds and freshness timeout.',
-          requireService: true,
-          args: {
-            min_range_m: parseNumber(
-              form.tofMinRangeM,
-              snapshot.bringup.tuning.tofMinRangeM,
-            ),
-            max_range_m: parseNumber(
-              form.tofMaxRangeM,
-              snapshot.bringup.tuning.tofMaxRangeM,
-            ),
-            stale_timeout_ms: parseNumber(
-              form.tofStaleTimeoutMs,
-              snapshot.bringup.tuning.tofStaleTimeoutMs,
-            ),
           },
         },
       ],
@@ -2261,6 +2677,14 @@ export function BringupWorkbench({
           },
         })),
         {
+          detail: 'Applying runtime safety policy...',
+          cmd: 'set_runtime_safety',
+          risk: 'service' as const,
+          note: 'Push the shared Service-page safety policy as part of the full bring-up plan.',
+          requireService: true,
+          args: buildSafetyPolicyArgs(),
+        },
+        {
           detail: 'Applying DAC profile...',
           cmd: 'dac_debug_config',
           risk: 'service' as const,
@@ -2323,27 +2747,6 @@ export function BringupWorkbench({
             bdu_enabled: form.imuBduEnabled,
             if_inc_enabled: form.imuIfIncEnabled,
             i2c_disabled: form.imuI2cDisabled,
-          },
-        },
-        {
-          detail: 'Applying ToF limits...',
-          cmd: 'tof_debug_config',
-          risk: 'service' as const,
-          note: 'Stage ToF debug thresholds and freshness timeout.',
-          requireService: true,
-          args: {
-            min_range_m: parseNumber(
-              form.tofMinRangeM,
-              snapshot.bringup.tuning.tofMinRangeM,
-            ),
-            max_range_m: parseNumber(
-              form.tofMaxRangeM,
-              snapshot.bringup.tuning.tofMaxRangeM,
-            ),
-            stale_timeout_ms: parseNumber(
-              form.tofStaleTimeoutMs,
-              snapshot.bringup.tuning.tofStaleTimeoutMs,
-            ),
           },
         },
         {
@@ -2451,7 +2854,7 @@ export function BringupWorkbench({
   }
 
   useEffect(() => {
-    if (!connected) {
+    if (!commandReady) {
       return
     }
 
@@ -2542,7 +2945,7 @@ export function BringupWorkbench({
       window.clearInterval(timerId)
     }
   }, [
-    connected,
+    commandReady,
     desiredModulePlanSignature,
     form.modules,
     onIssueCommandAwaitAck,
@@ -2722,6 +3125,161 @@ export function BringupWorkbench({
     }
   }
 
+async function setLdSbdnMode(mode: LdSbdnMode) {
+    const labelByMode: Record<LdSbdnMode, string> = {
+      firmware: 'Auto',
+      'off-pd': 'Off',
+      'on-pu': 'On',
+      'standby-hiz': 'Standby',
+    }
+    const detailByMode: Record<LdSbdnMode, string> = {
+      firmware: 'Releasing GPIO13 back to normal firmware ownership...',
+      'off-pd': 'Driving GPIO13 low for Off...',
+      'on-pu': 'Driving GPIO13 high for On...',
+      'standby-hiz': 'Releasing GPIO13 to input mode for Standby...',
+    }
+    const noteByMode: Record<LdSbdnMode, string> = {
+      firmware: 'Release GPIO13 so the original firmware logic regains SBDN ownership.',
+      'off-pd': 'Service-only override: drive GPIO13 low to hold the laser driver off.',
+      'on-pu': 'Service-only override: drive GPIO13 high to force the laser driver on.',
+      'standby-hiz': 'Service-only override: leave GPIO13 high impedance so SBDN sits in the standby threshold window.',
+    }
+    const argsByMode: Record<LdSbdnMode, Record<string, number | string | boolean>> = {
+      firmware: {
+        gpio: 13,
+        mode: 'firmware',
+        level_high: false,
+        pullup_enabled: false,
+        pulldown_enabled: false,
+      },
+      'off-pd': {
+        gpio: 13,
+        mode: 'output',
+        level_high: false,
+        pullup_enabled: false,
+        pulldown_enabled: false,
+      },
+      'on-pu': {
+        gpio: 13,
+        mode: 'output',
+        level_high: true,
+        pullup_enabled: false,
+        pulldown_enabled: false,
+      },
+      'standby-hiz': {
+        gpio: 13,
+        mode: 'input',
+        level_high: false,
+        pullup_enabled: false,
+        pulldown_enabled: false,
+      },
+    }
+
+    await runCommandSequence(
+      `Set LD SBDN ${labelByMode[mode]}`,
+      `LD SBDN moved to ${labelByMode[mode]}.`,
+      [
+        {
+          detail: detailByMode[mode],
+          cmd: 'set_gpio_override',
+          risk: 'service',
+          note: noteByMode[mode],
+          requireService: true,
+          args: argsByMode[mode],
+        },
+      ],
+      {
+        refreshAfter: false,
+      },
+    )
+  }
+
+  async function setLdPcnMode(mode: LdPcnMode) {
+    const detailByMode: Record<LdPcnMode, string> = {
+      firmware: 'Releasing GPIO21 back to normal firmware ownership...',
+      lisl: 'Driving GPIO21 low for LISL selection...',
+      lish: 'Driving GPIO21 high for LISH selection...',
+    }
+    const noteByMode: Record<LdPcnMode, string> = {
+      firmware: 'Release GPIO21 so the original firmware logic regains PCN ownership.',
+      lisl: 'Service-only override: drive GPIO21 low to select the LISL leg.',
+      lish: 'Service-only override: drive GPIO21 high to select the LISH leg.',
+    }
+    const argsByMode: Record<LdPcnMode, Record<string, number | string | boolean>> = {
+      firmware: {
+        gpio: 21,
+        mode: 'firmware',
+        level_high: false,
+        pullup_enabled: false,
+        pulldown_enabled: false,
+      },
+      lisl: {
+        gpio: 21,
+        mode: 'output',
+        level_high: false,
+        pullup_enabled: false,
+        pulldown_enabled: false,
+      },
+      lish: {
+        gpio: 21,
+        mode: 'output',
+        level_high: true,
+        pullup_enabled: false,
+        pulldown_enabled: false,
+      },
+    }
+
+    await runCommandSequence(
+      `Set LD PCN ${mode}`,
+      `LD PCN moved to ${mode}.`,
+      [
+        {
+          detail: detailByMode[mode],
+          cmd: 'set_gpio_override',
+          risk: 'service',
+          note: noteByMode[mode],
+          requireService: true,
+          args: argsByMode[mode],
+        },
+      ],
+      {
+        refreshAfter: false,
+      },
+    )
+  }
+
+  async function setBringupGreenLaserEnabled(enabled: boolean) {
+    await runCommandSequence(
+      enabled ? 'Enable green laser' : 'Disable green laser',
+      enabled
+        ? 'GPIO37 is now driving the shared green-laser enable net high.'
+        : 'GPIO37 is now driving the shared green-laser enable net low.',
+      [
+        {
+          detail: enabled
+            ? 'Driving GPIO37 high on the shared GN_LD_EN / ERM_TRIG net...'
+            : 'Driving GPIO37 low on the shared GN_LD_EN / ERM_TRIG net...',
+          cmd: 'set_gpio_override',
+          risk: 'service',
+          note: enabled
+            ? 'Service-only direct green-laser enable: drive GPIO37 high on the shared GN_LD_EN / ERM_TRIG net.'
+            : 'Service-only direct green-laser disable: drive GPIO37 low on the shared GN_LD_EN / ERM_TRIG net.',
+          requireService: true,
+          args: {
+            gpio: 37,
+            mode: 'output',
+            level_high: enabled,
+            pullup_enabled: false,
+            pulldown_enabled: false,
+          },
+        },
+      ],
+      {
+        refreshAfter: false,
+      },
+    )
+  }
+
   function patchHapticPattern<Key extends keyof HapticPatternDraft>(
     key: Key,
     value: HapticPatternDraft[Key],
@@ -2832,8 +3390,8 @@ export function BringupWorkbench({
         detail:
           'Service-only VIN enable for the laser-driver power rail. Driver standby stays asserted; this page never enables emission.',
         requested: connected ? snapshot.bringup.power.ldRequested : false,
-        enabled: snapshot.rails.ld.enabled,
-        pgood: snapshot.rails.ld.pgood,
+        enabled: liveSnapshot.rails.ld.enabled,
+        pgood: liveSnapshot.rails.ld.pgood,
       },
       {
         key: 'tec' as const,
@@ -2841,8 +3399,8 @@ export function BringupWorkbench({
         detail:
           'Service-only VIN enable for the TEC controller rail. Use this to prove rail startup and PGOOD behavior before closing the loop.',
         requested: connected ? snapshot.bringup.power.tecRequested : false,
-        enabled: snapshot.rails.tec.enabled,
-        pgood: snapshot.rails.tec.pgood,
+        enabled: liveSnapshot.rails.tec.enabled,
+        pgood: liveSnapshot.rails.tec.pgood,
       },
     ]
 
@@ -2871,8 +3429,8 @@ export function BringupWorkbench({
             <div>
               <span>Live LD rail</span>
               <strong>
-                {snapshot.rails.ld.enabled
-                  ? snapshot.rails.ld.pgood
+                {liveSnapshot.rails.ld.enabled
+                  ? liveSnapshot.rails.ld.pgood
                     ? 'enabled / PGOOD'
                     : 'enabled / waiting'
                   : 'off'}
@@ -2881,8 +3439,8 @@ export function BringupWorkbench({
             <div>
               <span>Live TEC rail</span>
               <strong>
-                {snapshot.rails.tec.enabled
-                  ? snapshot.rails.tec.pgood
+                {liveSnapshot.rails.tec.enabled
+                  ? liveSnapshot.rails.tec.pgood
                     ? 'enabled / PGOOD'
                     : 'enabled / waiting'
                   : 'off'}
@@ -3064,7 +3622,7 @@ export function BringupWorkbench({
             <button
               type="button"
               className="action-button is-inline is-accent"
-              disabled={!connected || serviceModeActive || operation !== null}
+              disabled={!commandReady || serviceModeActive || operation !== null}
               title="Request service mode with beam permission held off."
               onClick={() => {
                 void requestServiceMode()
@@ -3075,7 +3633,7 @@ export function BringupWorkbench({
             <button
               type="button"
               className="action-button is-inline"
-              disabled={!connected || !serviceModeActive || operation !== null}
+              disabled={!commandReady || !serviceModeActive || operation !== null}
               title="Return the controller to normal safe supervision."
               onClick={() =>
                 void runCommandSequence(
@@ -3104,7 +3662,7 @@ export function BringupWorkbench({
           </div>
 
           <p className="panel-note">
-            Keep operational control in the Control page. Use this service page for threshold, hysteresis, and timeout policy that changes how the firmware supervises the bench.
+            Keep operational control in the Control page. Use this service page for all threshold, hysteresis, and timeout policy that changes how the firmware supervises the bench. Module pages may show those live values, but they should not own safety edits.
           </p>
 
           <div className="button-row">
@@ -3496,7 +4054,7 @@ export function BringupWorkbench({
             <button
               type="button"
               className="action-button is-inline is-accent"
-              disabled={!connected || operation !== null}
+              disabled={!commandReady || operation !== null}
               title="Push the entire staged bring-up draft to the controller. A write session will be requested automatically only when needed."
               onClick={() => {
                 void pushDraftToDevice()
@@ -3510,7 +4068,7 @@ export function BringupWorkbench({
             <button
               type="button"
               className="action-button is-inline"
-              disabled={!connected || operation !== null}
+              disabled={!commandReady || operation !== null}
               title="Ask the current bench firmware to persist the active bring-up profile. Service mode is not required."
               onClick={() =>
                 void runCommandSequence(
@@ -3906,6 +4464,10 @@ export function BringupWorkbench({
           <p className="inline-help">
             Board-valid DAC output span on this PCB is `0.0-2.5 V` for both channels.
             `DAC_OUTA` drives laser `LISH`; `DAC_OUTB` drives TEC `TMS`.
+          </p>
+          <p className="inline-help">
+            The Laser driver and TEC bring-up pages now edit these same channel A/B
+            draft values. There is only one DAC shadow plan in the host.
           </p>
           {dacInternalReferenceSelected ? (
             <p className="inline-help">
@@ -4620,63 +5182,32 @@ export function BringupWorkbench({
             control path stays inactive unless it is intentionally exercised.
           </p>
 
-          <div className="field-grid">
-            <label className="field">
-              <FieldLabel
-                label="Minimum safe range (m)"
-                help="Lower bound of the allowed distance window. Any reading below this limit is treated as unsafe."
-              />
-              <input
-                value={form.tofMinRangeM}
-                title="Stage the minimum allowed ToF range in meters."
-                onChange={(event) => patchForm('tofMinRangeM', event.target.value)}
-              />
-            </label>
-
-            <label className="field">
-              <FieldLabel
-                label="Maximum safe range (m)"
-                help="Upper bound of the allowed distance window. Any reading above this limit is treated as unsafe."
-              />
-              <input
-                value={form.tofMaxRangeM}
-                title="Stage the maximum allowed ToF range in meters."
-                onChange={(event) => patchForm('tofMaxRangeM', event.target.value)}
-              />
-            </label>
-
-            <label className="field">
-              <FieldLabel
-                label="Stale-data timeout (ms)"
-                help="Freshness budget in milliseconds. If the controller does not receive a new valid sample before this timeout expires, the distance path is treated as unsafe."
-              />
-              <input
-                value={form.tofStaleTimeoutMs}
-                title="Stage the ToF stale-data timeout in milliseconds."
-                onChange={(event) => patchForm('tofStaleTimeoutMs', event.target.value)}
-              />
-            </label>
+          <div className="bringup-fact-grid">
+            <div>
+              <span>Safe window</span>
+              <strong>
+                {formatNumber(snapshot.safety.tofMinRangeM, 2)}-{formatNumber(snapshot.safety.tofMaxRangeM, 2)} m
+              </strong>
+            </div>
+            <div>
+              <span>Stale timeout</span>
+              <strong>{snapshot.safety.tofStaleMs} ms</strong>
+            </div>
+            <div>
+              <span>Hysteresis</span>
+              <strong>{formatNumber(snapshot.safety.tofHysteresisM, 3)} m</strong>
+            </div>
+            <div>
+              <span>Policy owner</span>
+              <strong>Service tab</strong>
+            </div>
           </div>
 
           <p className="inline-help">
-            Distance limits are in meters. The stale timeout is in milliseconds.
-            Unknown, out-of-window, or older-than-timeout samples must force the
-            controller to treat the ToF path as unsafe.
+            ToF distance limits and stale-data timeout are runtime safety policy, not
+            module-local tuning. Edit them only in <code>Bring-up -&gt; Service</code>, where the
+            full interlock policy is staged together.
           </p>
-
-          <div className="button-row">
-            <button
-              type="button"
-              className="action-button is-inline is-accent"
-              disabled={writesDisabled}
-              title="Stage the generic ToF range window and stale-data timeout."
-              onClick={() => {
-                void applyTofProfile()
-              }}
-            >
-              Apply ToF limits
-            </button>
-          </div>
 
           <div className="panel-cutout bringup-illumination-card">
             <div className="cutout-head">
@@ -4686,7 +5217,7 @@ export function BringupWorkbench({
             <p className="inline-help">
               The front visible LED path uses the TPS61169 `CTRL` pin on `GPIO6`.
               Firmware keeps that line low by default, and only drives a service-only
-              `5 kHz` PWM dimming signal here while service mode is active.
+              `20 kHz` PWM dimming signal here while service mode is active.
             </p>
 
             <label className="field">
@@ -4746,7 +5277,7 @@ export function BringupWorkbench({
 
             <p className="inline-help">
               TPS61169 brightness dimming is PWM-based on `CTRL`; this bring-up path
-              keeps a fixed `5 kHz` carrier and only changes duty cycle so the test
+              keeps a fixed `20 kHz` carrier and only changes duty cycle so the test
               stays easy to reproduce. Leaving service mode forces the line low again.
             </p>
           </div>
@@ -4765,7 +5296,7 @@ export function BringupWorkbench({
               <strong>{formatNumber(liveIllumination.frequencyHz / 1000, 1)} kHz</strong>
             </div>
             <div>
-              <span>Controller live distance</span>
+              <span>Controller filtered distance</span>
               <strong>{formatNumber(snapshot.tof.distanceM, 2)} m</strong>
             </div>
             <div>
@@ -4820,10 +5351,10 @@ export function BringupWorkbench({
             status, and the raw distance register in millimeters.
           </p>
           <p className="inline-help">
-            `Controller live distance` and `Controller validity` are the safety-path
+            `Controller filtered distance` and `Controller validity` are the safety-path
             values the rest of the GUI uses for interlock cards. `Raw distance register`
-            is direct peripheral readback and may be present before the controller
-            promotes it into a valid, fresh safety sample.
+            is direct peripheral readback and can jump before the controller accepts it
+            as a stable, fresh safety sample.
           </p>
         </article>
       </div>
@@ -5427,75 +5958,833 @@ export function BringupWorkbench({
   }
 
   function renderLaserPage() {
+    const draftLdVoltageV = clampLdCommandVoltageV(
+      parseNumber(form.dacLdVoltage, snapshot.bringup.tuning.dacLdChannelV),
+    )
+    const draftLdCurrentA = clampLdCommandCurrentA(
+      estimateLdCurrentFromVoltageV(draftLdVoltageV),
+    )
+    const liveLaser = ldDisplaySample
+    const loopTone = liveLaser.loopGood ? 'ok' : liveLaser.railEnabled ? 'warn' : 'off'
+    const railTone = liveLaser.railPgood ? 'ok' : liveLaser.railEnabled ? 'warn' : 'off'
+    const dacTone = snapshot.peripherals.dac.reachable
+      ? snapshot.peripherals.dac.configured
+        ? 'ok'
+        : 'warn'
+      : 'off'
+    const refAlarmTone = snapshot.peripherals.dac.refAlarm
+      ? 'critical'
+      : snapshot.peripherals.dac.reachable
+        ? 'ok'
+        : 'off'
+    const sbdnStatus = describeLdSbdnMode(liveSnapshot)
+    const pcnStatus = describeLdPcnMode(liveSnapshot)
+    const greenIo37Status = describeGreenIo37State(liveSnapshot)
+    const nirRequested = liveSnapshot.bench.requestedNirEnabled
+    const nirActive = liveSnapshot.laser.nirEnabled
+    const nirTone: UiTone =
+      nirActive
+        ? 'steady'
+        : nirRequested
+          ? liveSnapshot.safety.allowNir
+            ? 'warning'
+            : 'critical'
+          : 'steady'
+    const tmoTempValid = liveLaser.railPgood && sbdnStatus.mode !== 'off-pd'
+    const liveCurrentPercent = Math.max(
+      0,
+      Math.min(100, (liveLaser.measuredCurrentA / LD_CURRENT_FULL_SCALE_A) * 100),
+    )
+    const stagedCurrentPercent = Math.max(
+      0,
+      Math.min(100, (draftLdCurrentA / LD_CURRENT_UI_MAX_A) * 100),
+    )
+    const commandVoltagePercent = Math.max(
+      0,
+      Math.min(100, (liveLaser.commandVoltageV / DAC80502_BOARD_SPAN_V) * 100),
+    )
+    const currentMonitorPercent = Math.max(
+      0,
+      Math.min(100, (liveLaser.currentMonitorVoltageV / DAC80502_BOARD_SPAN_V) * 100),
+    )
+    const tempMonitorPercent = Math.max(
+      0,
+      Math.min(100, (liveLaser.driverTempVoltageV / LD_TEMP_MONITOR_MAX_V) * 100),
+    )
+    const liveCurrentTone: UiTone =
+      liveLaser.measuredCurrentA >= 4.5
+        ? 'critical'
+        : liveLaser.measuredCurrentA > 0.08
+          ? 'steady'
+          : 'warning'
+
+    function patchLdVoltageDraft(rawValue: string) {
+      const nextVoltageV = clampLdCommandVoltageV(parseNumber(rawValue, draftLdVoltageV))
+      patchForm('dacLdVoltage', formatNumber(nextVoltageV, 3))
+    }
+
+    function patchLdCurrentDraft(rawValue: string) {
+      const nextCurrentA = clampLdCommandCurrentA(parseNumber(rawValue, draftLdCurrentA))
+      patchForm('dacLdVoltage', formatNumber((nextCurrentA / LD_CURRENT_FULL_SCALE_A) * DAC80502_BOARD_SPAN_V, 3))
+    }
+
     return (
       <div className="bringup-page-grid">
         {renderModuleSettings('laserDriver')}
 
-        <article className="panel-cutout">
+        <article className="panel-cutout bringup-ld">
           <div className="cutout-head">
             <Radio size={16} />
-            <strong>Supervision snapshot</strong>
+            <strong>Laser-driver bring-up</strong>
           </div>
-          <div className="bringup-fact-grid">
-            <div>
-              <span>Driver standby</span>
-              <strong>{snapshot.laser.driverStandby ? 'Yes' : 'No'}</strong>
-            </div>
-            <div>
-              <span>Loop good</span>
-              <strong>{snapshot.laser.loopGood ? 'Yes' : 'No'}</strong>
-            </div>
-            <div>
-              <span>Measured current</span>
-              <strong>{formatNumber(snapshot.laser.measuredCurrentA, 3)} A</strong>
-            </div>
-            <div>
-              <span>Driver temp</span>
-              <strong>{formatNumber(snapshot.laser.driverTempC, 1)} C</strong>
-            </div>
+          <p className="bringup-ld__lead">
+            DAC channel A drives `LISH`. Stage the request here in driver terms,
+            then confirm the real `LIO`, `TMO`, `PCN`, `SBDN`, loop-good, and rail
+            readback on the live side.
+          </p>
+          <div className="bringup-ld__layout">
+            <section className="bringup-ld__panel">
+              <div className="bringup-ld__section-head">
+                <div>
+                  <strong>Command path</strong>
+                  <small>One shared DAC A shadow. Host setpoints stay capped at 5.00 A.</small>
+                </div>
+              </div>
+              <div className="bringup-ld__input-grid">
+                <label className="field">
+                  <FieldLabel
+                    label="Set current (A)"
+                    help="Stage the LD current request in driver terms. The real ATLS6A214 span is 0–6 A across 0–2.5 V on LISH, but this page clamps commands at 5 A."
+                  />
+                  <input
+                    value={formatNumber(draftLdCurrentA, 3)}
+                    title="Stage the LD current request in amps. This stays capped at 5.00 A."
+                    onChange={(event) => patchLdCurrentDraft(event.target.value)}
+                  />
+                </label>
+                <label className="field">
+                  <FieldLabel
+                    label="DAC A / LISH (V)"
+                    help="Same shared DAC channel A draft shown on the DAC page. The host caps this bring-up path at 2.083 V, which corresponds to 5 A."
+                  />
+                  <input
+                    value={formatNumber(draftLdVoltageV, 3)}
+                    title="Stage the LD / LISH DAC voltage in volts."
+                    onChange={(event) => patchLdVoltageDraft(event.target.value)}
+                  />
+                </label>
+              </div>
+
+              <div className="bringup-ld__summary-strip">
+                <div className="bringup-ld__live-summary">
+                  <span>Estimated diode load</span>
+                  <strong>{formatNumber(liveLaser.diodeElectricalPowerW, 2)} W</strong>
+                  <small>Based on live current with a 3.0 V diode model.</small>
+                </div>
+                <div className="bringup-ld__live-summary">
+                  <span>Estimated VIN draw</span>
+                  <strong>{formatNumber(liveLaser.supplyDrawW, 2)} W</strong>
+                  <small>Derived from live load using 90% driver efficiency.</small>
+                </div>
+              </div>
+
+              <div className="field">
+                <FieldLabel
+                  label="Current request slider"
+                  help="0–5 A host safety range. Moving this slider updates the same DAC channel A draft used by the DAC page."
+                />
+                <input
+                  className="bringup-ld__target-slider"
+                  type="range"
+                  min={0}
+                  max={LD_CURRENT_UI_MAX_A}
+                  step={0.01}
+                  value={draftLdCurrentA}
+                  title="Slide the staged LD current request from 0 to 5 A."
+                  onChange={(event) => patchLdCurrentDraft(event.target.value)}
+                />
+              </div>
+
+              <div className="bringup-ld__progress-card">
+                <div className="bringup-ld__meter-head">
+                  <span>Staged current request</span>
+                  <strong>{formatNumber(draftLdCurrentA, 2)} A</strong>
+                </div>
+                <ProgressMeter value={stagedCurrentPercent} tone="steady" />
+                <div className="bringup-ld__meter-scale">
+                  <span>0 A</span>
+                  <span>5 A cap</span>
+                </div>
+              </div>
+
+              <div className="button-row">
+                <button
+                  type="button"
+                  className="action-button is-inline is-accent"
+                  disabled={writesDisabled}
+                  title="Apply the LD / LISH DAC setpoint and read back the DAC status plus channel A register."
+                  onClick={() => {
+                    void applySingleDacShadowChannel('ld', form.dacLdVoltage)
+                  }}
+                >
+                  Apply LD setpoint
+                </button>
+                <button
+                  type="button"
+                  className="action-button is-inline"
+                  disabled={readsDisabled}
+                  title="Read the DAC STATUS register to confirm REF-ALARM is clear."
+                  onClick={() => {
+                    void moduleQuickReadI2c(
+                      'Read DAC STATUS',
+                      0x48,
+                      0x07,
+                      'Read the DAC80502 STATUS register. REF-ALARM=1 forces both outputs to 0 V.',
+                    )
+                  }}
+                >
+                  Read STATUS
+                </button>
+                <button
+                  type="button"
+                  className="action-button is-inline"
+                  disabled={readsDisabled}
+                  title="Read the DAC channel A data register that drives LISH."
+                  onClick={() => {
+                    void moduleQuickReadI2c(
+                      'Read DAC LD DATA',
+                      0x48,
+                      0x08,
+                      'Read the DAC80502 channel A data register that drives DAC_OUTA / LISH.',
+                    )
+                  }}
+                >
+                  Read LD DATA
+                </button>
+              </div>
+
+              <div className="button-row">
+                <button
+                  type="button"
+                  className="action-button is-inline"
+                  disabled={writesDisabled}
+                  title={
+                    greenIo37Status.enabled
+                      ? 'Drive GPIO37 low to disable the shared green-laser enable net.'
+                      : 'Drive GPIO37 high to enable the shared green-laser enable net.'
+                  }
+                  onClick={() => {
+                    void setBringupGreenLaserEnabled(!greenIo37Status.enabled)
+                  }}
+                >
+                  {greenIo37Status.enabled ? 'Disable Green Laser' : 'Enable Green Laser'}
+                </button>
+              </div>
+
+              <div className="bringup-ld__mode-grid">
+                <div className="bringup-ld__mode-card">
+                  <div className="bringup-ld__meter-head">
+                    <span>SBDN mode</span>
+                    <strong>{sbdnStatus.label}</strong>
+                  </div>
+                  <small>{sbdnStatus.detail}</small>
+                  <div className="bringup-ld__mode-switch bringup-ld__mode-switch--sbdn">
+                    <button
+                      type="button"
+                      className={sbdnStatus.mode === 'firmware' ? 'segmented__button is-active' : 'segmented__button'}
+                      disabled={writesDisabled}
+                      title="Release GPIO13 back to firmware ownership."
+                      onClick={() => {
+                        void setLdSbdnMode('firmware')
+                      }}
+                    >
+                      Auto
+                    </button>
+                    <button
+                      type="button"
+                      className={sbdnStatus.mode === 'off-pd' ? 'segmented__button is-active' : 'segmented__button'}
+                      disabled={writesDisabled}
+                      title="Drive GPIO13 low to force the laser driver off."
+                      onClick={() => {
+                        void setLdSbdnMode('off-pd')
+                      }}
+                    >
+                      Off
+                    </button>
+                    <button
+                      type="button"
+                      className={sbdnStatus.mode === 'standby-hiz' ? 'segmented__button is-active' : 'segmented__button'}
+                      disabled={writesDisabled}
+                      title="Release GPIO13 to high impedance for standby."
+                      onClick={() => {
+                        void setLdSbdnMode('standby-hiz')
+                      }}
+                    >
+                      Standby
+                    </button>
+                    <button
+                      type="button"
+                      className={sbdnStatus.mode === 'on-pu' ? 'segmented__button is-active' : 'segmented__button'}
+                      disabled={writesDisabled}
+                      title="Drive GPIO13 high to force the laser driver on."
+                      onClick={() => {
+                        void setLdSbdnMode('on-pu')
+                      }}
+                    >
+                      On
+                    </button>
+                  </div>
+                </div>
+
+                <div className="bringup-ld__mode-card">
+                  <div className="bringup-ld__meter-head">
+                    <span>PCN current leg</span>
+                    <strong>{pcnStatus.label}</strong>
+                  </div>
+                  <small>{pcnStatus.detail}</small>
+                  <div className="bringup-ld__mode-switch bringup-ld__mode-switch--pcn">
+                    <button
+                      type="button"
+                      className={pcnStatus.mode === 'firmware' ? 'segmented__button is-active' : 'segmented__button'}
+                      disabled={writesDisabled}
+                      title="Release GPIO21 back to firmware ownership."
+                      onClick={() => {
+                        void setLdPcnMode('firmware')
+                      }}
+                    >
+                      Firmware
+                    </button>
+                    <button
+                      type="button"
+                      className={pcnStatus.mode === 'lisl' ? 'segmented__button is-active' : 'segmented__button'}
+                      disabled={writesDisabled}
+                      title="Drive GPIO21 low to force LISL."
+                      onClick={() => {
+                        void setLdPcnMode('lisl')
+                      }}
+                    >
+                      LISL
+                    </button>
+                    <button
+                      type="button"
+                      className={pcnStatus.mode === 'lish' ? 'segmented__button is-active' : 'segmented__button'}
+                      disabled={writesDisabled}
+                      title="Drive GPIO21 high to force LISH."
+                      onClick={() => {
+                        void setLdPcnMode('lish')
+                      }}
+                    >
+                      LISH
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <section className="bringup-ld__panel bringup-ld__panel--live">
+              <div className="bringup-ld__section-head">
+                <div>
+                  <strong>Live driver readback</strong>
+                  <small>These cards reflect controller telemetry and GPIO truth, not just the staged host request. Sampled at 2 Hz for readability.</small>
+                </div>
+              </div>
+
+              <div className="bringup-ld__live-summary-grid">
+                <div>
+                  <span>Live current</span>
+                  <strong>{formatNumber(liveLaser.measuredCurrentA, 2)} A</strong>
+                  <small>{formatNumber(liveLaser.currentMonitorVoltageV, 3)} V on LIO</small>
+                </div>
+                <div>
+                  <span>TMO temp</span>
+                  <strong>{tmoTempValid ? `${formatNumber(liveLaser.driverTempC, 1)} °C` : 'Not valid'}</strong>
+                  <small>
+                    {tmoTempValid
+                      ? `${formatNumber(liveLaser.driverTempVoltageV, 3)} V on TMO`
+                      : 'Only valid when LD rail PGOOD is high and SBDN is not OFF-PD.'}
+                  </small>
+                </div>
+                <div>
+                  <span>Laser load</span>
+                  <strong>{formatNumber(liveLaser.diodeElectricalPowerW, 2)} W</strong>
+                  <small>Live current multiplied by the 3.0 V diode model.</small>
+                </div>
+                <div>
+                  <span>VIN draw</span>
+                  <strong>{formatNumber(liveLaser.supplyDrawW, 2)} W</strong>
+                  <small>Estimated upstream electrical draw.</small>
+                </div>
+              </div>
+
+              <div className="bringup-ld__status-tags">
+                <div className="bringup-ld__status-tag" data-tone={loopTone}>
+                  <span>Loop Good</span>
+                  <strong>{liveLaser.loopGood ? 'Good' : 'Low'}</strong>
+                </div>
+                <div className="bringup-ld__status-tag" data-tone={railTone}>
+                  <span>LD rail PGOOD</span>
+                  <strong>{liveLaser.railPgood ? 'Good' : 'Low'}</strong>
+                </div>
+                <div className="bringup-ld__status-tag" data-tone={dacTone}>
+                  <span>DAC path</span>
+                  <strong>{snapshot.peripherals.dac.reachable ? 'Reachable' : 'No response'}</strong>
+                </div>
+                <div className="bringup-ld__status-tag" data-tone={refAlarmTone}>
+                  <span>REF_ALARM</span>
+                  <strong>{snapshot.peripherals.dac.refAlarm ? 'Asserted' : 'Clear'}</strong>
+                </div>
+                <div className="bringup-ld__status-tag" data-tone={sbdnStatus.tone}>
+                  <span>SBDN state</span>
+                  <strong>{sbdnStatus.label}</strong>
+                </div>
+                <div className="bringup-ld__status-tag" data-tone={pcnStatus.tone}>
+                  <span>PCN state</span>
+                  <strong>{pcnStatus.label}</strong>
+                </div>
+                <div className="bringup-ld__status-tag" data-tone={nirTone}>
+                  <span>NIR request</span>
+                  <strong>{nirRequested ? 'Staged' : 'Clear'}</strong>
+                </div>
+                <div className="bringup-ld__status-tag" data-tone={nirActive ? 'ok' : liveSnapshot.safety.allowNir ? 'off' : 'warning'}>
+                  <span>NIR live</span>
+                  <strong>{nirActive ? 'On' : 'Off'}</strong>
+                </div>
+                <div className="bringup-ld__status-tag" data-tone={greenIo37Status.tone}>
+                  <span>Green net</span>
+                  <strong>{greenIo37Status.label}</strong>
+                </div>
+                <div className="bringup-ld__status-tag" data-tone={greenIo37Status.tone}>
+                  <span>Green owner</span>
+                  <strong>{greenIo37Status.owner}</strong>
+                </div>
+              </div>
+
+              <div className="bringup-ld__progress-card">
+                <div className="bringup-ld__meter-head">
+                  <span>Live driver current</span>
+                  <strong>{formatNumber(liveLaser.measuredCurrentA, 2)} A</strong>
+                </div>
+                <ProgressMeter value={liveCurrentPercent} tone={liveCurrentTone} />
+                <div className="bringup-ld__meter-scale">
+                  <span>0 A</span>
+                  <span>6 A full span</span>
+                </div>
+              </div>
+
+              <div className="bringup-ld__meter-grid">
+                <div className="bringup-ld__meter-card">
+                  <div className="bringup-ld__meter-head">
+                    <span>LISH command</span>
+                    <strong>{formatNumber(liveLaser.commandVoltageV, 3)} V</strong>
+                  </div>
+                  <ProgressMeter value={commandVoltagePercent} tone="steady" />
+                  <div className="bringup-ld__meter-scale">
+                    <span>0 V</span>
+                    <span>2.5 V span</span>
+                  </div>
+                </div>
+                <div className="bringup-ld__meter-card">
+                  <div className="bringup-ld__meter-head">
+                    <span>LIO current monitor</span>
+                    <strong>{formatNumber(liveLaser.currentMonitorVoltageV, 3)} V</strong>
+                  </div>
+                  <ProgressMeter value={currentMonitorPercent} tone={liveCurrentTone} />
+                  <div className="bringup-ld__meter-scale">
+                    <span>0 V</span>
+                    <span>2.5 V</span>
+                  </div>
+                </div>
+                <div className="bringup-ld__meter-card">
+                  <div className="bringup-ld__meter-head">
+                    <span>TMO voltage</span>
+                    <strong>{tmoTempValid ? `${formatNumber(liveLaser.driverTempVoltageV, 3)} V` : 'Invalid now'}</strong>
+                  </div>
+                  <ProgressMeter value={tmoTempValid ? tempMonitorPercent : 0} tone="warning" />
+                  <div className="bringup-ld__meter-scale">
+                    <span>0 V</span>
+                    <span>2.5 V</span>
+                  </div>
+                </div>
+                <div className="bringup-ld__meter-card bringup-ld__meter-card--register">
+                  <div className="bringup-ld__meter-head">
+                    <span>DAC channel A</span>
+                    <strong>{formatRegisterHex(snapshot.peripherals.dac.dataAReg)}</strong>
+                  </div>
+                  <small>{formatDacRegisterEquivalent(snapshot.peripherals.dac.dataAReg)}</small>
+                  <div className="bringup-ld__meter-scale">
+                    <span>STATUS {formatRegisterHex(snapshot.peripherals.dac.statusReg)}</span>
+                    <span>GAIN {formatRegisterHex(snapshot.peripherals.dac.gainReg)}</span>
+                  </div>
+                </div>
+              </div>
+            </section>
           </div>
           <p className="inline-help">
-            This page is intentionally read-only in bring-up. Use DAC and Control
-            pages to stage current requests, but keep the real laser hardware absent
-            until IMU, PD, and rail supervision are proven.
+            `TMO` temperature is only treated as valid when the LD rail is good and
+            `SBDN` is not forcing OFF-PD. `PCN` and `SBDN` controls on this page are
+            service-only GPIO overrides layered on top of the normal firmware logic.
+            On this page, green-laser control is also a direct service override on
+            shared `GPIO37 / GN_LD_EN`, so it drives the pin high or low directly
+            instead of staging a normal runtime alignment request.
           </p>
+          <p className="inline-help">{snapshot.bringup.tools.lastI2cOp}</p>
         </article>
       </div>
     )
   }
 
   function renderTecPage() {
+    const tecVoltageRange = {
+      min: tecCalibrationPoints[0].tecVoltageV,
+      max: tecCalibrationPoints[tecCalibrationPoints.length - 1].tecVoltageV,
+    }
+    const tecTempRange = {
+      min: tecCalibrationPoints[0].tempC,
+      max: tecCalibrationPoints[tecCalibrationPoints.length - 1].tempC,
+    }
+    const tecWavelengthRange = {
+      min: tecCalibrationPoints[0].wavelengthNm,
+      max: tecCalibrationPoints[tecCalibrationPoints.length - 1].wavelengthNm,
+    }
+    const draftTecVoltageV = clampTecVoltageV(
+      parseNumber(form.dacTecVoltage, snapshot.bringup.tuning.dacTecChannelV),
+    )
+    const draftTecTempC = estimateTempFromTecVoltageV(draftTecVoltageV)
+    const draftTecLambdaNm = estimateWavelengthFromTecVoltageV(draftTecVoltageV)
+    const sampledTec = tecDisplaySample
+    const tecElectricalPowerW = Math.abs(sampledTec.currentA * sampledTec.voltageV)
+    const tecSupplyDrawW = tecElectricalPowerW / 0.9
+    const liveLambdaDeltaNm = sampledTec.actualLambdaNm - draftTecLambdaNm
+    const commandVoltagePercent = Math.max(0, Math.min(100, (sampledTec.commandVoltageV / 2.5) * 100))
+    const tempAdcPercent = Math.max(0, Math.min(100, (sampledTec.tempAdcVoltageV / 2.5) * 100))
+    const tecVoltagePercent = Math.max(0, Math.min(100, (sampledTec.voltageV / 5.0) * 100))
+    const currentMagnitudePercent = Math.min(
+      50,
+      (Math.abs(sampledTec.currentA) / 3.5) * 50,
+    )
+    const currentDirectionClass =
+      sampledTec.currentA < -0.03
+        ? 'is-negative'
+        : sampledTec.currentA > 0.03
+          ? 'is-positive'
+          : 'is-neutral'
+    const pgoodTone = sampledTec.railPgood
+      ? 'ok'
+      : sampledTec.railEnabled
+        ? 'warn'
+        : 'off'
+    const railEnableTone = sampledTec.railEnabled ? 'ok' : 'off'
+    const powerTone = tecElectricalPowerW > 0.2 ? 'ok' : 'off'
+
+    function patchTecVoltageDraft(rawValue: string) {
+      const nextVoltageV = clampTecVoltageV(parseNumber(rawValue, draftTecVoltageV))
+      patchForm('dacTecVoltage', formatNumber(nextVoltageV, 3))
+    }
+
+    function patchTecTempDraft(rawValue: string) {
+      const nextTempC = clampTecTempC(parseNumber(rawValue, draftTecTempC))
+      patchForm('dacTecVoltage', formatNumber(estimateTecVoltageFromTempC(nextTempC), 3))
+    }
+
+    function patchTecWavelengthDraft(rawValue: string) {
+      const nextWavelengthNm = clampTecWavelengthNm(parseNumber(rawValue, draftTecLambdaNm))
+      patchForm(
+        'dacTecVoltage',
+        formatNumber(estimateTecVoltageFromWavelengthNm(nextWavelengthNm), 3),
+      )
+    }
+
     return (
       <div className="bringup-page-grid">
         {renderModuleSettings('tec')}
 
-        <article className="panel-cutout">
+        <article className="panel-cutout bringup-tec">
           <div className="cutout-head">
             <Thermometer size={16} />
-            <strong>TEC readiness</strong>
+            <strong>TEC loop bring-up</strong>
           </div>
-          <div className="bringup-fact-grid">
-            <div>
-              <span>Target temp</span>
-              <strong>{formatNumber(snapshot.tec.targetTempC, 1)} C</strong>
+          <p className="panel-note">
+            Stage the TEC command once, then watch the loop respond. This page keeps
+            the editable target on the left and the sampled live loop truth on the
+            right so write intent and readback never blur together.
+          </p>
+          <div className="bringup-tec__layout">
+            <section className="bringup-tec__panel">
+              <div className="segmented is-three">
+                <button
+                  type="button"
+                  className={tecSliderMode === 'temp' ? 'segmented__button is-active' : 'segmented__button'}
+                  disabled={writesDisabled}
+                  title="Use the main target slider in temperature mode."
+                  onClick={() => setTecSliderMode('temp')}
+                >
+                  Temp slider
+                </button>
+                <button
+                  type="button"
+                  className={tecSliderMode === 'lambda' ? 'segmented__button is-active' : 'segmented__button'}
+                  disabled={writesDisabled}
+                  title="Use the main target slider in wavelength mode."
+                  onClick={() => setTecSliderMode('lambda')}
+                >
+                  Wavelength slider
+                </button>
+                <button
+                  type="button"
+                  className="segmented__button"
+                  disabled={writesDisabled}
+                  title="Overwrite the TEC draft with the controller's current staged DAC channel B voltage."
+                  onClick={() => {
+                    patchForm(
+                      'dacTecVoltage',
+                      formatNumber(snapshot.bringup.tuning.dacTecChannelV, 3),
+                    )
+                  }}
+                >
+                  Sync live
+                </button>
+              </div>
+
+              <div className="bringup-tec__input-grid">
+                <label className="field">
+                  <FieldLabel
+                    label="Target TEC temp (°C)"
+                    help="Editable TEC temperature target derived from the same channel B DAC draft."
+                  />
+                  <input
+                    type="number"
+                    min={tecTempRange.min}
+                    max={70}
+                    step="0.1"
+                    value={formatNumber(draftTecTempC, 1)}
+                    title="Stage the TEC target temperature in degrees Celsius."
+                    onChange={(event) => patchTecTempDraft(event.target.value)}
+                  />
+                </label>
+                <label className="field">
+                  <FieldLabel
+                    label="Target wavelength (nm)"
+                    help="Editable wavelength target derived from the same TEC calibration table."
+                  />
+                  <input
+                    type="number"
+                    min={tecWavelengthRange.min}
+                    max={tecWavelengthRange.max}
+                    step="0.1"
+                    value={formatNumber(draftTecLambdaNm, 1)}
+                    title="Stage the TEC wavelength target in nanometers."
+                    onChange={(event) => patchTecWavelengthDraft(event.target.value)}
+                  />
+                </label>
+                <label className="field">
+                  <FieldLabel
+                    label="TMS setpoint (V)"
+                    help="Editable DAC channel B command voltage toward the TEC controller TMS input."
+                  />
+                  <input
+                    type="number"
+                    min={tecVoltageRange.min}
+                    max={tecVoltageRange.max}
+                    step="0.001"
+                    value={formatNumber(draftTecVoltageV, 3)}
+                    title="Stage the TEC / TMS DAC shadow voltage in volts."
+                    onChange={(event) => patchTecVoltageDraft(event.target.value)}
+                  />
+                </label>
+              </div>
+
+              <label className="field field--full">
+                <div className="field__head">
+                  <span>{tecSliderMode === 'temp' ? 'Target TEC temp slider' : 'Target wavelength slider'}</span>
+                  <strong>
+                    {tecSliderMode === 'temp'
+                      ? `${formatNumber(draftTecTempC, 1)} °C`
+                      : `${formatNumber(draftTecLambdaNm, 1)} nm`}
+                  </strong>
+                </div>
+                <input
+                  className="bringup-tec__target-slider"
+                  type="range"
+                  min={tecSliderMode === 'temp' ? tecTempRange.min : tecWavelengthRange.min}
+                  max={tecSliderMode === 'temp' ? 70 : tecWavelengthRange.max}
+                  step="0.1"
+                  value={tecSliderMode === 'temp' ? draftTecTempC : draftTecLambdaNm}
+                  title={
+                    tecSliderMode === 'temp'
+                      ? 'Drag to stage TEC temperature and auto-update wavelength and TMS voltage.'
+                      : 'Drag to stage wavelength and auto-update TEC temperature and TMS voltage.'
+                  }
+                  onChange={(event) => {
+                    if (tecSliderMode === 'temp') {
+                      patchTecTempDraft(event.target.value)
+                      return
+                    }
+
+                    patchTecWavelengthDraft(event.target.value)
+                  }}
+                />
+                <span className="inline-help">
+                  One target, three linked views: {formatNumber(draftTecTempC, 1)} °C, {formatNumber(draftTecLambdaNm, 1)} nm, and {formatNumber(draftTecVoltageV, 3)} V on TMS.
+                </span>
+              </label>
+
+              <div className="button-row">
+                <button
+                  type="button"
+                  className="action-button is-inline is-accent"
+                  disabled={writesDisabled}
+                  title="Apply the TEC / TMS DAC setpoint and read back the channel B register."
+                  onClick={() => {
+                    void applySingleDacShadowChannel('tec', form.dacTecVoltage)
+                  }}
+                >
+                  Apply TEC setpoint
+                </button>
+              </div>
+            </section>
+
+            <section className="bringup-tec__panel bringup-tec__panel--live">
+              <div className="bringup-tec__live-summary">
+                <div>
+                  <span>Actual lambda</span>
+                  <strong>{formatNumber(sampledTec.actualLambdaNm, 2)} nm</strong>
+                  <small>{formatNumber(liveLambdaDeltaNm, 2)} nm from staged target</small>
+                </div>
+                <div>
+                  <span>TEC electrical load</span>
+                  <strong>{formatNumber(tecElectricalPowerW, 2)} W</strong>
+                  <small>{formatNumber(tecSupplyDrawW, 2)} W estimated supply draw</small>
+                </div>
+              </div>
+
+              <label className="field field--full">
+                <div className="field__head">
+                  <span>Current TEC temp readback</span>
+                  <strong>{formatNumber(sampledTec.tempC, 2)} °C</strong>
+                </div>
+                <input
+                  className="bringup-tec__readback-slider"
+                  type="range"
+                  min={5}
+                  max={70}
+                  step="0.01"
+                  value={clampTecTempC(sampledTec.tempC)}
+                  disabled
+                  title="Sampled live TEC temperature readback."
+                  readOnly
+                />
+                <span className="inline-help">
+                  Sampled once per second for readability. This is live readback, not the staged target slider.
+                </span>
+              </label>
+
+              <div className="bringup-tec__status-tags">
+                <div className="bringup-tec__status-tag" data-tone={sampledTec.tempGood ? 'ok' : 'warn'}>
+                  <span>TEMPGD</span>
+                  <strong>{sampledTec.tempGood ? 'High' : 'Low'}</strong>
+                </div>
+                <div className="bringup-tec__status-tag" data-tone={pgoodTone}>
+                  <span>TEC rail PGOOD</span>
+                  <strong>{sampledTec.railPgood ? 'High' : 'Low'}</strong>
+                </div>
+                <div className="bringup-tec__status-tag" data-tone={railEnableTone}>
+                  <span>TEC rail enable</span>
+                  <strong>{sampledTec.railEnabled ? 'On' : 'Off'}</strong>
+                </div>
+                <div className="bringup-tec__status-tag" data-tone={powerTone}>
+                  <span>Power draw</span>
+                  <strong>{formatNumber(tecElectricalPowerW, 2)} W</strong>
+                </div>
+              </div>
+            </section>
+          </div>
+          <div className="bringup-tec__meter-grid">
+            <div className="bringup-tec__meter-card">
+              <div className="bringup-tec__meter-head">
+                <span>TMS set voltage</span>
+                <strong>{formatNumber(sampledTec.commandVoltageV, 3)} V</strong>
+              </div>
+              <ProgressMeter value={commandVoltagePercent} tone="steady" />
+              <div className="bringup-tec__meter-scale">
+                <span>0 V</span>
+                <span>2.5 V</span>
+              </div>
             </div>
-            <div>
-              <span>Target lambda</span>
-              <strong>{formatNumber(snapshot.tec.targetLambdaNm, 2)} nm</strong>
+            <div className="bringup-tec__meter-card">
+              <div className="bringup-tec__meter-head">
+                <span>TMO thermistor voltage</span>
+                <strong>{formatNumber(sampledTec.tempAdcVoltageV, 3)} V</strong>
+              </div>
+              <ProgressMeter
+                value={tempAdcPercent}
+                tone={sampledTec.tempAdcVoltageV >= 2.2 ? 'warning' : 'steady'}
+              />
+              <div className="bringup-tec__meter-scale">
+                <span>0 V</span>
+                <span>2.5 V</span>
+              </div>
             </div>
-            <div>
-              <span>Current</span>
-              <strong>{formatNumber(snapshot.tec.currentA, 2)} A</strong>
+            <div className="bringup-tec__meter-card">
+              <div className="bringup-tec__meter-head">
+                <span>VTEC</span>
+                <strong>{formatNumber(sampledTec.voltageV, 2)} V</strong>
+              </div>
+              <ProgressMeter value={tecVoltagePercent} tone="steady" />
+              <div className="bringup-tec__meter-scale">
+                <span>0 V</span>
+                <span>5.0 V</span>
+              </div>
             </div>
-            <div>
-              <span>Voltage</span>
-              <strong>{formatNumber(snapshot.tec.voltageV, 2)} V</strong>
+            <div className="bringup-tec__meter-card bringup-tec__meter-card--power">
+              <div className="bringup-tec__meter-head">
+                <span>Estimated supply draw</span>
+                <strong>{formatNumber(tecSupplyDrawW, 2)} W</strong>
+              </div>
+              <ProgressMeter
+                value={Math.min(100, (tecSupplyDrawW / 20) * 100)}
+                tone={tecSupplyDrawW > 12 ? 'warning' : 'steady'}
+              />
+              <div className="bringup-tec__meter-scale">
+                <span>0 W</span>
+                <span>20 W</span>
+              </div>
+            </div>
+            <div className="bringup-tec__current-card">
+              <div className="bringup-tec__meter-head">
+                <span>ITEC</span>
+                <strong>{formatNumber(sampledTec.currentA, 2)} A</strong>
+              </div>
+              <div className="bringup-tec__current-bar">
+                <div className="bringup-tec__current-track" />
+                <div className="bringup-tec__current-center" />
+                <div
+                  className={`bringup-tec__current-fill ${currentDirectionClass}`}
+                  style={
+                    sampledTec.currentA < -0.03
+                      ? {
+                          left: `calc(50% - ${currentMagnitudePercent}%)`,
+                          width: `${currentMagnitudePercent}%`,
+                        }
+                      : {
+                          left: '50%',
+                          width: `${currentMagnitudePercent}%`,
+                        }
+                  }
+                />
+              </div>
+              <div className="bringup-tec__meter-scale bringup-tec__meter-scale--triple">
+                <span>-3.5 A</span>
+                <span>0 A</span>
+                <span>+3.5 A</span>
+              </div>
             </div>
           </div>
           <p className="inline-help">
-            TEC14 is an analog controller. Bring-up should prove DAC shadowing,
-            TEMPGD behavior, and telemetry plausibility before the real TEC loop is
-            considered populated.
+            What matters here is whether the staged target turns into believable loop
+            behavior: `TMS` should move, `TMO` should stay plausible, `VTEC` and
+            `ITEC` should respond, and `TEMPGD` / rail `PGOOD` should make sense.
+            The live readback panel is intentionally sampled at 1 Hz so the page is
+            readable while still showing the real trend.
           </p>
         </article>
       </div>

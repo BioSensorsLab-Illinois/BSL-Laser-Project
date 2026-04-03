@@ -58,6 +58,7 @@ export function makeRealtimeTelemetryFromSnapshot(
     bringup: {
       serviceModeRequested: snapshot.bringup.serviceModeRequested,
       serviceModeActive: snapshot.bringup.serviceModeActive,
+      interlocksDisabled: snapshot.bringup.interlocksDisabled,
       illumination: {
         tof: { ...snapshot.bringup.illumination.tof },
       },
@@ -109,6 +110,7 @@ export function mergeRealtimeTelemetryIntoSnapshot(
       ...snapshot.bringup,
       serviceModeRequested: telemetry.bringup.serviceModeRequested,
       serviceModeActive: telemetry.bringup.serviceModeActive,
+      interlocksDisabled: telemetry.bringup.interlocksDisabled,
       illumination: {
         ...snapshot.bringup.illumination,
         tof: {

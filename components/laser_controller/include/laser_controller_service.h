@@ -125,6 +125,7 @@ typedef struct {
 
 typedef struct {
     bool service_mode_requested;
+    bool interlocks_disabled;
     bool persistence_dirty;
     bool persistence_available;
     bool last_save_ok;
@@ -179,6 +180,7 @@ typedef struct {
 void laser_controller_service_init_defaults(void);
 void laser_controller_service_copy_status(laser_controller_service_status_t *status);
 bool laser_controller_service_mode_requested(void);
+bool laser_controller_service_interlocks_disabled(void);
 bool laser_controller_service_module_expected(laser_controller_module_t module);
 bool laser_controller_service_module_write_enabled(laser_controller_module_t module);
 void laser_controller_service_get_dac_runtime(
@@ -197,6 +199,9 @@ void laser_controller_service_report_module_probe(
     bool healthy);
 void laser_controller_service_set_mode_requested(
     bool enable,
+    laser_controller_time_ms_t now_ms);
+void laser_controller_service_set_interlocks_disabled(
+    bool enabled,
     laser_controller_time_ms_t now_ms);
 bool laser_controller_service_apply_preset(
     const char *preset_name,

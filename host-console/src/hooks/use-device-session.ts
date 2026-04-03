@@ -46,11 +46,21 @@ const DEFAULT_WIFI_WS_URL = 'ws://192.168.4.1/ws'
 const COMMAND_ACK_TIMEOUT_MS = 2600
 const LINK_IDLE_PROBE_DELAY_MS = 1000
 const LINK_IDLE_PROBE_TIMEOUT_MS = 1000
+const WIFI_LINK_IDLE_PROBE_DELAY_MS = 6000
+const WIFI_LINK_IDLE_PROBE_TIMEOUT_MS = 5000
 const SESSION_AUTOSAVE_FLUSH_MS = 2500
 
 type LinkLivenessProbe = {
   commandId: number
   sentAt: number
+}
+
+function linkIdleProbeDelayMs(kind: TransportKind): number {
+  return kind === 'wifi' ? WIFI_LINK_IDLE_PROBE_DELAY_MS : LINK_IDLE_PROBE_DELAY_MS
+}
+
+function linkIdleProbeTimeoutMs(kind: TransportKind): number {
+  return kind === 'wifi' ? WIFI_LINK_IDLE_PROBE_TIMEOUT_MS : LINK_IDLE_PROBE_TIMEOUT_MS
 }
 
 function makeEventId(suffix: string): string {
@@ -94,7 +104,7 @@ function moduleFromCommand(cmd: string): string {
     return 'laser'
   }
 
-  if (cmd.includes('service') || cmd.includes('fault') || cmd === 'reboot') {
+  if (cmd.includes('service') || cmd.includes('fault') || cmd.includes('interlock') || cmd === 'reboot') {
     return 'service'
   }
 
@@ -141,6 +151,28 @@ function noteFromSnapshotForCommand(
     return snapshot.bringup.illumination.tof.enabled
       ? `Front illumination active on GPIO6 at ${snapshot.bringup.illumination.tof.dutyCyclePct}% duty and ${snapshot.bringup.illumination.tof.frequencyHz} Hz.`
       : 'Front illumination disabled and GPIO6 returned low.'
+  }
+
+  if (cmd === 'enable_alignment') {
+    if (snapshot.laser.alignmentEnabled) {
+      return 'Green alignment laser request is staged and the output is live.'
+    }
+    if (snapshot.bench.requestedAlignmentEnabled) {
+      return 'Green alignment laser request is staged, but output is still waiting on firmware gates.'
+    }
+    return 'Green alignment laser request was accepted.'
+  }
+
+  if (cmd === 'disable_alignment') {
+    return snapshot.bench.requestedAlignmentEnabled
+      ? 'Green alignment request is still staged.'
+      : 'Green alignment laser request cleared.'
+  }
+
+  if (cmd === 'set_interlocks_disabled') {
+    return snapshot.bringup.interlocksDisabled
+      ? 'All controller beam interlocks are disabled under explicit bench override.'
+      : 'Normal controller interlock supervision restored.'
   }
 
   return null
@@ -206,6 +238,25 @@ function deriveSnapshotEvents(
         detail: next.bringup.serviceModeActive
           ? 'Guarded maintenance writes are now permitted by the controller.'
           : 'Controller returned to normal safe supervision.',
+        module: 'service',
+        source: 'derived',
+      }),
+    )
+  }
+
+  if (previous.bringup.interlocksDisabled !== next.bringup.interlocksDisabled) {
+    events.push(
+      annotateSessionEvent({
+        id: makeEventId('interlocks-override'),
+        atIso: new Date().toISOString(),
+        severity: next.bringup.interlocksDisabled ? 'critical' : 'ok',
+        category: 'safety',
+        title: next.bringup.interlocksDisabled
+          ? 'All interlocks disabled'
+          : 'Interlocks restored',
+        detail: next.bringup.interlocksDisabled
+          ? 'The controller is running under an explicit bench override. Treat all optical safety gates as defeated until restored.'
+          : 'Normal controller interlock supervision has been restored.',
         module: 'service',
         source: 'derived',
       }),
@@ -411,15 +462,19 @@ function makeSeedSnapshot(): DeviceSnapshot {
       alignmentEnabled: false,
       nirEnabled: false,
       driverStandby: true,
+      commandVoltageV: 0,
       measuredCurrentA: 0,
       commandedCurrentA: 0,
+      currentMonitorVoltageV: 0,
       loopGood: false,
+      driverTempVoltageV: 0,
       driverTempC: 0,
     },
     tec: {
       targetTempC: 0,
       targetLambdaNm: 785,
       actualLambdaNm: 785,
+      commandVoltageV: 0,
       tempGood: false,
       tempC: 0,
       tempAdcVoltageV: 0,
@@ -610,6 +665,7 @@ export function useDeviceSession() {
   )
   const [transportStatus, setTransportStatus] = useState<TransportStatus>('disconnected')
   const [transportDetail, setTransportDetail] = useState('No active device link.')
+  const [transportRecovering, setTransportRecovering] = useState(false)
   const [wifiUrl, setWifiUrlState] = useState(() => readStoredWifiUrl())
   const [snapshot, setSnapshot] = useState<DeviceSnapshot>(makeSeedSnapshot)
   const [events, setEvents] = useState<SessionEvent[]>([])
@@ -651,6 +707,7 @@ export function useDeviceSession() {
   const lastInboundMessageAtRef = useRef(0)
   const livenessProbeRef = useRef<LinkLivenessProbe | null>(null)
   const pendingAcksRef = useRef(new Map<number, PendingCommandAck>())
+  const commandDispatchChainRef = useRef<Promise<void>>(Promise.resolve())
   const sessionAutosaveHandleRef = useRef<FileSystemFileHandle | null>(null)
   const sessionArchiveRevisionRef = useRef(0)
   const sessionArchiveRef = useRef<SessionArchivePayload>(
@@ -680,6 +737,25 @@ export function useDeviceSession() {
   const appendEvent = useCallback((event: SessionEvent) => {
     setEvents((current) => [annotateSessionEvent(event), ...current].slice(0, 250))
   }, [])
+
+  const runSerializedControllerOperation = useCallback(
+    <T,>(operation: () => Promise<T>): Promise<T> => {
+      if (transportKindRef.current !== 'serial' && transportKindRef.current !== 'wifi') {
+        return operation()
+      }
+
+      const nextOperation = commandDispatchChainRef.current
+        .catch(() => undefined)
+        .then(operation)
+
+      commandDispatchChainRef.current = nextOperation
+        .then(() => undefined)
+        .catch(() => undefined)
+
+      return nextOperation
+    },
+    [],
+  )
 
   const rebuildSessionArchive = useCallback(() => {
     const payload = makeSessionArchivePayload({
@@ -787,10 +863,36 @@ export function useDeviceSession() {
 
   const markTransportUnhealthy = useCallback(
     (reason: string, module = 'transport') => {
+      if (
+        transportKindRef.current === 'wifi' &&
+        wifiReconnectEnabled &&
+        !wifiManualDisconnectRef.current
+      ) {
+        livenessProbeRef.current = null
+        transportStatusRef.current = 'disconnected'
+        setTransportStatus('disconnected')
+        setTransportDetail(reason)
+        setTransportRecovering(true)
+        clearPendingAcks(reason)
+        appendEvent({
+          id: makeEventId('transport-health'),
+          atIso: new Date().toISOString(),
+          severity: 'warn',
+          category: 'transport',
+          title: 'Wireless link recovering',
+          detail: reason,
+          module,
+          source: 'host',
+        })
+        void transportRef.current?.disconnect().catch(() => undefined)
+        return
+      }
+
       livenessProbeRef.current = null
       transportStatusRef.current = 'error'
       setTransportStatus('error')
       setTransportDetail(reason)
+      setTransportRecovering(false)
       clearPendingAcks(reason)
       resetLiveSnapshot()
       appendEvent({
@@ -805,7 +907,7 @@ export function useDeviceSession() {
       })
       void transportRef.current?.disconnect().catch(() => undefined)
     },
-    [appendEvent, clearPendingAcks, resetLiveSnapshot],
+    [appendEvent, clearPendingAcks, resetLiveSnapshot, wifiReconnectEnabled],
   )
 
   const noteInboundControllerTraffic = useCallback(() => {
@@ -895,6 +997,7 @@ export function useDeviceSession() {
         protocolReadyRef.current = false
         transportStatusRef.current = 'connecting'
         setTransportStatus('connecting')
+        setTransportRecovering(false)
         setTransportDetail(
           transportKind === 'serial'
             ? 'Serial port opened. Waiting for controller firmware handshake…'
@@ -903,11 +1006,29 @@ export function useDeviceSession() {
         return
       }
 
+      if (
+        transportKind === 'wifi' &&
+        (message.status === 'disconnected' || message.status === 'error') &&
+        wifiReconnectEnabled &&
+        !wifiManualDisconnectRef.current
+      ) {
+        protocolReadyRef.current = false
+        livenessProbeRef.current = null
+        transportStatusRef.current = 'disconnected'
+        setTransportStatus('disconnected')
+        setTransportDetail(message.detail ?? 'Wireless link dropped. Trying to reconnect…')
+        setTransportRecovering(true)
+        lastInboundMessageAtRef.current = 0
+        clearPendingAcks(message.detail ?? 'Wireless transport became unavailable.')
+        return
+      }
+
       protocolReadyRef.current = false
       livenessProbeRef.current = null
       transportStatusRef.current = message.status
       setTransportStatus(message.status)
       setTransportDetail(message.detail ?? '')
+      setTransportRecovering(false)
 
       if (message.status === 'disconnected' || message.status === 'error') {
         lastInboundMessageAtRef.current = 0
@@ -927,6 +1048,7 @@ export function useDeviceSession() {
       ) {
         transportStatusRef.current = 'connected'
         setTransportStatus('connected')
+        setTransportRecovering(false)
         setTransportDetail('Controller protocol active.')
       }
       const merged = mergeSnapshot(snapshotRef.current, message.snapshot)
@@ -951,6 +1073,7 @@ export function useDeviceSession() {
       ) {
         transportStatusRef.current = 'connected'
         setTransportStatus('connected')
+        setTransportRecovering(false)
         setTransportDetail('Controller protocol active.')
       }
       telemetryStoreRef.current?.publish(message.telemetry)
@@ -973,6 +1096,7 @@ export function useDeviceSession() {
       ) {
         transportStatusRef.current = 'connected'
         setTransportStatus('connected')
+        setTransportRecovering(false)
         setTransportDetail('Controller protocol active.')
       }
       const pending = pendingAcksRef.current.get(message.commandId)
@@ -1118,6 +1242,7 @@ export function useDeviceSession() {
     lastInboundMessageAtRef.current = Date.now()
     livenessProbeRef.current = null
     transportStatusRef.current = 'connecting'
+    setTransportRecovering(false)
     setTransportDetail('Connecting…')
     await transportRef.current?.connect()
   }, [transportKind, transportStatus])
@@ -1207,7 +1332,7 @@ export function useDeviceSession() {
           return
         }
 
-        if ((now - probe.sentAt) < LINK_IDLE_PROBE_TIMEOUT_MS) {
+        if ((now - probe.sentAt) < linkIdleProbeTimeoutMs(transportKindRef.current)) {
           return
         }
 
@@ -1217,9 +1342,9 @@ export function useDeviceSession() {
             ? recoveringFromFlash && transportKindRef.current === 'serial'
               ? 'Serial port reopened after browser flash, but the controller stayed silent after a liveness probe. The board may still be rebooting, sitting in bootloader mode, or have failed to leave the flasher cleanly.'
               : transportKindRef.current === 'serial'
-                ? 'Serial port opened, then stayed silent for over 1 second and ignored a controller checkup. The board may still be rebooting, sitting in bootloader mode, or running incompatible firmware.'
-                : 'Wireless link opened, then stayed silent for over 1 second and ignored a controller checkup. Verify the laptop joined the controller AP and the ESP32 is running the wireless bench image.'
-            : 'Controller traffic stopped for over 1 second and the keepalive probe was not answered. Treating the active link as lost.',
+                ? 'Serial port opened, then stayed silent for several seconds and ignored a controller checkup. The board may still be rebooting, sitting in bootloader mode, or running incompatible firmware.'
+                : 'Wireless link opened, then stayed silent for several seconds and ignored a controller checkup. Verify the laptop joined the controller AP and the ESP32 is running the wireless bench image.'
+            : 'Controller traffic stopped for several seconds and the keepalive probe was not answered. Treating the active link as lost.',
         )
         return
       }
@@ -1228,7 +1353,8 @@ export function useDeviceSession() {
         return
       }
 
-      if ((now - lastInboundMessageAtRef.current) >= LINK_IDLE_PROBE_DELAY_MS) {
+      if ((now - lastInboundMessageAtRef.current) >=
+        linkIdleProbeDelayMs(transportKindRef.current)) {
         void issueLinkLivenessProbe()
       }
     }, 200)
@@ -1299,10 +1425,12 @@ export function useDeviceSession() {
     }
 
     if (transportStatus === 'disconnected') {
+      setTransportRecovering(false)
       setFirmwareProgress(null)
       return
     }
 
+    setTransportRecovering(false)
     setFirmwareProgress(null)
     await transportRef.current?.disconnect()
   }, [transportKind, transportStatus])
@@ -1346,6 +1474,7 @@ export function useDeviceSession() {
             ? 'Previous transport disconnected. Wireless selected.'
             : 'Previous transport disconnected. Mock rig selected.',
       )
+      setTransportRecovering(false)
       const nextSnapshot = makeSeedSnapshot()
       snapshotRef.current = nextSnapshot
       setSnapshot(nextSnapshot)
@@ -1388,45 +1517,47 @@ export function useDeviceSession() {
         ...current,
       ].slice(0, 40))
 
-      try {
-        await transportRef.current?.sendCommand(command)
-        setCommands((current) =>
-          current.map((entry) =>
-            entry.id === command.id
-              ? {
-                  ...entry,
-                  status: 'sent',
-                }
-              : entry,
-          ),
-        )
-      } catch (error) {
-        const message =
-          error instanceof Error ? error.message : 'Command transport failed.'
-        setCommands((current) =>
-          current.map((entry) =>
-            entry.id === command.id
-              ? {
-                  ...entry,
-                  status: 'error',
-                  note: message,
-                }
-              : entry,
-          ),
-        )
-        appendEvent({
-          id: makeEventId('command-error'),
-          atIso: new Date().toISOString(),
-          severity: 'critical',
-          category: 'transport',
-          title: 'Command delivery failed',
-          detail: message,
-          module: moduleFromCommand(cmd),
-          source: 'host',
-        })
-      }
+      await runSerializedControllerOperation(async () => {
+        try {
+          await transportRef.current?.sendCommand(command)
+          setCommands((current) =>
+            current.map((entry) =>
+              entry.id === command.id
+                ? {
+                    ...entry,
+                    status: 'sent',
+                  }
+                : entry,
+            ),
+          )
+        } catch (error) {
+          const message =
+            error instanceof Error ? error.message : 'Command transport failed.'
+          setCommands((current) =>
+            current.map((entry) =>
+              entry.id === command.id
+                ? {
+                    ...entry,
+                    status: 'error',
+                    note: message,
+                  }
+                : entry,
+            ),
+          )
+          appendEvent({
+            id: makeEventId('command-error'),
+            atIso: new Date().toISOString(),
+            severity: 'critical',
+            category: 'transport',
+            title: 'Command delivery failed',
+            detail: message,
+            module: moduleFromCommand(cmd),
+            source: 'host',
+          })
+        }
+      })
     },
-    [appendEvent],
+    [appendEvent, runSerializedControllerOperation],
   )
 
   const issueCommandAwaitAck = useCallback(
@@ -1467,31 +1598,123 @@ export function useDeviceSession() {
         setCommands((current) => [historyEntry, ...current].slice(0, 40))
       }
 
-      const ackPromise = waitForCommandAck(command.id, timeoutMs)
+      return runSerializedControllerOperation(async () => {
+        const ackPromise = waitForCommandAck(command.id, timeoutMs)
 
-      try {
-        await transportRef.current?.sendCommand(command)
+        try {
+          await transportRef.current?.sendCommand(command)
 
-        if (logHistory) {
-          setCommands((current) =>
-            current.map((entry) =>
-              entry.id === command.id
-                ? {
-                    ...entry,
-                    status: 'sent',
-                  }
-                : entry,
-            ),
-          )
-        }
+          if (logHistory) {
+            setCommands((current) =>
+              current.map((entry) =>
+                entry.id === command.id
+                  ? {
+                      ...entry,
+                      status: 'sent',
+                    }
+                  : entry,
+              ),
+            )
+          }
 
-        const ack = await ackPromise
-        const successNote =
-          ack.ok
-            ? noteFromSnapshotForCommand(cmd, snapshotRef.current) ?? ack.note
-            : ack.note
+          const ack = await ackPromise
+          const successNote =
+            ack.ok
+              ? noteFromSnapshotForCommand(cmd, snapshotRef.current) ?? ack.note
+              : ack.note
 
-        if (!ack.ok) {
+          if (!ack.ok) {
+            if (logHistory) {
+              setCommands((current) =>
+                current.map((entry) =>
+                  entry.id === command.id
+                    ? {
+                        ...entry,
+                        status: 'error',
+                        note: ack.note,
+                      }
+                    : entry,
+                ),
+              )
+            }
+
+            appendEvent({
+              id: makeEventId('command-timeout'),
+              atIso: new Date().toISOString(),
+              severity: 'warn',
+              category: 'transport',
+              title: ack.note.toLowerCase().includes('timed out')
+                ? 'Command timed out'
+                : 'Command rejected',
+              detail: `${cmd}: ${ack.note}`,
+              module: moduleFromCommand(cmd),
+              source: 'host',
+            })
+
+            if (
+              (transportKind === 'serial' || transportKind === 'wifi') &&
+              ack.note.toLowerCase().includes('timed out')
+            ) {
+              const quietForMs = Date.now() - lastInboundMessageAtRef.current
+              if (
+                quietForMs >= linkIdleProbeDelayMs(transportKind) &&
+                livenessProbeRef.current === null
+              ) {
+                void issueLinkLivenessProbe()
+              }
+            }
+          }
+
+          if (ack.ok && logHistory && successNote !== ack.note) {
+            setCommands((current) =>
+              current.map((entry) =>
+                entry.id === command.id
+                  ? {
+                      ...entry,
+                      status: 'ack',
+                      note: successNote,
+                    }
+                  : entry,
+              ),
+            )
+          }
+
+          if (ack.ok && isBusCommand(cmd)) {
+            appendEvent({
+              id: makeEventId('bus-command-result'),
+              atIso: new Date().toISOString(),
+              severity: 'info',
+              category: 'bus',
+              title:
+                cmd === 'i2c_scan'
+                  ? 'I2C scan completed'
+                  : cmd.startsWith('i2c_')
+                    ? 'I2C transaction completed'
+                    : 'SPI transaction completed',
+              detail: successNote,
+              module: 'bus',
+              source: 'host',
+            })
+          }
+
+          return {
+            ok: ack.ok,
+            note: successNote,
+          }
+        } catch (error) {
+          const message =
+            error instanceof Error ? error.message : 'Command transport failed.'
+          const pending = pendingAcksRef.current.get(command.id)
+
+          if (pending !== undefined) {
+            window.clearTimeout(pending.timeoutId)
+            pending.resolve({
+              ok: false,
+              note: message,
+            })
+            pendingAcksRef.current.delete(command.id)
+          }
+
           if (logHistory) {
             setCommands((current) =>
               current.map((entry) =>
@@ -1499,7 +1722,7 @@ export function useDeviceSession() {
                   ? {
                       ...entry,
                       status: 'error',
-                      note: ack.note,
+                      note: message,
                     }
                   : entry,
               ),
@@ -1507,121 +1730,38 @@ export function useDeviceSession() {
           }
 
           appendEvent({
-            id: makeEventId('command-timeout'),
+            id: makeEventId('command-error'),
             atIso: new Date().toISOString(),
-            severity: 'warn',
+            severity: 'critical',
             category: 'transport',
-            title: ack.note.toLowerCase().includes('timed out')
-              ? 'Command timed out'
-              : 'Command rejected',
-            detail: `${cmd}: ${ack.note}`,
+            title: 'Command delivery failed',
+            detail: message,
             module: moduleFromCommand(cmd),
             source: 'host',
           })
 
           if (
             (transportKind === 'serial' || transportKind === 'wifi') &&
-            ack.note.toLowerCase().includes('timed out')
+            message.toLowerCase().includes('not connected')
           ) {
-            const quietForMs = Date.now() - lastInboundMessageAtRef.current
-            if (
-              quietForMs >= LINK_IDLE_PROBE_DELAY_MS &&
-              livenessProbeRef.current === null
-            ) {
-              void issueLinkLivenessProbe()
-            }
+            markTransportUnhealthy(message, 'transport')
           }
-        }
 
-        if (ack.ok && logHistory && successNote !== ack.note) {
-          setCommands((current) =>
-            current.map((entry) =>
-              entry.id === command.id
-                ? {
-                    ...entry,
-                    status: 'ack',
-                    note: successNote,
-                  }
-                : entry,
-            ),
-          )
-        }
-
-        if (ack.ok && isBusCommand(cmd)) {
-          appendEvent({
-            id: makeEventId('bus-command-result'),
-            atIso: new Date().toISOString(),
-            severity: 'info',
-            category: 'bus',
-            title:
-              cmd === 'i2c_scan'
-                ? 'I2C scan completed'
-                : cmd.startsWith('i2c_')
-                  ? 'I2C transaction completed'
-                  : 'SPI transaction completed',
-            detail: successNote,
-            module: 'bus',
-            source: 'host',
-          })
-        }
-
-        return {
-          ok: ack.ok,
-          note: successNote,
-        }
-      } catch (error) {
-        const message =
-          error instanceof Error ? error.message : 'Command transport failed.'
-        const pending = pendingAcksRef.current.get(command.id)
-
-        if (pending !== undefined) {
-          window.clearTimeout(pending.timeoutId)
-          pending.resolve({
+          return {
             ok: false,
             note: message,
-          })
-          pendingAcksRef.current.delete(command.id)
+          }
         }
-
-        if (logHistory) {
-          setCommands((current) =>
-            current.map((entry) =>
-              entry.id === command.id
-                ? {
-                    ...entry,
-                    status: 'error',
-                    note: message,
-                  }
-                : entry,
-            ),
-          )
-        }
-
-        appendEvent({
-          id: makeEventId('command-error'),
-          atIso: new Date().toISOString(),
-          severity: 'critical',
-          category: 'transport',
-          title: 'Command delivery failed',
-          detail: message,
-          module: moduleFromCommand(cmd),
-          source: 'host',
-        })
-
-        if (
-          (transportKind === 'serial' || transportKind === 'wifi') &&
-          message.toLowerCase().includes('not connected')
-        ) {
-          markTransportUnhealthy(message, 'transport')
-        }
-
-        return {
-          ok: false,
-          note: message,
-        }
-      }
+      })
     },
-    [appendEvent, issueLinkLivenessProbe, markTransportUnhealthy, transportKind, waitForCommandAck],
+    [
+      appendEvent,
+      issueLinkLivenessProbe,
+      markTransportUnhealthy,
+      runSerializedControllerOperation,
+      transportKind,
+      waitForCommandAck,
+    ],
   )
 
   const beginFirmwareTransfer = useCallback(
@@ -1769,6 +1909,7 @@ export function useDeviceSession() {
     setTransportKind,
     transportStatus,
     transportDetail,
+    transportRecovering,
     snapshot,
     telemetryStore: telemetryStoreRef.current,
     events,

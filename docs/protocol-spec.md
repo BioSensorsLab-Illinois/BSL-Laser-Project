@@ -89,7 +89,7 @@ Required fields:
 | `pd_burn_nvm` | validate runtime PDOs, then burn the requested STUSB4500 PDO startup defaults into NVM and verify raw NVM readback | service-only; manufacturing-only action with finite endurance, never for iterative tuning |
 | `set_target_temp` | stage TEC target temperature | service-only; clamp to safe calibrated range |
 | `set_target_lambda` | stage wavelength target | service-only; reject out-of-range or uncalibrated values |
-| `configure_modulation` | stage PCN high/low current modulation request | service-only; host request only, not direct PWM authority |
+| `configure_modulation` | stage PCN PWM modulation request | service-only; host request only, not direct PWM authority |
 | `laser_output_enable` | request bench NIR output intent | service-only; still routed through interlocks and may remain off |
 | `laser_output_disable` | clear bench NIR output intent | safe; immediately drops host NIR request |
 | `enable_alignment` | request stage-1 style alignment intent | service-only; still routed through interlocks |
@@ -456,6 +456,7 @@ Wireless transport notes:
   - `enabled`
   - `duty_cycle_pct`
   - `frequency_hz`
+  - Bench default and host bring-up carrier are now `20 kHz` unless an explicit override is sent.
   - This command is transient service state only; it does not change the saved bring-up profile.
 - `set_runtime_safety` currently mirrors:
   - `horizon_threshold_deg`

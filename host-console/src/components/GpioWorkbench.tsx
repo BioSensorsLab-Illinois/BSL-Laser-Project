@@ -38,6 +38,8 @@ type GpioAnalogReading = {
   label: string
   voltageV: number
   caption: string
+  summary: string
+  maxVoltageV: number
 }
 
 const gpioSignalLegend: GpioModuleSignalClass[] = [
@@ -78,7 +80,17 @@ function makeDraftFromPin(pin: GpioPinReadback): GpioDraft {
   }
 }
 
-function formatActualMode(pin: GpioPinReadback) {
+function formatActualMode(
+  pin: GpioPinReadback,
+  meta?: GpioModulePinMeta,
+  analogReading?: GpioAnalogReading | null,
+) {
+  if (meta?.signalClass === 'analog') {
+    return analogReading !== null && analogReading !== undefined
+      ? 'ADC telemetry input'
+      : 'Analog telemetry pad'
+  }
+
   if (pin.inputEnabled && pin.outputEnabled) {
     return pin.openDrainEnabled ? 'Input + open-drain output' : 'Input + output'
   }
@@ -94,7 +106,15 @@ function formatActualMode(pin: GpioPinReadback) {
   return 'Not actively configured'
 }
 
-function formatCompactMode(pin: GpioPinReadback) {
+function formatCompactMode(
+  pin: GpioPinReadback,
+  meta?: GpioModulePinMeta,
+  analogReading?: GpioAnalogReading | null,
+) {
+  if (meta?.signalClass === 'analog') {
+    return analogReading !== null && analogReading !== undefined ? 'ADC' : 'ANA'
+  }
+
   if (pin.inputEnabled && pin.outputEnabled) {
     return pin.openDrainEnabled ? 'IN/OD' : 'I/O'
   }
@@ -110,7 +130,11 @@ function formatCompactMode(pin: GpioPinReadback) {
   return 'OFF'
 }
 
-function getModeTone(pin: GpioPinReadback) {
+function getModeTone(pin: GpioPinReadback, meta?: GpioModulePinMeta) {
+  if (meta?.signalClass === 'analog') {
+    return 'input'
+  }
+
   if (pin.inputEnabled && pin.outputEnabled) {
     return 'bidirectional'
   }
@@ -126,7 +150,11 @@ function getModeTone(pin: GpioPinReadback) {
   return 'idle'
 }
 
-function formatBias(pin: GpioPinReadback) {
+function formatBias(pin: GpioPinReadback, meta?: GpioModulePinMeta) {
+  if (meta?.signalClass === 'analog') {
+    return 'Analog / high-Z'
+  }
+
   if (pin.pullupEnabled) {
     return 'Pull-up'
   }
@@ -190,6 +218,30 @@ function deriveAnalogReading(
       voltageV: snapshot.tec.tempAdcVoltageV,
       caption:
         'Live TEC temperature monitor sample from the controller snapshot. Meter range is shown against the 0 V to 3.3 V ADC span.',
+      summary: `${formatNumber(snapshot.tec.tempC, 1)} C equivalent`,
+      maxVoltageV: 3.3,
+    }
+  }
+
+  if (meta.analogTelemetry === 'ldCurrentMonitor') {
+    return {
+      label: 'Laser current monitor',
+      voltageV: snapshot.laser.currentMonitorVoltageV,
+      caption:
+        'Raw LD LIO ADC telemetry from the controller snapshot. This is the analog current-monitor node, not a digital GPIO high/low state.',
+      summary: `${formatNumber(snapshot.laser.measuredCurrentA, 2)} A derived`,
+      maxVoltageV: 2.5,
+    }
+  }
+
+  if (meta.analogTelemetry === 'ldDriverTemp') {
+    return {
+      label: 'Laser driver temperature monitor',
+      voltageV: snapshot.laser.driverTempVoltageV,
+      caption:
+        'Raw LD TMO ADC telemetry from the controller snapshot. This is only meaningful when the LD rail is good and the driver is not forced off.',
+      summary: `${formatNumber(snapshot.laser.driverTempC, 1)} C derived`,
+      maxVoltageV: 2.5,
     }
   }
 
@@ -242,9 +294,13 @@ export function GpioWorkbench({
     gpioModulePins.find((pin) => pin.gpioNum === selectedPin.gpioNum) ?? gpioModulePins[0]
   const selectedAnalogReading =
     selectedMeta !== undefined ? deriveAnalogReading(selectedMeta, snapshot) : null
+  const selectedAnalogMaxVoltageV = selectedAnalogReading?.maxVoltageV ?? 3.3
   const selectedAnalogPercent =
     selectedAnalogReading !== null
-      ? Math.max(0, Math.min(100, (selectedAnalogReading.voltageV / 3.3) * 100))
+      ? Math.max(
+          0,
+          Math.min(100, (selectedAnalogReading.voltageV / selectedAnalogMaxVoltageV) * 100),
+        )
       : 0
 
   const [draft, setDraft] = useState<GpioDraft>(() => makeDraftFromPin(selectedPin))
@@ -355,8 +411,8 @@ export function GpioWorkbench({
     }
 
     const isSelected = gpioNum === selectedGpio
-    const actualMode = formatCompactMode(pin)
     const analogReading = deriveAnalogReading(meta, snapshot)
+    const actualMode = formatCompactMode(pin, meta, analogReading)
     const pinStateClass = pin.outputEnabled
       ? pin.levelHigh
         ? 'is-driven-high'
@@ -393,10 +449,12 @@ export function GpioWorkbench({
         </div>
         <div className="gpio-pin-button__tokens">
           <span
-            className={`gpio-state-dot ${pin.levelHigh ? 'is-high' : 'is-low'}`}
+            className={`gpio-state-dot ${
+              meta.signalClass === 'analog' ? 'is-analog' : pin.levelHigh ? 'is-high' : 'is-low'
+            }`}
             aria-hidden="true"
           />
-          <span className={`gpio-mini-token is-mode-${getModeTone(pin)}`}>{actualMode}</span>
+          <span className={`gpio-mini-token is-mode-${getModeTone(pin, meta)}`}>{actualMode}</span>
           {analogReading !== null ? (
             <span className="gpio-mini-token is-analog">
               {formatNumber(analogReading.voltageV, 2)}V
@@ -510,11 +568,30 @@ export function GpioWorkbench({
                 <span className={`gpio-detail-chip is-${selectedMeta?.signalClass ?? 'control'}`}>
                   {formatSignalClass(selectedMeta?.signalClass ?? 'control')}
                 </span>
-                <span className={`gpio-detail-chip ${selectedPin.levelHigh ? 'is-high' : 'is-low'}`}>
-                  {selectedPin.levelHigh ? 'Level high' : 'Level low'}
+                <span
+                  className={`gpio-detail-chip ${
+                    selectedMeta?.signalClass === 'analog'
+                      ? 'is-analog'
+                      : selectedPin.levelHigh
+                        ? 'is-high'
+                        : 'is-low'
+                  }`}
+                >
+                  {selectedMeta?.signalClass === 'analog'
+                    ? selectedAnalogReading !== null
+                      ? `${formatNumber(selectedAnalogReading.voltageV, 3)} V ADC`
+                      : 'Analog telemetry'
+                    : selectedPin.levelHigh
+                      ? 'Level high'
+                      : 'Level low'}
                 </span>
-                <span className={`gpio-detail-chip is-mode-${getModeTone(selectedPin)}`}>
-                  {formatCompactMode(selectedPin)}
+                <span
+                  className={`gpio-detail-chip is-mode-${getModeTone(
+                    selectedPin,
+                    selectedMeta,
+                  )}`}
+                >
+                  {formatCompactMode(selectedPin, selectedMeta, selectedAnalogReading)}
                 </span>
                 {selectedPin.overrideActive ? (
                   <span className="gpio-detail-chip is-override">Service override</span>
@@ -535,24 +612,59 @@ export function GpioWorkbench({
           ) : null}
 
           <div className="metric-grid is-two gpio-detail-grid">
-            <div className={`metric-card gpio-detail-metric is-mode-${getModeTone(selectedPin)}`}>
+            <div
+              className={`metric-card gpio-detail-metric is-mode-${getModeTone(
+                selectedPin,
+                selectedMeta,
+              )}`}
+            >
               <span>Actual direction</span>
-              <strong>{formatActualMode(selectedPin)}</strong>
+              <strong>
+                {formatActualMode(selectedPin, selectedMeta, selectedAnalogReading)}
+              </strong>
               <small>
-                {selectedPin.outputCapable ? 'output-capable pad' : 'input-only / limited pad'}
+                {selectedMeta?.signalClass === 'analog'
+                  ? 'sampled through the controller ADC path'
+                  : selectedPin.outputCapable
+                    ? 'output-capable pad'
+                    : 'input-only / limited pad'}
               </small>
             </div>
             <div className="metric-card gpio-detail-metric">
               <span>Actual bias</span>
-              <strong>{formatBias(selectedPin)}</strong>
+              <strong>{formatBias(selectedPin, selectedMeta)}</strong>
               <small>
-                {selectedPin.openDrainEnabled ? 'open-drain enabled' : 'push-pull or input path'}
+                {selectedMeta?.signalClass === 'analog'
+                  ? 'ADC path does not use the digital pull-state summary here'
+                  : selectedPin.openDrainEnabled
+                    ? 'open-drain enabled'
+                    : 'push-pull or input path'}
               </small>
             </div>
-            <div className={`metric-card gpio-detail-metric ${selectedPin.levelHigh ? 'is-high' : 'is-low'}`}>
-              <span>Actual level</span>
-              <strong>{selectedPin.levelHigh ? 'High' : 'Low'}</strong>
-              <small>live pin sample from the controller snapshot</small>
+            <div
+              className={`metric-card gpio-detail-metric ${
+                selectedMeta?.signalClass === 'analog'
+                  ? 'is-analog'
+                  : selectedPin.levelHigh
+                    ? 'is-high'
+                    : 'is-low'
+              }`}
+            >
+              <span>{selectedMeta?.signalClass === 'analog' ? 'Analog sample' : 'Actual level'}</span>
+              <strong>
+                {selectedMeta?.signalClass === 'analog'
+                  ? selectedAnalogReading !== null
+                    ? `${formatNumber(selectedAnalogReading.voltageV, 3)} V`
+                    : 'No ADC sample'
+                  : selectedPin.levelHigh
+                    ? 'High'
+                    : 'Low'}
+              </strong>
+              <small>
+                {selectedMeta?.signalClass === 'analog'
+                  ? 'live ADC telemetry from the controller snapshot'
+                  : 'live pin sample from the controller snapshot'}
+              </small>
             </div>
             <div className={`metric-card gpio-detail-metric ${selectedPin.overrideActive ? 'is-override' : ''}`}>
               <span>Override owner</span>
@@ -590,7 +702,7 @@ export function GpioWorkbench({
                 role="progressbar"
                 aria-label="ADC voltage"
                 aria-valuemin={0}
-                aria-valuemax={3.3}
+                aria-valuemax={selectedAnalogMaxVoltageV}
                 aria-valuenow={selectedAnalogReading?.voltageV ?? 0}
               >
                 <span style={{ width: `${selectedAnalogPercent}%` }} />
@@ -598,9 +710,17 @@ export function GpioWorkbench({
 
               <div className="gpio-analog-card__scale" aria-hidden="true">
                 <span>0.0 V</span>
-                <span>1.65 V</span>
-                <span>3.3 V</span>
+                <span>{formatNumber(selectedAnalogMaxVoltageV / 2, 2)} V</span>
+                <span>{formatNumber(selectedAnalogMaxVoltageV, 2)} V</span>
               </div>
+
+              {selectedAnalogReading !== null ? (
+                <div className="gpio-detail-card__chips">
+                  <span className="gpio-detail-chip is-analog">
+                    {selectedAnalogReading.summary}
+                  </span>
+                </div>
+              ) : null}
 
               <small>
                 {selectedAnalogReading?.caption ??

@@ -14,10 +14,10 @@
 #define LASER_CONTROLLER_BENCH_DEFAULT_TARGET_LAMBDA  785.0f
 #define LASER_CONTROLLER_BENCH_DEFAULT_PWM_HZ         2000U
 #define LASER_CONTROLLER_BENCH_DEFAULT_PWM_DUTY       50U
-#define LASER_CONTROLLER_BENCH_MIN_PWM_HZ             10U
-#define LASER_CONTROLLER_BENCH_MAX_PWM_HZ             50000U
-#define LASER_CONTROLLER_BENCH_MIN_PWM_DUTY           1U
-#define LASER_CONTROLLER_BENCH_MAX_PWM_DUTY           99U
+#define LASER_CONTROLLER_BENCH_MIN_PWM_HZ             0U
+#define LASER_CONTROLLER_BENCH_MAX_PWM_HZ             4000U
+#define LASER_CONTROLLER_BENCH_MIN_PWM_DUTY           0U
+#define LASER_CONTROLLER_BENCH_MAX_PWM_DUTY           100U
 
 static laser_controller_bench_status_t s_bench_status;
 static portMUX_TYPE s_bench_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -238,7 +238,6 @@ void laser_controller_bench_set_modulation(
     bool enabled,
     uint32_t frequency_hz,
     uint32_t duty_cycle_pct,
-    laser_controller_amps_t low_state_current_a,
     laser_controller_time_ms_t now_ms)
 {
     (void)now_ms;
@@ -252,10 +251,7 @@ void laser_controller_bench_set_modulation(
         duty_cycle_pct,
         LASER_CONTROLLER_BENCH_MIN_PWM_DUTY,
         LASER_CONTROLLER_BENCH_MAX_PWM_DUTY);
-    s_bench_status.low_state_current_a = laser_controller_bench_clamp(
-        low_state_current_a,
-        0.0f,
-        s_bench_status.high_state_current_a);
+    s_bench_status.low_state_current_a = 0.0f;
     portEXIT_CRITICAL(&s_bench_lock);
 }
 

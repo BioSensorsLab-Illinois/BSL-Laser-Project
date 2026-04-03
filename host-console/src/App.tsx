@@ -4,10 +4,13 @@ import {
   Activity,
   Box,
   Cable,
+  ChevronDown,
+  ChevronUp,
   Command,
   Cpu,
   FlaskConical,
   Shield,
+  Wifi,
   Zap,
 } from 'lucide-react'
 
@@ -171,10 +174,13 @@ function App() {
   const [packageDescriptor, setPackageDescriptor] = useState<FirmwarePackageDescriptor | null>(null)
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => readStoredTheme())
   const [wirelessStationSsidDraft, setWirelessStationSsidDraft] = useState('')
+  const [wirelessStationSsidDraftTouched, setWirelessStationSsidDraftTouched] = useState(false)
   const [wirelessStationPasswordDraft, setWirelessStationPasswordDraft] = useState('')
+  const [wirelessReuseSavedPassword, setWirelessReuseSavedPassword] = useState(false)
   const [wirelessActionPending, setWirelessActionPending] = useState<WirelessAction | null>(null)
   const [wirelessActionStartedAtMs, setWirelessActionStartedAtMs] = useState<number | null>(null)
   const [wirelessActionError, setWirelessActionError] = useState<string | null>(null)
+  const [wirelessPanelExpanded, setWirelessPanelExpanded] = useState(false)
 
   const {
     transportKind,
@@ -183,6 +189,7 @@ function App() {
     setTransportKind,
     transportStatus,
     transportDetail,
+    transportRecovering,
     snapshot,
     telemetryStore,
     events,
@@ -245,13 +252,25 @@ function App() {
     () => sortWirelessScanNetworks(snapshot.wireless.scannedNetworks),
     [snapshot.wireless.scannedNetworks],
   )
+  const displayedWirelessStationSsidDraft =
+    wirelessStationSsidDraftTouched
+      ? wirelessStationSsidDraft
+      : snapshot.wireless.stationSsid
   const selectedScannedWirelessNetwork = useMemo(
     () =>
       scannedWirelessNetworks.find(
-        (network) => network.ssid === wirelessStationSsidDraft.trim(),
+        (network) => network.ssid === displayedWirelessStationSsidDraft.trim(),
       ) ?? null,
-    [scannedWirelessNetworks, wirelessStationSsidDraft],
+    [displayedWirelessStationSsidDraft, scannedWirelessNetworks],
   )
+  const requestedStationSsid = displayedWirelessStationSsidDraft.trim()
+  const savedStationSsid = snapshot.wireless.stationSsid.trim()
+  const reusingSavedStationSsid =
+    requestedStationSsid.length > 0 &&
+    savedStationSsid.length > 0 &&
+    requestedStationSsid === savedStationSsid
+  const canReuseSavedPassword =
+    snapshot.wireless.stationConfigured && reusingSavedStationSsid
   const wirelessSignalLevel = useMemo(
     () =>
       snapshot.wireless.mode === 'station'
@@ -311,21 +330,32 @@ function App() {
       snapshot.wireless,
     ],
   )
-  useEffect(() => {
-    if (
-      snapshot.wireless.stationSsid.trim().length > 0 &&
-      wirelessStationSsidDraft.trim().length === 0
-    ) {
-      setWirelessStationSsidDraft(snapshot.wireless.stationSsid)
+  const wirelessPanelSummary = useMemo(() => {
+    if (snapshot.wireless.mode === 'station' && snapshot.wireless.stationConnected) {
+      return {
+        label: 'Joined existing Wi-Fi',
+        detail: `${snapshot.wireless.ssid} • ${snapshot.wireless.ipAddress || 'Awaiting IP'}`,
+      }
     }
-  }, [snapshot.wireless.stationSsid, wirelessStationSsidDraft])
 
+    if (snapshot.wireless.mode === 'station' && snapshot.wireless.stationConfigured) {
+      return {
+        label: 'Station saved',
+        detail: `${snapshot.wireless.stationSsid || 'Saved SSID'} • bench AP still available`,
+      }
+    }
+
+    return {
+      label: 'Bench AP ready',
+      detail: `${controllerBenchAp.ssid} • ${controllerBenchAp.wsUrl}`,
+    }
+  }, [snapshot.wireless])
   useEffect(() => {
     if (
       snapshot.wireless.mode === 'station' &&
       snapshot.wireless.stationConnected &&
       snapshot.wireless.wsUrl.trim().length > 0 &&
-      (wifiUrl.trim().length === 0 || wifiUrl === controllerBenchAp.wsUrl)
+      wifiUrl.trim().length === 0
     ) {
       setWifiUrl(snapshot.wireless.wsUrl)
     }
@@ -394,6 +424,11 @@ function App() {
     wirelessActionPending,
     wirelessActionStartedAtMs,
   ])
+  useEffect(() => {
+    if (!(activeView === 'overview' && (transportKind === 'serial' || transportKind === 'wifi'))) {
+      setWirelessPanelExpanded(false)
+    }
+  }, [activeView, transportKind])
 
   const sessionFacts = useMemo(
     () => [
@@ -531,11 +566,12 @@ function App() {
   const deviceLinkLost = !connectionHealthy
   const showControllerWirelessPanel =
     activeView === 'overview' && (transportKind === 'serial' || transportKind === 'wifi')
+  const controllerWirelessPanelExpanded =
+    showControllerWirelessPanel &&
+    (wirelessPanelExpanded ||
+      wirelessActionPending !== null ||
+      (wirelessActionError !== null && wirelessActionError.trim().length > 0))
   const canConfigureControllerWireless = transportStatus === 'connected'
-  const controllerWirelessBusy =
-    wirelessActionPending === 'join' ||
-    wirelessActionPending === 'restore' ||
-    snapshot.wireless.stationConnecting
   const wirelessFeedback = useMemo<{
     tone: WirelessFeedbackTone
     label: string
@@ -562,7 +598,9 @@ function App() {
         return {
           tone: 'steady',
           label: 'Joined existing Wi-Fi',
-          detail: `Controller joined ${snapshot.wireless.ssid} at ${snapshot.wireless.ipAddress || 'the reported IP address'} and is ready for wireless reconnection.`,
+          detail: snapshot.wireless.apReady
+            ? `Controller joined ${snapshot.wireless.ssid} at ${snapshot.wireless.ipAddress || 'the reported IP address'}. Bench AP stays online for management, so you do not need to abandon ${controllerBenchAp.ssid} to change networks later.`
+            : `Controller joined ${snapshot.wireless.ssid} at ${snapshot.wireless.ipAddress || 'the reported IP address'} and is ready for wireless reconnection.`,
         }
       }
 
@@ -570,14 +608,14 @@ function App() {
         return {
           tone: 'warning',
           label: 'Joining existing Wi-Fi',
-          detail: `Controller is associating with ${snapshot.wireless.stationSsid || wirelessStationSsidDraft || 'the requested SSID'}. Only 2.4 GHz Wi-Fi is supported.`,
+          detail: `Controller is associating with ${snapshot.wireless.stationSsid || displayedWirelessStationSsidDraft || 'the requested SSID'}. Only 2.4 GHz Wi-Fi is supported.`,
         }
       }
 
       return {
         tone: 'warning',
         label: 'Waiting for controller network join',
-        detail: `Station credentials were sent. Keep USB connected while the controller joins ${snapshot.wireless.stationSsid || wirelessStationSsidDraft || 'the requested SSID'} and waits for DHCP.`,
+        detail: `Station credentials were sent. Keep USB connected while the controller joins ${snapshot.wireless.stationSsid || displayedWirelessStationSsidDraft || 'the requested SSID'} and waits for DHCP.`,
       }
     }
 
@@ -601,7 +639,9 @@ function App() {
       return {
         tone: 'steady',
         label: 'Existing Wi-Fi linked',
-        detail: `Controller joined ${snapshot.wireless.ssid} at ${snapshot.wireless.ipAddress}. Only 2.4 GHz Wi-Fi is supported.`,
+        detail: snapshot.wireless.apReady
+          ? `Controller joined ${snapshot.wireless.ssid} at ${snapshot.wireless.ipAddress}. Bench AP ${controllerBenchAp.ssid} stays up for stable management and future network changes.`
+          : `Controller joined ${snapshot.wireless.ssid} at ${snapshot.wireless.ipAddress}. Only 2.4 GHz Wi-Fi is supported.`,
       }
     }
 
@@ -626,20 +666,7 @@ function App() {
       label: 'Wireless ready for setup',
       detail: 'Use Web Serial to stage controller Wi-Fi changes safely. The ESP32 radio supports 2.4 GHz Wi-Fi only.',
     }
-  }, [
-    snapshot.wireless.apReady,
-    snapshot.wireless.ipAddress,
-    snapshot.wireless.mode,
-    snapshot.wireless.scanInProgress,
-    snapshot.wireless.ssid,
-    snapshot.wireless.stationConfigured,
-    snapshot.wireless.stationConnected,
-    snapshot.wireless.stationConnecting,
-    snapshot.wireless.stationSsid,
-    wirelessActionError,
-    wirelessActionPending,
-    wirelessStationSsidDraft,
-  ])
+  }, [displayedWirelessStationSsidDraft, snapshot.wireless, wirelessActionError, wirelessActionPending])
   const serviceModeLabel = snapshot.bringup.serviceModeActive
     ? 'Service active'
     : snapshot.bringup.serviceModeRequested
@@ -660,13 +687,24 @@ function App() {
 
   async function handleConfigureControllerStationMode() {
     setWirelessActionError(null)
+    const nextStationSsid = displayedWirelessStationSsidDraft.trim()
+
+    if (nextStationSsid.length === 0) {
+      setWirelessActionPending(null)
+      setWirelessActionStartedAtMs(null)
+      setWirelessActionError('Enter the target Wi-Fi SSID before asking the controller to join.')
+      return {
+        ok: false,
+        note: 'Enter the target Wi-Fi SSID before asking the controller to join.',
+      }
+    }
+
     setWirelessActionPending('join')
     setWirelessActionStartedAtMs(window.performance.now())
     const args: Record<string, string> = { mode: 'station' }
-    if (wirelessStationSsidDraft.trim().length > 0) {
-      args.ssid = wirelessStationSsidDraft.trim()
-    }
-    if (wirelessStationPasswordDraft.length > 0) {
+    args.ssid = nextStationSsid
+
+    if (!(wirelessReuseSavedPassword && canReuseSavedPassword)) {
       args.password = wirelessStationPasswordDraft
     }
 
@@ -765,6 +803,22 @@ function App() {
       snapshot.bringup.serviceModeActive
         ? 'Leaving guarded write session.'
         : 'Entering guarded write session with outputs held safe.',
+    )
+  }
+
+  async function handleSetInterlocksDisabled(enabled: boolean) {
+    if (transportStatus !== 'connected') {
+      return
+    }
+
+    await issueCommandAwaitAck(
+      'set_interlocks_disabled',
+      'service',
+      enabled
+        ? 'Disabling all beam interlocks under explicit bench override.'
+        : 'Restoring normal controller interlock supervision.',
+      { enabled },
+      { timeoutMs: 3200 },
     )
   }
 
@@ -1003,202 +1057,288 @@ function App() {
               )}
 
               {showControllerWirelessPanel ? (
-                <div className="field-stack">
-                  {transportKind === 'wifi' ? (
-                    <label className="field-block">
-                      <span>Wireless controller URL</span>
-                      <input
-                        type="text"
-                        value={wifiUrl}
-                        onChange={(event) => setWifiUrl(event.target.value)}
-                        placeholder={preferredWirelessUrl(snapshot.wireless)}
-                      />
-                      <small>
-                        Controller network: <code>{wirelessModeLabel(snapshot.wireless)}</code>
-                        {' '}• endpoint <code>{preferredWirelessUrl(snapshot.wireless)}</code>
-                      </small>
-                      <small>
-                        {snapshot.wireless.mode === 'station'
-                          ? snapshot.wireless.stationConnected
-                            ? `Joined ${snapshot.wireless.ssid} at ${snapshot.wireless.ipAddress}`
-                            : snapshot.wireless.lastError || 'Waiting for station association'
-                          : `Bench AP: ${controllerBenchAp.ssid} / ${controllerBenchAp.password}`}
-                      </small>
-                    </label>
-                  ) : null}
-
-                  <div className="panel-cutout panel-cutout--compact">
-                    <div className="cutout-head">
-                      <strong>Controller Wi-Fi mode</strong>
+                <div className="controller-wireless-shell">
+                  <div className="controller-wireless-shell__summary">
+                    <div className="controller-wireless-shell__identity">
+                      <div className="cutout-head">
+                        <Wifi size={16} />
+                        <strong>Controller Wi-Fi settings</strong>
+                      </div>
+                      <p className="inline-help">
+                        {wirelessPanelSummary.label} • {wirelessPanelSummary.detail}
+                      </p>
                     </div>
-                    <p className="panel-note">
-                      {transportKind === 'serial'
-                        ? 'Use the live Web Serial link to stage controller network changes safely, then switch the transport to Wireless once the controller endpoint is ready.'
-                        : 'Switching controller network mode can intentionally drop the current wireless socket before the browser sees the acknowledgement.'}
-                    </p>
-                    <div
-                      className={`controller-wireless-feedback is-${wirelessFeedback.tone}`}
-                      data-hover-help={wirelessFeedback.detail}
+                    <button
+                      type="button"
+                      className="action-button is-inline"
+                      aria-expanded={controllerWirelessPanelExpanded}
+                      onClick={() => setWirelessPanelExpanded((current) => !current)}
                     >
-                      <div>
-                        <span>Wi-Fi transition</span>
-                        <strong>{wirelessFeedback.label}</strong>
-                        <small>{wirelessFeedback.detail}</small>
-                      </div>
-                      <div className={`state-pill is-${wirelessFeedback.tone}`}>
-                        <span>{wirelessFeedback.label}</span>
-                      </div>
-                    </div>
-                    <div className="controller-wireless-status-grid">
-                      {wirelessStatusCards.map((card) => (
-                        <div
-                          key={card.label}
-                          className="controller-wireless-status-card"
-                          data-hover-help={`${card.label}. ${card.detail}`}
-                        >
-                          <span>{card.label}</span>
-                          <strong>{card.value}</strong>
-                          <small>{card.detail}</small>
-                        </div>
-                      ))}
-                    </div>
-                    <div className="controller-wireless-meter">
-                      <div className="controller-wireless-meter__label">
-                        <span>Signal / endpoint confidence</span>
-                        <strong>
-                          {snapshot.wireless.mode === 'station'
-                            ? `${wirelessSignalLevel}%`
-                            : snapshot.wireless.apReady
-                              ? 'AP ready'
-                              : 'AP idle'}
-                        </strong>
-                      </div>
-                      <ProgressMeter value={wirelessSignalLevel} tone={wirelessSignalTone} compact />
-                    </div>
-                    <div className="field-grid field-grid--two">
-                      {scannedWirelessNetworks.length > 0 ? (
-                        <label className="field-block field-block--compact">
-                          <span>Nearby SSIDs</span>
-                          <select
-                            value={
-                              selectedScannedWirelessNetwork?.ssid ??
-                              (wirelessStationSsidDraft.trim().length > 0 ? '__manual__' : '')
-                            }
-                            onChange={(event) => {
-                              const nextValue = event.target.value
-                              if (nextValue === '__manual__' || nextValue === '') {
-                                return
-                              }
-                              setWirelessStationSsidDraft(nextValue)
-                            }}
-                          >
-                            <option value="">Select scanned network</option>
-                            {selectedScannedWirelessNetwork === null &&
-                            wirelessStationSsidDraft.trim().length > 0 ? (
-                              <option value="__manual__">
-                                Manual SSID: {wirelessStationSsidDraft.trim()}
-                              </option>
-                            ) : null}
-                            {scannedWirelessNetworks.map((network) => (
-                              <option
-                                key={`${network.ssid}-${network.channel}`}
-                                value={network.ssid}
-                              >
-                                {network.ssid} · {network.rssiDbm} dBm · ch {network.channel}
-                                {network.secure ? '' : ' · open'}
-                              </option>
-                            ))}
-                          </select>
+                      {controllerWirelessPanelExpanded ? (
+                        <>
+                          <ChevronUp size={16} />
+                          <span>Fold Wi-Fi</span>
+                        </>
+                      ) : (
+                        <>
+                          <ChevronDown size={16} />
+                          <span>Show Wi-Fi</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+
+                  {controllerWirelessPanelExpanded ? (
+                    <div className="field-stack">
+                      {transportKind === 'wifi' ? (
+                        <label className="field-block">
+                          <span>Wireless controller URL</span>
+                          <input
+                            type="text"
+                            value={wifiUrl}
+                            onChange={(event) => setWifiUrl(event.target.value)}
+                            placeholder={preferredWirelessUrl(snapshot.wireless)}
+                          />
                           <small>
-                            {snapshot.wireless.scanInProgress
-                              ? 'Controller scan is in progress.'
-                              : 'Pick a scanned SSID or type one manually below. Only 2.4 GHz networks are supported.'}
+                            Controller network: <code>{wirelessModeLabel(snapshot.wireless)}</code>
+                            {' '}• endpoint <code>{preferredWirelessUrl(snapshot.wireless)}</code>
+                          </small>
+                          <small>
+                            {snapshot.wireless.mode === 'station'
+                              ? snapshot.wireless.stationConnected
+                                ? `Joined ${snapshot.wireless.ssid} at ${snapshot.wireless.ipAddress}`
+                                : snapshot.wireless.lastError || 'Waiting for station association'
+                              : `Bench AP: ${controllerBenchAp.ssid} / ${controllerBenchAp.password}`}
                           </small>
                         </label>
                       ) : null}
-                      <label className="field-block field-block--compact">
-                        <span>Existing Wi-Fi SSID</span>
-                        <input
-                          type="text"
-                          value={wirelessStationSsidDraft}
-                          onChange={(event) => setWirelessStationSsidDraft(event.target.value)}
-                          placeholder={snapshot.wireless.stationSsid || 'Lab network'}
-                        />
-                      </label>
-                      <label className="field-block field-block--compact">
-                        <span>Password</span>
-                        <input
-                          type="text"
-                          value={wirelessStationPasswordDraft}
-                          onChange={(event) => setWirelessStationPasswordDraft(event.target.value)}
-                          placeholder={
-                            snapshot.wireless.stationConfigured
-                              ? 'Leave blank to reuse saved password'
-                              : 'Enter Wi-Fi password'
-                          }
-                        />
-                        <small>
-                          {selectedScannedWirelessNetwork === null
-                            ? 'Password is always visible here so you can confirm exactly what will be sent.'
-                            : selectedScannedWirelessNetwork.secure
-                              ? `Selected network ${selectedScannedWirelessNetwork.ssid} is secured.`
-                              : `Selected network ${selectedScannedWirelessNetwork.ssid} is open; password can stay blank.`}
-                        </small>
-                      </label>
+
+                      <div className="panel-cutout panel-cutout--compact">
+                        <div className="cutout-head">
+                          <strong>Controller Wi-Fi mode</strong>
+                        </div>
+                        <p className="panel-note">
+                          {transportKind === 'serial'
+                            ? 'Use the live Web Serial link to stage controller network changes safely, then switch the transport to Wireless once the controller endpoint is ready.'
+                            : 'Switching controller network mode can intentionally drop the current wireless socket before the browser sees the acknowledgement.'}
+                        </p>
+                        <div
+                          className={`controller-wireless-feedback is-${wirelessFeedback.tone}`}
+                          data-hover-help={wirelessFeedback.detail}
+                        >
+                          <div>
+                            <span>Wi-Fi transition</span>
+                            <strong>{wirelessFeedback.label}</strong>
+                            <small>{wirelessFeedback.detail}</small>
+                          </div>
+                          <div className={`state-pill is-${wirelessFeedback.tone}`}>
+                            <span>{wirelessFeedback.label}</span>
+                          </div>
+                        </div>
+                        <div className="controller-wireless-status-grid">
+                          {wirelessStatusCards.map((card) => (
+                            <div
+                              key={card.label}
+                              className="controller-wireless-status-card"
+                              data-hover-help={`${card.label}. ${card.detail}`}
+                            >
+                              <span>{card.label}</span>
+                              <strong>{card.value}</strong>
+                              <small>{card.detail}</small>
+                            </div>
+                          ))}
+                        </div>
+                        <div className="controller-wireless-meter">
+                          <div className="controller-wireless-meter__label">
+                            <span>Signal / endpoint confidence</span>
+                            <strong>
+                              {snapshot.wireless.mode === 'station'
+                                ? `${wirelessSignalLevel}%`
+                                : snapshot.wireless.apReady
+                                  ? 'AP ready'
+                                  : 'AP idle'}
+                            </strong>
+                          </div>
+                          <ProgressMeter value={wirelessSignalLevel} tone={wirelessSignalTone} compact />
+                        </div>
+                        <div className="field-grid field-grid--two">
+                          {scannedWirelessNetworks.length > 0 ? (
+                            <label className="field-block field-block--compact">
+                              <span>Nearby SSIDs</span>
+                              <select
+                                value={
+                                  selectedScannedWirelessNetwork?.ssid ??
+                                  (displayedWirelessStationSsidDraft.trim().length > 0 ? '__manual__' : '')
+                                }
+                                onChange={(event) => {
+                                  const nextValue = event.target.value
+                                  if (nextValue === '__manual__' || nextValue === '') {
+                                    return
+                                  }
+                                  setWirelessStationSsidDraftTouched(true)
+                                  setWirelessStationSsidDraft(nextValue)
+                                  setWirelessReuseSavedPassword(false)
+                                }}
+                              >
+                                <option value="">Select scanned network</option>
+                                {selectedScannedWirelessNetwork === null &&
+                                displayedWirelessStationSsidDraft.trim().length > 0 ? (
+                                  <option value="__manual__">
+                                    Manual SSID: {displayedWirelessStationSsidDraft.trim()}
+                                  </option>
+                                ) : null}
+                                {scannedWirelessNetworks.map((network) => (
+                                  <option
+                                    key={`${network.ssid}-${network.channel}`}
+                                    value={network.ssid}
+                                  >
+                                    {network.ssid} · {network.rssiDbm} dBm · ch {network.channel}
+                                    {network.secure ? '' : ' · open'}
+                                  </option>
+                                ))}
+                              </select>
+                              <small>
+                                {snapshot.wireless.scanInProgress
+                                  ? 'Controller scan is in progress.'
+                                  : 'Pick a scanned SSID or type one manually below. Only 2.4 GHz networks are supported.'}
+                              </small>
+                            </label>
+                          ) : null}
+                          <label className="field-block field-block--compact">
+                            <span>Existing Wi-Fi SSID</span>
+                            <input
+                              type="text"
+                              value={displayedWirelessStationSsidDraft}
+                              onChange={(event) => {
+                                setWirelessStationSsidDraftTouched(true)
+                                setWirelessStationSsidDraft(event.target.value)
+                                setWirelessReuseSavedPassword(false)
+                              }}
+                              placeholder={snapshot.wireless.stationSsid || 'Lab network'}
+                            />
+                          </label>
+                          <label className="field-block field-block--compact">
+                            <span>Password</span>
+                            <input
+                              type="text"
+                              value={wirelessStationPasswordDraft}
+                              onChange={(event) => {
+                                setWirelessStationPasswordDraft(event.target.value)
+                                if (event.target.value.length > 0) {
+                                  setWirelessReuseSavedPassword(false)
+                                }
+                              }}
+                              placeholder={
+                                canReuseSavedPassword
+                                  ? 'Enter a replacement password or enable reuse below'
+                                  : 'Enter Wi-Fi password or leave blank for an open network'
+                              }
+                            />
+                            <small>
+                              {wirelessReuseSavedPassword && canReuseSavedPassword
+                                ? `Controller will reuse the saved password for ${savedStationSsid}.`
+                                : selectedScannedWirelessNetwork === null
+                                  ? canReuseSavedPassword
+                                    ? `Blank means open-network join unless you enable saved-password reuse for ${savedStationSsid}.`
+                                    : 'Password is always visible here so you can confirm exactly what will be sent.'
+                                  : selectedScannedWirelessNetwork.secure
+                                    ? `Selected network ${selectedScannedWirelessNetwork.ssid} is secured. Enter its password or explicitly reuse the saved password for ${savedStationSsid}.`
+                                    : `Selected network ${selectedScannedWirelessNetwork.ssid} is open; password can stay blank.`}
+                            </small>
+                          </label>
+                        </div>
+                        {canReuseSavedPassword ? (
+                          <label className="field-inline-toggle">
+                            <input
+                              type="checkbox"
+                              checked={wirelessReuseSavedPassword}
+                              onChange={(event) =>
+                                setWirelessReuseSavedPassword(event.target.checked)
+                              }
+                            />
+                            <span>
+                              Reuse the controller’s saved password for {savedStationSsid}
+                            </span>
+                          </label>
+                        ) : null}
+                        <p className="controller-wireless-note">
+                          ESP32 Wi-Fi supports 2.4 GHz networks only. 5 GHz SSIDs will not work.
+                        </p>
+                        <div className="button-row">
+                          <button
+                            type="button"
+                            className="action-button is-inline"
+                            disabled={
+                              !canConfigureControllerWireless ||
+                              snapshot.wireless.scanInProgress ||
+                              wirelessActionPending === 'scan'
+                            }
+                            data-hover-help="Ask the controller radio to scan nearby 2.4 GHz Wi-Fi networks."
+                            onClick={() => {
+                              void handleScanControllerWirelessNetworks()
+                            }}
+                          >
+                            {snapshot.wireless.scanInProgress || wirelessActionPending === 'scan'
+                              ? 'Scanning…'
+                              : 'Scan SSIDs'}
+                          </button>
+                          <button
+                            type="button"
+                            className="action-button is-inline is-accent"
+                            disabled={
+                              !canConfigureControllerWireless ||
+                              wirelessActionPending === 'join' ||
+                              wirelessActionPending === 'restore'
+                            }
+                            data-hover-help="Save the typed SSID and password into the controller, then ask it to join that 2.4 GHz Wi-Fi network."
+                            onClick={() => {
+                              void handleConfigureControllerStationMode()
+                            }}
+                          >
+                            {wirelessActionPending === 'join' ? 'Saving and joining…' : 'Save and join Wi-Fi'}
+                          </button>
+                          <button
+                            type="button"
+                            className="action-button is-inline"
+                            disabled={
+                              !canConfigureControllerWireless ||
+                              wirelessActionPending === 'join' ||
+                              wirelessActionPending === 'restore'
+                            }
+                            data-hover-help="Switch the controller back to its built-in bench access point network and default WebSocket address."
+                            onClick={() => {
+                              void handleRestoreControllerBenchAp()
+                            }}
+                          >
+                            {wirelessActionPending === 'restore' ? 'Restoring…' : 'Restore bench AP'}
+                          </button>
+                          <button
+                            type="button"
+                            className="action-button is-inline"
+                            data-hover-help="Copy the controller-reported WebSocket URL into the Wireless controller URL field."
+                            onClick={() => setWifiUrl(preferredWirelessUrl(snapshot.wireless))}
+                          >
+                            Use controller URL
+                          </button>
+                          {transportKind === 'wifi' ? (
+                            <button
+                              type="button"
+                              className="action-button is-inline"
+                              data-hover-help="Point the host back to the default bench access point URL so you can reconnect and manage Wi-Fi again."
+                              onClick={() => setWifiUrl(controllerBenchAp.wsUrl)}
+                            >
+                              Use bench AP URL
+                            </button>
+                          ) : null}
+                        </div>
+                        {!canConfigureControllerWireless ? (
+                          <p className="controller-wireless-note">
+                            Connect to the controller first, then scan or save Wi-Fi settings. If the saved station endpoint is stale, switch Wireless controller URL back to <code>{controllerBenchAp.wsUrl}</code> and reconnect over the bench AP.
+                          </p>
+                        ) : null}
+                      </div>
                     </div>
-                    <p className="controller-wireless-note">
-                      ESP32 Wi-Fi supports 2.4 GHz networks only. 5 GHz SSIDs will not work.
-                    </p>
-                    <div className="button-row">
-                      <button
-                        type="button"
-                        className="action-button is-inline"
-                        disabled={
-                          !canConfigureControllerWireless ||
-                          snapshot.wireless.scanInProgress ||
-                          controllerWirelessBusy
-                        }
-                        data-hover-help="Ask the controller radio to scan nearby 2.4 GHz Wi-Fi networks."
-                        onClick={() => {
-                          void handleScanControllerWirelessNetworks()
-                        }}
-                      >
-                        {snapshot.wireless.scanInProgress || wirelessActionPending === 'scan'
-                          ? 'Scanning…'
-                          : 'Scan SSIDs'}
-                      </button>
-                      <button
-                        type="button"
-                        className="action-button is-inline"
-                        disabled={!canConfigureControllerWireless || controllerWirelessBusy}
-                        data-hover-help="Send the typed SSID and password to the controller so it joins an existing 2.4 GHz Wi-Fi network."
-                        onClick={() => {
-                          void handleConfigureControllerStationMode()
-                        }}
-                      >
-                        {wirelessActionPending === 'join' ? 'Joining…' : 'Join existing Wi-Fi'}
-                      </button>
-                      <button
-                        type="button"
-                        className="action-button is-inline"
-                        disabled={!canConfigureControllerWireless || controllerWirelessBusy}
-                        data-hover-help="Switch the controller back to its built-in bench access point network and default WebSocket address."
-                        onClick={() => {
-                          void handleRestoreControllerBenchAp()
-                        }}
-                      >
-                        {wirelessActionPending === 'restore' ? 'Restoring…' : 'Restore bench AP'}
-                      </button>
-                      <button
-                        type="button"
-                        className="action-button is-inline"
-                        data-hover-help="Copy the controller-reported WebSocket URL into the Wireless controller URL field."
-                        onClick={() => setWifiUrl(preferredWirelessUrl(snapshot.wireless))}
-                      >
-                        Use controller URL
-                      </button>
-                    </div>
-                  </div>
+                  ) : null}
                 </div>
               ) : null}
             </div>
@@ -1238,7 +1378,9 @@ function App() {
           >
             {activeView === 'overview' ? (
               <>
-                <ModuleReadinessPanel modules={snapshot.bringup.modules} />
+                <SafetyMatrix snapshot={snapshot} />
+
+                <ModuleReadinessPanel snapshot={snapshot} telemetryStore={telemetryStore} />
 
                 <section className="telemetry-grid">
                   <article className="panel-section">
@@ -1388,8 +1530,6 @@ function App() {
                   </article>
                 </section>
 
-                <SafetyMatrix snapshot={snapshot} />
-
                 <EventTimeline
                   events={events}
                   commands={commands}
@@ -1410,7 +1550,8 @@ function App() {
                 telemetryStore={telemetryStore}
                 transportKind={transportKind}
                 transportStatus={transportStatus}
-                onIssueCommand={issueCommand}
+                transportRecovering={transportRecovering}
+                onIssueCommandAwaitAck={issueCommandAwaitAck}
               />
             ) : null}
 
@@ -1419,6 +1560,7 @@ function App() {
                 snapshot={snapshot}
                 telemetryStore={telemetryStore}
                 transportStatus={transportStatus}
+                transportRecovering={transportRecovering}
                 onIssueCommandAwaitAck={issueCommandAwaitAck}
               />
             ) : null}
@@ -1517,6 +1659,7 @@ function App() {
         onConnect={connect}
         onDisconnect={disconnect}
         onToggleServiceMode={handleToggleServiceMode}
+        onSetInterlocksDisabled={handleSetInterlocksDisabled}
       />
     </div>
   )

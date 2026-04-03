@@ -120,9 +120,12 @@ export interface LaserStatus {
   alignmentEnabled: boolean
   nirEnabled: boolean
   driverStandby: boolean
+  commandVoltageV: number
   measuredCurrentA: number
   commandedCurrentA: number
+  currentMonitorVoltageV: number
   loopGood: boolean
+  driverTempVoltageV: number
   driverTempC: number
 }
 
@@ -130,6 +133,7 @@ export interface TecStatus {
   targetTempC: number
   targetLambdaNm: number
   actualLambdaNm: number
+  commandVoltageV: number
   tempGood: boolean
   tempC: number
   tempAdcVoltageV: number
@@ -140,6 +144,7 @@ export interface TecStatus {
 
 export interface BenchControlStatus {
   targetMode: BenchTargetMode
+  requestedAlignmentEnabled: boolean
   requestedNirEnabled: boolean
   modulationEnabled: boolean
   modulationFrequencyHz: number
@@ -319,6 +324,7 @@ export interface GpioInspectorStatus {
 export interface BringupStatus {
   serviceModeRequested: boolean
   serviceModeActive: boolean
+  interlocksDisabled: boolean
   persistenceDirty: boolean
   persistenceAvailable: boolean
   lastSaveOk: boolean
@@ -375,6 +381,7 @@ export interface RealtimeSafetyStatus {
 export interface RealtimeBringupStatus {
   serviceModeRequested: boolean
   serviceModeActive: boolean
+  interlocksDisabled: boolean
   illumination: {
     tof: TofIlluminationStatus
   }

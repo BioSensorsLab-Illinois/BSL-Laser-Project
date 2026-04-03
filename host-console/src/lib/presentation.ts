@@ -17,16 +17,12 @@ export type SafetyCheck = {
 }
 
 export function getTofDisplayDistanceM(snapshot: DeviceSnapshot): number | null {
-  if (snapshot.tof.valid && snapshot.tof.fresh) {
+  if (snapshot.tof.fresh && snapshot.tof.distanceM > 0) {
     return snapshot.tof.distanceM
   }
 
   if (snapshot.peripherals.tof.distanceMm > 0) {
     return snapshot.peripherals.tof.distanceMm / 1000
-  }
-
-  if (snapshot.tof.distanceM > 0) {
-    return snapshot.tof.distanceM
   }
 
   return null
@@ -35,6 +31,10 @@ export function getTofDisplayDistanceM(snapshot: DeviceSnapshot): number | null 
 export function formatTofValidityLabel(snapshot: DeviceSnapshot): string {
   if (snapshot.tof.valid && snapshot.tof.fresh) {
     return 'Fresh and valid'
+  }
+
+  if (snapshot.tof.fresh && snapshot.tof.distanceM > 0) {
+    return 'Controller-held reading'
   }
 
   if (snapshot.peripherals.tof.reachable && snapshot.peripherals.tof.distanceMm > 0) {
@@ -61,6 +61,10 @@ export function formatTofDistanceDetail(snapshot: DeviceSnapshot): string {
 
   if (distance !== null && snapshot.tof.valid && snapshot.tof.fresh) {
     return `${formatNumber(distance, 2)} m live • controller-valid safety sample`
+  }
+
+  if (snapshot.tof.fresh && snapshot.tof.distanceM > 0) {
+    return `${formatNumber(snapshot.tof.distanceM, 2)} m controller-filtered hold • raw VL53L1X frames are not yet safety-valid`
   }
 
   if (distance !== null && snapshot.peripherals.tof.distanceMm > 0) {
@@ -173,28 +177,51 @@ export function getHorizonPitchLimitDeg(snapshot: DeviceSnapshot): number {
   return 0
 }
 
+export function getHorizonPitchClearDeg(snapshot: DeviceSnapshot): number {
+  return getHorizonPitchLimitDeg(snapshot) - Math.max(0, snapshot.safety.horizonHysteresisDeg)
+}
+
 export function computePitchMarginDeg(snapshot: DeviceSnapshot): number | null {
   if (!snapshot.imu.valid || !snapshot.imu.fresh) {
     return null
   }
 
-  const pitchLimitDeg = getHorizonPitchLimitDeg(snapshot)
-  if (pitchLimitDeg <= 0) {
-    return null
-  }
+  const activeBoundaryDeg = snapshot.safety.horizonBlocked
+    ? getHorizonPitchClearDeg(snapshot)
+    : getHorizonPitchLimitDeg(snapshot)
 
-  return pitchLimitDeg - snapshot.imu.beamPitchDeg
+  return activeBoundaryDeg - snapshot.imu.beamPitchDeg
 }
 
 export function computePitchMarginPercent(snapshot: DeviceSnapshot): number {
-  const pitchLimitDeg = getHorizonPitchLimitDeg(snapshot)
   const margin = computePitchMarginDeg(snapshot)
+  const tripThresholdDeg = getHorizonPitchLimitDeg(snapshot)
+  const clearThresholdDeg = getHorizonPitchClearDeg(snapshot)
+  const referenceBandDeg = snapshot.safety.horizonBlocked
+    ? Math.max(1, Math.abs(tripThresholdDeg - clearThresholdDeg))
+    : Math.max(1, snapshot.safety.horizonHysteresisDeg, Math.abs(tripThresholdDeg))
 
-  if (margin === null || pitchLimitDeg <= 0) {
+  if (margin === null) {
     return 0
   }
 
-  return clampPercent((margin / pitchLimitDeg) * 100)
+  return clampPercent((margin / referenceBandDeg) * 100)
+}
+
+export function formatHorizonConditionDetail(snapshot: DeviceSnapshot): string {
+  if (!snapshot.imu.valid || !snapshot.imu.fresh) {
+    return 'No fresh IMU sample'
+  }
+
+  const pitchDeg = snapshot.imu.beamPitchDeg
+  const tripThresholdDeg = getHorizonPitchLimitDeg(snapshot)
+  const clearThresholdDeg = getHorizonPitchClearDeg(snapshot)
+
+  if (snapshot.safety.horizonBlocked) {
+    return `${formatNumber(pitchDeg, 1)}° measured • blocked until below ${formatNumber(clearThresholdDeg, 1)}°`
+  }
+
+  return `${formatNumber(pitchDeg, 1)}° measured • trips above ${formatNumber(tripThresholdDeg, 1)}°`
 }
 
 export function computeTecSettlePercent(snapshot: DeviceSnapshot): number {
@@ -225,7 +252,12 @@ export function buildSafetyChecks(snapshot: DeviceSnapshot): SafetyCheck[] {
   const tofDisplayDistance = getTofDisplayDistanceM(snapshot)
   const tofWindowDetail = formatTofWindowSummary(snapshot)
   const pitchLimitDeg = getHorizonPitchLimitDeg(snapshot)
+  const pitchClearDeg = getHorizonPitchClearDeg(snapshot)
   const pitchMarginDeg = computePitchMarginDeg(snapshot)
+  const horizonPass =
+    snapshot.imu.valid &&
+    snapshot.imu.fresh &&
+    !snapshot.safety.horizonBlocked
   const tofPass =
     snapshot.tof.valid &&
     snapshot.tof.fresh &&
@@ -282,19 +314,15 @@ export function buildSafetyChecks(snapshot: DeviceSnapshot): SafetyCheck[] {
     },
     {
       label: 'Orientation safe',
-      pass:
-        snapshot.imu.valid &&
-        snapshot.imu.fresh &&
-        pitchLimitDeg > 0 &&
-        snapshot.imu.beamPitchDeg < pitchLimitDeg,
-      detail: `${formatNumber(snapshot.imu.beamPitchDeg, 1)}° measured`,
+      pass: horizonPass,
+      detail: snapshot.imu.valid && snapshot.imu.fresh
+        ? `${formatNumber(snapshot.imu.beamPitchDeg, 1)}° measured • trip ${formatNumber(pitchLimitDeg, 1)}° / clear ${formatNumber(pitchClearDeg, 1)}°`
+        : 'No fresh IMU sample',
       progress: pitchProgress,
       tone: toneFromProgress(
         pitchProgress,
-        snapshot.imu.valid &&
-          snapshot.imu.fresh &&
+        horizonPass &&
           pitchMarginDeg !== null &&
-          pitchLimitDeg > 0 &&
           pitchMarginDeg > 0,
       ),
     },

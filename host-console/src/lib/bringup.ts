@@ -4,10 +4,15 @@ import type {
   BringupStatus,
   DacReferenceMode,
   DacSyncMode,
+  DeviceSnapshot,
   HapticActuator,
   HapticMode,
   ModuleKey,
 } from '../types'
+import { estimateTecVoltageFromTempC } from './tec-calibration'
+
+const DEFAULT_TEC_BRINGUP_TEMP_C = 25
+const DEFAULT_TEC_BRINGUP_VOLTAGE_V = estimateTecVoltageFromTempC(DEFAULT_TEC_BRINGUP_TEMP_C)
 
 export const moduleKeys: ModuleKey[] = [
   'imu',
@@ -267,10 +272,149 @@ export function makeDefaultBringupModules(): BringupModuleMap {
   }
 }
 
+export function observeBringupModuleStatus(
+  module: ModuleKey,
+  snapshot: DeviceSnapshot,
+): Pick<BringupModuleStatus, 'detected' | 'healthy'> {
+  switch (module) {
+    case 'imu': {
+      const peripheral = snapshot.peripherals.imu
+      const detected =
+        peripheral.reachable ||
+        peripheral.configured ||
+        peripheral.whoAmI === 0x6c ||
+        snapshot.imu.valid ||
+        snapshot.imu.fresh
+      const healthy =
+        snapshot.imu.valid ||
+        snapshot.imu.fresh ||
+        (peripheral.reachable && peripheral.configured)
+      return { detected, healthy }
+    }
+    case 'dac': {
+      const peripheral = snapshot.peripherals.dac
+      const registerReadbackSeen =
+        peripheral.syncReg !== 0 ||
+        peripheral.configReg !== 0 ||
+        peripheral.gainReg !== 0 ||
+        peripheral.statusReg !== 0 ||
+        peripheral.dataAReg !== 0 ||
+        peripheral.dataBReg !== 0
+      const detected =
+        peripheral.reachable || peripheral.configured || registerReadbackSeen
+      const healthy =
+        peripheral.reachable && (peripheral.configured || registerReadbackSeen)
+      return { detected, healthy }
+    }
+    case 'haptic': {
+      const peripheral = snapshot.peripherals.haptic
+      const registerReadbackSeen =
+        peripheral.modeReg !== 0 ||
+        peripheral.libraryReg !== 0 ||
+        peripheral.feedbackReg !== 0 ||
+        peripheral.goReg !== 0
+      const detected =
+        peripheral.reachable ||
+        peripheral.enablePinHigh ||
+        peripheral.triggerPinHigh ||
+        registerReadbackSeen
+      return { detected, healthy: peripheral.reachable }
+    }
+    case 'tof': {
+      const peripheral = snapshot.peripherals.tof
+      const detected =
+        peripheral.reachable ||
+        peripheral.configured ||
+        peripheral.sensorId !== 0 ||
+        peripheral.dataReady ||
+        snapshot.tof.valid ||
+        snapshot.tof.fresh
+      const healthy =
+        snapshot.tof.valid ||
+        snapshot.tof.fresh ||
+        (peripheral.reachable &&
+          (peripheral.configured || peripheral.sensorId !== 0))
+      return { detected, healthy }
+    }
+    case 'pd': {
+      const peripheral = snapshot.peripherals.pd
+      const detected =
+        peripheral.reachable ||
+        peripheral.attached ||
+        snapshot.pd.contractValid ||
+        snapshot.pd.sourceVoltageV > 0 ||
+        snapshot.pd.sourceCurrentA > 0
+      const healthy = peripheral.reachable || snapshot.pd.contractValid
+      return { detected, healthy }
+    }
+    case 'buttons': {
+      const detected =
+        snapshot.buttons.stage1Pressed ||
+        snapshot.buttons.stage2Pressed ||
+        snapshot.buttons.stage1Edge ||
+        snapshot.buttons.stage2Edge
+      return { detected, healthy: detected }
+    }
+    case 'laserDriver': {
+      const detected =
+        snapshot.rails.ld.enabled ||
+        snapshot.rails.ld.pgood ||
+        snapshot.laser.measuredCurrentA > 0 ||
+        snapshot.laser.driverTempC !== 0
+      const healthy = snapshot.rails.ld.pgood || snapshot.laser.loopGood
+      return { detected, healthy }
+    }
+    case 'tec': {
+      const detected =
+        snapshot.rails.tec.enabled ||
+        snapshot.rails.tec.pgood ||
+        snapshot.tec.tempC !== 0 ||
+        snapshot.tec.currentA !== 0 ||
+        snapshot.tec.voltageV !== 0
+      const healthy = snapshot.rails.tec.pgood || snapshot.tec.tempGood
+      return { detected, healthy }
+    }
+  }
+}
+
+export function mergeObservedBringupModules(
+  modules: BringupModuleMap,
+  snapshot: DeviceSnapshot,
+  connected: boolean,
+): BringupModuleMap {
+  if (!connected) {
+    return modules
+  }
+
+  const mergeModule = (
+    module: ModuleKey,
+    status: BringupModuleStatus,
+  ): BringupModuleStatus => {
+    const observed = observeBringupModuleStatus(module, snapshot)
+    return {
+      ...status,
+      detected: status.detected || observed.detected,
+      healthy: status.healthy || observed.healthy,
+    }
+  }
+
+  return {
+    imu: mergeModule('imu', modules.imu),
+    dac: mergeModule('dac', modules.dac),
+    haptic: mergeModule('haptic', modules.haptic),
+    tof: mergeModule('tof', modules.tof),
+    buttons: mergeModule('buttons', modules.buttons),
+    pd: mergeModule('pd', modules.pd),
+    laserDriver: mergeModule('laserDriver', modules.laserDriver),
+    tec: mergeModule('tec', modules.tec),
+  }
+}
+
 export function makeDefaultBringupStatus(): BringupStatus {
   return {
     serviceModeRequested: false,
     serviceModeActive: false,
+    interlocksDisabled: false,
     persistenceDirty: false,
     persistenceAvailable: false,
     lastSaveOk: false,
@@ -290,7 +434,7 @@ export function makeDefaultBringupStatus(): BringupStatus {
     modules: makeDefaultBringupModules(),
     tuning: {
       dacLdChannelV: 0,
-      dacTecChannelV: 0,
+      dacTecChannelV: DEFAULT_TEC_BRINGUP_VOLTAGE_V,
       dacReferenceMode: 'internal',
       dacGain2x: true,
       dacRefDiv: true,

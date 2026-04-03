@@ -1,12 +1,15 @@
 import { Layers3 } from 'lucide-react'
 
 import { ProgressMeter } from './ProgressMeter'
-import { moduleKeys, moduleMeta } from '../lib/bringup'
+import { moduleKeys, moduleMeta, mergeObservedBringupModules } from '../lib/bringup'
 import type { UiTone } from '../lib/presentation'
 import type { DeviceSnapshot, ModuleKey } from '../types'
+import type { RealtimeTelemetryStore } from '../lib/live-telemetry'
+import { useLiveSnapshot } from '../hooks/use-live-snapshot'
 
 type ModuleReadinessPanelProps = {
-  modules: DeviceSnapshot['bringup']['modules']
+  snapshot: DeviceSnapshot
+  telemetryStore: RealtimeTelemetryStore
 }
 
 type ModuleReadinessSummary = {
@@ -21,11 +24,13 @@ function summarizeModule(
   key: ModuleKey,
   status: DeviceSnapshot['bringup']['modules'][ModuleKey],
 ): ModuleReadinessSummary {
+  const meta = moduleMeta[key]
+
   if (!status.expectedPresent) {
     return {
       label: status.detected ? 'Unexpected response' : 'Not declared',
       detail: status.detected
-        ? `${moduleMeta[key].label} responded even though it is not declared installed.`
+        ? `${meta.label} responded even though it is not declared installed.`
         : 'Skipped on this bench stage until you mark the module installed.',
       progress: 0,
       tone: 'critical',
@@ -46,14 +51,44 @@ function summarizeModule(
   }
 
   if (status.detected) {
+    if (meta.validationMode === 'monitored') {
+      return {
+        label: 'Needs review',
+        detail:
+          key === 'tec'
+            ? 'Live TEC telemetry is present, but TEMPGD or TEC rail PGOOD is still low.'
+            : key === 'laserDriver'
+              ? 'Live LD telemetry is present, but LOOP GOOD or LD rail PGOOD is still low.'
+              : 'Live electrical supervision is present, but the firmware does not trust the path yet.',
+        progress: 68,
+        tone: 'warning',
+        state: 'attention',
+      }
+    }
+
     return {
       label: 'Needs review',
       detail: status.expectedPresent
         ? 'Hardware responded, but the firmware does not trust it yet.'
-        : `${moduleMeta[key].label} responded even though it is not declared installed.`,
+        : `${meta.label} responded even though it is not declared installed.`,
       progress: status.debugEnabled ? 72 : 62,
       tone: 'warning',
       state: 'attention',
+    }
+  }
+
+  if (meta.validationMode === 'monitored') {
+    return {
+      label: 'Watching live signals',
+      detail:
+        key === 'tec'
+          ? 'Declared installed. Waiting for TEMPGD or TEC rail truth instead of a bus probe.'
+          : key === 'laserDriver'
+            ? 'Declared installed. Waiting for LOOP GOOD or LD rail truth instead of a bus probe.'
+            : 'Declared installed. Waiting for live electrical truth instead of a digital identity probe.',
+      progress: 34,
+      tone: 'warning',
+      state: 'planned',
     }
   }
 
@@ -69,8 +104,15 @@ function summarizeModule(
 }
 
 export function ModuleReadinessPanel({
-  modules,
+  snapshot,
+  telemetryStore,
 }: ModuleReadinessPanelProps) {
+  const liveSnapshot = useLiveSnapshot(snapshot, telemetryStore)
+  const modules = mergeObservedBringupModules(
+    liveSnapshot.bringup.modules,
+    liveSnapshot,
+    true,
+  )
   const summaries = moduleKeys.map((key) => {
     const status = modules[key]
     return {
@@ -101,7 +143,8 @@ export function ModuleReadinessPanel({
         </div>
         <p className="inline-help">
           This list separates modules you plan to bring up from modules the firmware has
-          actually seen. A block only reads as ready after it is detected and healthy.
+          actually seen. Probe-based parts need a real bus response; TEC and laser-driver
+          readiness come from live TEMPGD, LOOP GOOD, and rail truth instead.
         </p>
         <div className="status-badges">
           <span className="status-badge is-steady">{readyCount} ready</span>

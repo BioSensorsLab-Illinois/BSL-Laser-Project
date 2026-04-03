@@ -32,6 +32,7 @@
 #define LASER_CONTROLLER_WIRELESS_NVS_KEY          "config"
 #define LASER_CONTROLLER_WIRELESS_CONFIG_VERSION   1U
 #define LASER_CONTROLLER_WIRELESS_PASSWORD_LEN     65U
+#define LASER_CONTROLLER_WIRELESS_CLIENT_DROP_FAILURES 4U
 
 typedef struct {
     uint32_t version;
@@ -59,6 +60,9 @@ static bool s_station_connected;
 static laser_controller_wireless_mode_t s_mode =
     LASER_CONTROLLER_WIRELESS_MODE_SOFTAP;
 static int s_client_fds[LASER_CONTROLLER_WIRELESS_CLIENT_SLOTS] = { -1, -1 };
+static uint8_t s_client_send_failures[LASER_CONTROLLER_WIRELESS_CLIENT_SLOTS] = { 0U, 0U };
+static uint32_t s_client_generations[LASER_CONTROLLER_WIRELESS_CLIENT_SLOTS] = { 0U, 0U };
+static uint32_t s_client_generation_counter;
 static char s_active_ssid[33] = LASER_CONTROLLER_WIRELESS_AP_SSID;
 static char s_station_ssid[33];
 static char s_station_password[LASER_CONTROLLER_WIRELESS_PASSWORD_LEN];
@@ -190,30 +194,46 @@ static void laser_controller_wireless_clear_clients(void)
          index < LASER_CONTROLLER_WIRELESS_CLIENT_SLOTS;
          ++index) {
         s_client_fds[index] = -1;
+        s_client_send_failures[index] = 0U;
+        s_client_generations[index] = 0U;
     }
     portEXIT_CRITICAL(&s_client_lock);
 }
 
 static void laser_controller_wireless_add_client(int fd)
 {
+    ssize_t empty_index = -1;
+    size_t oldest_index = 0U;
+    uint32_t oldest_generation = UINT32_MAX;
+
     portENTER_CRITICAL(&s_client_lock);
     for (size_t index = 0U;
          index < LASER_CONTROLLER_WIRELESS_CLIENT_SLOTS;
          ++index) {
         if (s_client_fds[index] == fd) {
+            s_client_send_failures[index] = 0U;
+            s_client_generations[index] = ++s_client_generation_counter;
             portEXIT_CRITICAL(&s_client_lock);
             return;
         }
-    }
-
-    for (size_t index = 0U;
-         index < LASER_CONTROLLER_WIRELESS_CLIENT_SLOTS;
-         ++index) {
         if (s_client_fds[index] < 0) {
-            s_client_fds[index] = fd;
-            break;
+            if (empty_index < 0) {
+                empty_index = (ssize_t)index;
+            }
+            continue;
+        }
+
+        if (s_client_generations[index] < oldest_generation) {
+            oldest_generation = s_client_generations[index];
+            oldest_index = index;
         }
     }
+
+    const size_t target_index =
+        empty_index >= 0 ? (size_t)empty_index : oldest_index;
+    s_client_fds[target_index] = fd;
+    s_client_send_failures[target_index] = 0U;
+    s_client_generations[target_index] = ++s_client_generation_counter;
     portEXIT_CRITICAL(&s_client_lock);
 }
 
@@ -225,7 +245,35 @@ static void laser_controller_wireless_remove_client(int fd)
          ++index) {
         if (s_client_fds[index] == fd) {
             s_client_fds[index] = -1;
+            s_client_send_failures[index] = 0U;
+            s_client_generations[index] = 0U;
         }
+    }
+    portEXIT_CRITICAL(&s_client_lock);
+}
+
+static void laser_controller_wireless_note_send_result(int fd, bool ok)
+{
+    portENTER_CRITICAL(&s_client_lock);
+    for (size_t index = 0U;
+         index < LASER_CONTROLLER_WIRELESS_CLIENT_SLOTS;
+         ++index) {
+        if (s_client_fds[index] != fd) {
+            continue;
+        }
+
+        if (ok) {
+            s_client_send_failures[index] = 0U;
+            s_client_generations[index] = ++s_client_generation_counter;
+        } else if (s_client_send_failures[index] + 1U >=
+                   LASER_CONTROLLER_WIRELESS_CLIENT_DROP_FAILURES) {
+            s_client_fds[index] = -1;
+            s_client_send_failures[index] = 0U;
+            s_client_generations[index] = 0U;
+        } else {
+            s_client_send_failures[index] += 1U;
+        }
+        break;
     }
     portEXIT_CRITICAL(&s_client_lock);
 }
@@ -568,6 +616,7 @@ static esp_err_t laser_controller_wireless_ws_handler(httpd_req_t *req)
     }
 
     if (frame.type == HTTPD_WS_TYPE_TEXT) {
+        laser_controller_wireless_add_client(httpd_req_to_sockfd(req));
         payload[frame.len] = '\0';
         laser_controller_comms_receive_line((const char *)payload);
     }
@@ -638,7 +687,8 @@ static void laser_controller_wireless_start_http_server(void)
 static esp_err_t laser_controller_wireless_apply_config(
     laser_controller_wireless_mode_t mode)
 {
-    wifi_config_t wifi_config = { 0 };
+    wifi_config_t ap_config = { 0 };
+    wifi_config_t sta_config = { 0 };
     char station_ssid[33];
     char station_password[LASER_CONTROLLER_WIRELESS_PASSWORD_LEN];
     esp_err_t err = ESP_OK;
@@ -689,25 +739,25 @@ static esp_err_t laser_controller_wireless_apply_config(
     portEXIT_CRITICAL(&s_wireless_lock);
 
     if (mode == LASER_CONTROLLER_WIRELESS_MODE_SOFTAP) {
-        wifi_config.ap.channel = LASER_CONTROLLER_WIRELESS_AP_CHANNEL;
-        wifi_config.ap.max_connection = LASER_CONTROLLER_WIRELESS_MAX_CLIENTS;
-        wifi_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
-        wifi_config.ap.pmf_cfg.required = false;
+        ap_config.ap.channel = LASER_CONTROLLER_WIRELESS_AP_CHANNEL;
+        ap_config.ap.max_connection = LASER_CONTROLLER_WIRELESS_MAX_CLIENTS;
+        ap_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
+        ap_config.ap.pmf_cfg.required = false;
         (void)strlcpy(
-            (char *)wifi_config.ap.ssid,
+            (char *)ap_config.ap.ssid,
             LASER_CONTROLLER_WIRELESS_AP_SSID,
-            sizeof(wifi_config.ap.ssid));
-        wifi_config.ap.ssid_len = strlen(LASER_CONTROLLER_WIRELESS_AP_SSID);
+            sizeof(ap_config.ap.ssid));
+        ap_config.ap.ssid_len = strlen(LASER_CONTROLLER_WIRELESS_AP_SSID);
         (void)strlcpy(
-            (char *)wifi_config.ap.password,
+            (char *)ap_config.ap.password,
             LASER_CONTROLLER_WIRELESS_AP_PASSWORD,
-            sizeof(wifi_config.ap.password));
+            sizeof(ap_config.ap.password));
 
         err = esp_wifi_set_mode(WIFI_MODE_AP);
         if (err != ESP_OK) {
             return err;
         }
-        err = esp_wifi_set_config(WIFI_IF_AP, &wifi_config);
+        err = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
         if (err != ESP_OK) {
             return err;
         }
@@ -725,23 +775,41 @@ static esp_err_t laser_controller_wireless_apply_config(
     }
 
     (void)strlcpy(
-        (char *)wifi_config.sta.ssid,
+        (char *)sta_config.sta.ssid,
         station_ssid,
-        sizeof(wifi_config.sta.ssid));
+        sizeof(sta_config.sta.ssid));
     (void)strlcpy(
-        (char *)wifi_config.sta.password,
+        (char *)sta_config.sta.password,
         station_password,
-        sizeof(wifi_config.sta.password));
-    wifi_config.sta.threshold.authmode =
+        sizeof(sta_config.sta.password));
+    sta_config.sta.threshold.authmode =
         station_password[0] == '\0' ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK;
-    wifi_config.sta.pmf_cfg.capable = true;
-    wifi_config.sta.pmf_cfg.required = false;
+    sta_config.sta.pmf_cfg.capable = true;
+    sta_config.sta.pmf_cfg.required = false;
 
-    err = esp_wifi_set_mode(WIFI_MODE_STA);
+    ap_config.ap.channel = LASER_CONTROLLER_WIRELESS_AP_CHANNEL;
+    ap_config.ap.max_connection = LASER_CONTROLLER_WIRELESS_MAX_CLIENTS;
+    ap_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    ap_config.ap.pmf_cfg.required = false;
+    (void)strlcpy(
+        (char *)ap_config.ap.ssid,
+        LASER_CONTROLLER_WIRELESS_AP_SSID,
+        sizeof(ap_config.ap.ssid));
+    ap_config.ap.ssid_len = strlen(LASER_CONTROLLER_WIRELESS_AP_SSID);
+    (void)strlcpy(
+        (char *)ap_config.ap.password,
+        LASER_CONTROLLER_WIRELESS_AP_PASSWORD,
+        sizeof(ap_config.ap.password));
+
+    err = esp_wifi_set_mode(WIFI_MODE_APSTA);
     if (err != ESP_OK) {
         return err;
     }
-    err = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    err = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = esp_wifi_set_config(WIFI_IF_STA, &sta_config);
     if (err != ESP_OK) {
         return err;
     }
@@ -1008,9 +1076,9 @@ void laser_controller_wireless_broadcast_text(const char *line)
             continue;
         }
 
-        if (httpd_ws_send_frame_async(s_server, fds[index], &frame) != ESP_OK) {
-            laser_controller_wireless_remove_client(fds[index]);
-        }
+        const bool ok =
+            httpd_ws_send_frame_async(s_server, fds[index], &frame) == ESP_OK;
+        laser_controller_wireless_note_send_result(fds[index], ok);
     }
 }
 

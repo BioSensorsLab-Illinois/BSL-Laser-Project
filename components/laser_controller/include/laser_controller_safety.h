@@ -14,6 +14,7 @@ typedef struct {
     bool fault_latched;
     bool service_mode_requested;
     bool service_mode_active;
+    bool interlocks_disabled;
     bool allow_missing_imu;
     bool allow_missing_tof;
     bool allow_missing_buttons;

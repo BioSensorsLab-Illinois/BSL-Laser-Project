@@ -2,24 +2,26 @@ import { motion } from 'framer-motion'
 import { Crosshair, Gauge, PlugZap, ScanLine, ShieldAlert, ThermometerSnowflake } from 'lucide-react'
 
 import { ProgressMeter } from './ProgressMeter'
+import { mergeObservedBringupModules, moduleMeta } from '../lib/bringup'
 import { deriveBenchEstimate } from '../lib/bench-model'
 import { formatNumber } from '../lib/format'
 import type { RealtimeTelemetryStore } from '../lib/live-telemetry'
 import {
-  computePitchMarginDeg,
   computeDistanceWindowPercent,
+  computePitchMarginDeg,
   computePitchMarginPercent,
   computePowerHeadroomPercent,
   computeTecSettlePercent,
-  formatTofDistanceDetail,
   formatEnumLabel,
-  formatTofWindowSummary,
+  formatHorizonConditionDetail,
   formatTofValidityLabel,
-  getTofDisplayDistanceM,
+  formatTofWindowSummary,
+  getHorizonPitchClearDeg,
   getHorizonPitchLimitDeg,
+  getTofDisplayDistanceM,
 } from '../lib/presentation'
 import { useLiveSnapshot } from '../hooks/use-live-snapshot'
-import type { BringupModuleStatus, DeviceSnapshot } from '../types'
+import type { BringupModuleStatus, DeviceSnapshot, ModuleKey } from '../types'
 
 type StatusRailProps = {
   snapshot: DeviceSnapshot
@@ -33,6 +35,7 @@ type StripAvailability = {
 }
 
 function describeStripAvailability(
+  key: ModuleKey,
   status: BringupModuleStatus,
   label: string,
 ): StripAvailability {
@@ -41,6 +44,14 @@ function describeStripAvailability(
       available: false,
       value: 'Not installed',
       detail: `${label} is not declared on this bench build.`,
+    }
+  }
+
+  if (moduleMeta[key].validationMode === 'monitored') {
+    return {
+      available: true,
+      value: '',
+      detail: '',
     }
   }
 
@@ -67,30 +78,103 @@ function describeStripAvailability(
   }
 }
 
+function toneFromWindowDistance(
+  distanceM: number | null,
+  minRangeM: number,
+  maxRangeM: number,
+  validSample: boolean,
+): 'steady' | 'warning' | 'critical' {
+  if (distanceM === null || maxRangeM <= minRangeM) {
+    return 'critical'
+  }
+
+  if (distanceM < minRangeM || distanceM > maxRangeM) {
+    return 'critical'
+  }
+
+  const warningBandM = (maxRangeM - minRangeM) * 0.1
+  const nearLowerLimit = distanceM - minRangeM <= warningBandM
+  const nearUpperLimit = maxRangeM - distanceM <= warningBandM
+
+  if (!validSample || nearLowerLimit || nearUpperLimit) {
+    return 'warning'
+  }
+
+  return 'steady'
+}
+
+function toneFromPitchMargin(
+  pitchDeg: number,
+  limitDeg: number,
+  blocked: boolean,
+  validSample: boolean,
+): 'steady' | 'warning' | 'critical' {
+  if (!validSample || limitDeg <= 0) {
+    return 'critical'
+  }
+
+  if (blocked || pitchDeg >= limitDeg) {
+    return 'critical'
+  }
+
+  const warningBandDeg = Math.max(0.5, limitDeg * 0.1)
+  if (limitDeg - pitchDeg <= warningBandDeg) {
+    return 'warning'
+  }
+
+  return 'steady'
+}
+
 export function StatusRail({ snapshot, telemetryStore }: StatusRailProps) {
   const liveSnapshot = useLiveSnapshot(snapshot, telemetryStore)
+  const liveModules = mergeObservedBringupModules(
+    liveSnapshot.bringup.modules,
+    liveSnapshot,
+    true,
+  )
   const estimate = deriveBenchEstimate(liveSnapshot)
   const powerPercent = computePowerHeadroomPercent(liveSnapshot)
   const distancePercent = computeDistanceWindowPercent(liveSnapshot)
   const pitchPercent = computePitchMarginPercent(liveSnapshot)
   const pitchMarginDeg = computePitchMarginDeg(liveSnapshot)
   const pitchLimitDeg = getHorizonPitchLimitDeg(liveSnapshot)
+  const pitchClearDeg = getHorizonPitchClearDeg(liveSnapshot)
   const tecPercent = computeTecSettlePercent(liveSnapshot)
-  const pdAvailability = describeStripAvailability(liveSnapshot.bringup.modules.pd, 'USB-PD')
-  const tofAvailability = describeStripAvailability(liveSnapshot.bringup.modules.tof, 'ToF range sensing')
-  const imuAvailability = describeStripAvailability(liveSnapshot.bringup.modules.imu, 'IMU posture sensing')
-  const tecAvailability = describeStripAvailability(liveSnapshot.bringup.modules.tec, 'TEC control')
-  const laserAvailability = describeStripAvailability(liveSnapshot.bringup.modules.laserDriver, 'Laser driver')
+  const pdAvailability = describeStripAvailability('pd', liveModules.pd, 'USB-PD')
+  const tofAvailability = describeStripAvailability('tof', liveModules.tof, 'ToF range sensing')
+  const imuAvailability = describeStripAvailability('imu', liveModules.imu, 'IMU posture sensing')
+  const tecAvailability = describeStripAvailability('tec', liveModules.tec, 'TEC control')
+  const laserAvailability = describeStripAvailability('laserDriver', liveModules.laserDriver, 'Laser driver')
   const tofDisplayDistance = getTofDisplayDistanceM(liveSnapshot)
   const tofHasRawReadback = liveSnapshot.peripherals.tof.distanceMm > 0
   const tofWithinWindow =
     tofDisplayDistance !== null &&
     tofDisplayDistance >= liveSnapshot.safety.tofMinRangeM &&
     tofDisplayDistance <= liveSnapshot.safety.tofMaxRangeM
-  const horizonWarningBandDeg = Math.max(
-    1.5,
-    liveSnapshot.safety.horizonHysteresisDeg * 2,
+  const tofStripDetail = !tofAvailability.available
+    ? tofAvailability.detail
+    : liveSnapshot.tof.valid && liveSnapshot.tof.fresh
+      ? formatTofWindowSummary(liveSnapshot)
+      : tofHasRawReadback
+        ? 'Raw sample only • safety hold'
+        : liveSnapshot.peripherals.tof.reachable && liveSnapshot.peripherals.tof.configured
+          ? 'Configured • awaiting stable sample'
+          : liveSnapshot.peripherals.tof.reachable
+            ? 'Reachable • setup incomplete'
+            : 'Awaiting probe'
+  const rangeTone = toneFromWindowDistance(
+    tofDisplayDistance,
+    liveSnapshot.safety.tofMinRangeM,
+    liveSnapshot.safety.tofMaxRangeM,
+    liveSnapshot.tof.valid && liveSnapshot.tof.fresh,
   )
+  const horizonTone = toneFromPitchMargin(
+    liveSnapshot.imu.beamPitchDeg,
+    pitchLimitDeg,
+    liveSnapshot.safety.horizonBlocked,
+    liveSnapshot.imu.valid && liveSnapshot.imu.fresh && pitchMarginDeg !== null,
+  )
+  const tecErrorDeg = Math.abs(liveSnapshot.tec.targetTempC - liveSnapshot.tec.tempC)
 
   const stats = [
     {
@@ -106,12 +190,12 @@ export function StatusRail({ snapshot, telemetryStore }: StatusRailProps) {
         !pdAvailability.available
           ? 'steady'
           : !liveSnapshot.pd.contractValid || liveSnapshot.pd.negotiatedPowerW <= 0
-          ? 'critical'
-          : powerPercent < 18
             ? 'critical'
-            : powerPercent < 40
-              ? 'warning'
-              : 'steady',
+            : powerPercent < 18
+              ? 'critical'
+              : powerPercent < 40
+                ? 'warning'
+                : 'steady',
       disabled: !pdAvailability.available,
     },
     {
@@ -123,47 +207,37 @@ export function StatusRail({ snapshot, telemetryStore }: StatusRailProps) {
           ? `${formatNumber(tofDisplayDistance, 2)} m`
           : formatTofValidityLabel(liveSnapshot)
         : tofAvailability.value,
-      detail: tofAvailability.available
-        ? `${formatTofWindowSummary(liveSnapshot)} • ${formatTofDistanceDetail(liveSnapshot)}`
-        : tofAvailability.detail,
+      detail: tofStripDetail,
       progress: tofAvailability.available ? distancePercent : 0,
       tone:
         !tofAvailability.available
           ? 'steady'
-          : liveSnapshot.tof.valid && liveSnapshot.tof.fresh && distancePercent >= 55
-          ? 'steady'
-          : tofHasRawReadback && tofWithinWindow
+          : tofHasRawReadback && tofWithinWindow && rangeTone === 'steady' && !liveSnapshot.tof.valid
             ? 'warning'
-          : liveSnapshot.tof.valid && liveSnapshot.tof.fresh && distancePercent > 0
-            ? 'warning'
-            : 'critical',
+            : rangeTone,
       disabled: !tofAvailability.available,
     },
     {
       key: 'pitch',
-      label: 'Horizon margin',
+      label: 'Horizon guard',
       icon: ShieldAlert,
       value: imuAvailability.available
         ? pitchMarginDeg !== null
-          ? `${formatNumber(pitchMarginDeg, 1)}°`
+          ? `${formatNumber(liveSnapshot.imu.beamPitchDeg, 1)}° pitch`
           : 'Waiting'
         : imuAvailability.value,
       detail: imuAvailability.available
-        ? pitchLimitDeg > 0
-          ? `${formatNumber(liveSnapshot.imu.beamPitchDeg, 1)}° pitch vs ${formatNumber(pitchLimitDeg, 1)}° trip`
-          : 'Horizon trip threshold is not available yet.'
+        ? pitchLimitDeg > pitchClearDeg
+          ? liveSnapshot.safety.horizonBlocked
+            ? formatHorizonConditionDetail(liveSnapshot)
+            : `Trip above ${formatNumber(pitchLimitDeg, 1)}° • clear below ${formatNumber(pitchClearDeg, 1)}°`
+          : formatHorizonConditionDetail(liveSnapshot)
         : imuAvailability.detail,
-      progress: imuAvailability.available ? pitchPercent : 0,
-      tone:
-        !imuAvailability.available
-          ? 'steady'
-          : !liveSnapshot.imu.valid || !liveSnapshot.imu.fresh || pitchMarginDeg === null
-          ? 'critical'
-          : liveSnapshot.safety.horizonBlocked || pitchMarginDeg <= 0
-          ? 'critical'
-          : pitchMarginDeg <= horizonWarningBandDeg
-            ? 'warning'
-            : 'steady',
+      progress:
+        imuAvailability.available && !liveSnapshot.safety.horizonBlocked
+          ? pitchPercent
+          : 0,
+      tone: !imuAvailability.available ? 'steady' : horizonTone,
       disabled: !imuAvailability.available,
     },
     {
@@ -171,15 +245,22 @@ export function StatusRail({ snapshot, telemetryStore }: StatusRailProps) {
       label: 'TEC settle',
       icon: ThermometerSnowflake,
       value: tecAvailability.available
-        ? liveSnapshot.tec.tempGood
-          ? 'Locked'
-          : `${formatNumber(Math.abs(liveSnapshot.tec.targetTempC - liveSnapshot.tec.tempC), 1)}°C error`
+        ? `${formatNumber(liveSnapshot.tec.tempC, 1)} / ${formatNumber(liveSnapshot.tec.targetTempC, 1)} °C`
         : tecAvailability.value,
       detail: tecAvailability.available
-        ? `${formatNumber(liveSnapshot.tec.targetLambdaNm, 1)} nm target`
+        ? liveSnapshot.tec.tempGood
+          ? 'Settled to target'
+          : `${formatNumber(tecErrorDeg, 1)} °C from target • ${formatNumber(liveSnapshot.tec.voltageV, 2)} VTEC`
         : tecAvailability.detail,
       progress: tecAvailability.available ? tecPercent : 0,
-      tone: !tecAvailability.available ? 'steady' : liveSnapshot.tec.tempGood ? 'steady' : tecPercent > 55 ? 'warning' : 'critical',
+      tone:
+        !tecAvailability.available
+          ? 'steady'
+          : liveSnapshot.tec.tempGood
+            ? 'steady'
+            : tecPercent > 55
+              ? 'warning'
+              : 'critical',
       disabled: !tecAvailability.available,
     },
     {
@@ -188,13 +269,17 @@ export function StatusRail({ snapshot, telemetryStore }: StatusRailProps) {
       icon: liveSnapshot.laser.nirEnabled ? ScanLine : liveSnapshot.laser.alignmentEnabled ? Crosshair : ScanLine,
       value: laserAvailability.available
         ? liveSnapshot.laser.nirEnabled
-          ? 'NIR laser on'
+          ? 'NIR active'
           : liveSnapshot.laser.alignmentEnabled
-            ? 'Green laser on'
-            : 'Beam safe'
+            ? 'Green active'
+            : liveSnapshot.laser.driverStandby
+              ? 'Standby'
+              : 'Ready'
         : laserAvailability.value,
       detail: laserAvailability.available
-        ? `${formatNumber(estimate.averageOpticalPowerW, 2)} W optical estimate`
+        ? liveSnapshot.laser.driverStandby
+          ? `${formatNumber(estimate.averageOpticalPowerW, 2)} W optical estimate • standby asserted`
+          : `${formatNumber(estimate.averageOpticalPowerW, 2)} W optical estimate • output path awake`
         : laserAvailability.detail,
       progress: laserAvailability.available
         ? liveSnapshot.laser.nirEnabled
@@ -203,7 +288,14 @@ export function StatusRail({ snapshot, telemetryStore }: StatusRailProps) {
             ? 55
             : 100
         : 0,
-      tone: !laserAvailability.available ? 'steady' : liveSnapshot.laser.nirEnabled ? 'critical' : liveSnapshot.laser.alignmentEnabled ? 'warning' : 'steady',
+      tone:
+        !laserAvailability.available
+          ? 'steady'
+          : liveSnapshot.laser.nirEnabled
+            ? 'critical'
+            : liveSnapshot.laser.alignmentEnabled
+              ? 'warning'
+              : 'steady',
       disabled: !laserAvailability.available,
     },
   ] as const
