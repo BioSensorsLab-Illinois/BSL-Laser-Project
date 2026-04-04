@@ -649,6 +649,7 @@ function App() {
               <DeploymentWorkbench
                 snapshot={snapshot}
                 telemetryStore={telemetryStore}
+                events={events}
                 transportStatus={transportStatus}
                 onIssueCommandAwaitAck={issueCommandAwaitAck}
               />

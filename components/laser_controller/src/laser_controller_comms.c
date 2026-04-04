@@ -49,7 +49,6 @@
 #define LASER_CONTROLLER_PD_RENEGOTIATE_WAIT_MS 650U
 #define LASER_CONTROLLER_SERVICE_MODE_WAIT_MS  1200U
 #define LASER_CONTROLLER_SERVICE_MODE_POLL_MS  20U
-#define LASER_CONTROLLER_DEPLOYMENT_WAIT_MS    45000U
 #define LASER_CONTROLLER_SUPPLY_ENABLE_WAIT_MS 4000U
 #define LASER_CONTROLLER_SUPPLY_DISABLE_WAIT_MS 400U
 #define LASER_CONTROLLER_HAPTIC_GPIO_WAIT_MS   400U
@@ -1302,35 +1301,6 @@ static bool laser_controller_comms_wait_for_deployment_mode(
            (enabled ? status->deployment.active : !status->deployment.active);
 }
 
-static bool laser_controller_comms_wait_for_deployment_sequence(
-    laser_controller_runtime_status_t *status)
-{
-    const TickType_t start_ticks = xTaskGetTickCount();
-    const TickType_t timeout_ticks =
-        pdMS_TO_TICKS(LASER_CONTROLLER_DEPLOYMENT_WAIT_MS);
-    const TickType_t poll_ticks =
-        pdMS_TO_TICKS(LASER_CONTROLLER_SERVICE_MODE_POLL_MS);
-
-    if (status == NULL) {
-        return false;
-    }
-
-    do {
-        if (!laser_controller_app_copy_status(status)) {
-            return false;
-        }
-
-        if (!status->deployment.running) {
-            return true;
-        }
-
-        vTaskDelay(poll_ticks);
-    } while ((xTaskGetTickCount() - start_ticks) < timeout_ticks);
-
-    return laser_controller_app_copy_status(status) &&
-           !status->deployment.running;
-}
-
 static bool laser_controller_comms_wait_for_supply_state(
     laser_controller_service_supply_t supply,
     bool enabled,
@@ -2392,7 +2362,7 @@ static void laser_controller_comms_write_live_telemetry_json(
         status->bringup.interlocks_disabled ? "true" : "false",
         status->bringup.tof_illumination_enabled ? "true" : "false");
 
-    laser_controller_comms_write_deployment_json(buffer, status, false);
+    laser_controller_comms_write_deployment_json(buffer, status, true);
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
@@ -3735,14 +3705,9 @@ static void laser_controller_comms_handle_command_line(const char *line)
                 "Deployment sequence could not start from the current controller state.");
             return;
         }
-        if (!laser_controller_comms_wait_for_deployment_sequence(&status)) {
-            laser_controller_comms_emit_error_response(
-                id,
-                "Deployment sequence timed out before the controller reported a terminal state.");
-            return;
-        }
+        vTaskDelay(pdMS_TO_TICKS(60U));
         (void)laser_controller_app_copy_status(&status);
-        laser_controller_comms_emit_full_status_response(id, &status);
+        laser_controller_comms_emit_status_response(id, &status);
         return;
     }
 

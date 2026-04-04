@@ -2248,6 +2248,28 @@ code {
   line-height: 1.55;
 }
 
+.deployment-step__failure {
+  display: grid;
+  gap: 6px;
+  margin-top: 12px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid color-mix(in srgb, var(--critical) 24%, var(--line));
+  background: color-mix(in srgb, var(--critical-soft) 18%, var(--surface));
+}
+
+.deployment-step__failure strong,
+.deployment-log-entry strong {
+  display: block;
+  margin: 0;
+  font-size: 0.9rem;
+  letter-spacing: -0.02em;
+}
+
+.deployment-step__failure p {
+  color: color-mix(in srgb, var(--critical) 72%, var(--text));
+}
+
 .deployment-step .check-row {
   border-top: 0;
   padding-top: 0;
@@ -2257,11 +2279,24 @@ code {
   border-color: color-mix(in srgb, var(--accent) 36%, var(--line));
   background:
     linear-gradient(180deg, color-mix(in srgb, var(--accent-soft) 42%, var(--surface-elevated)), color-mix(in srgb, var(--accent-soft) 18%, var(--surface-strong)));
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--accent) 12%, transparent),
+    0 10px 24px rgba(22, 86, 64, 0.12);
 }
 
 .deployment-step.is-pass .deployment-step__body {
   border-top-color: color-mix(in srgb, var(--accent) 24%, var(--line));
   background: color-mix(in srgb, var(--accent-soft) 20%, var(--surface));
+}
+
+.deployment-step.is-pass .check-row__label,
+.deployment-step.is-pass em {
+  color: var(--accent-strong);
+}
+
+.deployment-step.is-pass .check-row__note,
+.deployment-step.is-pass .deployment-step__body p {
+  color: color-mix(in srgb, var(--accent-strong) 62%, var(--text));
 }
 
 .deployment-step.is-warn {
@@ -2284,6 +2319,49 @@ code {
 .deployment-step.is-fail .deployment-step__body {
   border-top-color: color-mix(in srgb, var(--critical) 24%, var(--line));
   background: color-mix(in srgb, var(--critical-soft) 16%, var(--surface));
+}
+
+.deployment-log-strip {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.deployment-log-list {
+  display: grid;
+  gap: 10px;
+}
+
+.deployment-log-entry {
+  display: grid;
+  gap: 6px;
+  padding: 12px 14px;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--surface-elevated) 86%, transparent);
+}
+
+.deployment-log-entry > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: baseline;
+}
+
+.deployment-log-entry span {
+  font-family: var(--mono);
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-soft);
+}
+
+.deployment-log-entry p {
+  margin: 0;
+  color: var(--text-soft);
+  line-height: 1.5;
 }
 
 .safety-row {

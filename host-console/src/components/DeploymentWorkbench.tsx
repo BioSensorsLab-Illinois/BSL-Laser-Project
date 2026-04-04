@@ -7,12 +7,14 @@ import { useLiveSnapshot } from '../hooks/use-live-snapshot'
 import type {
   DeploymentTargetMode,
   DeviceSnapshot,
+  SessionEvent,
   TransportStatus,
 } from '../types'
 
 type DeploymentWorkbenchProps = {
   snapshot: DeviceSnapshot
   telemetryStore: RealtimeTelemetryStore
+  events: SessionEvent[]
   transportStatus: TransportStatus
   onIssueCommandAwaitAck: (
     cmd: string,
@@ -142,6 +144,7 @@ function rowClass(status: string): string {
 export function DeploymentWorkbench({
   snapshot,
   telemetryStore,
+  events,
   transportStatus,
   onIssueCommandAwaitAck,
 }: DeploymentWorkbenchProps) {
@@ -171,6 +174,20 @@ export function DeploymentWorkbench({
     () => deployment.steps,
     [deployment.steps],
   )
+  const deploymentLogEvents = useMemo(() => {
+    const keywords = ['deployment', 'pgood', 'rail', 'loop-good', 'loop good', 'tec rail', 'ld rail']
+
+    return events
+      .filter((event) => {
+        const haystack = `${event.category} ${event.title} ${event.detail}`.toLowerCase()
+        return (
+          event.category === 'deploy' ||
+          event.category === 'fault' ||
+          keywords.some((keyword) => haystack.includes(keyword))
+        )
+      })
+      .slice(0, 6)
+  }, [events])
 
   async function enterDeploymentMode() {
     await onIssueCommandAwaitAck(
@@ -196,9 +213,9 @@ export function DeploymentWorkbench({
     await onIssueCommandAwaitAck(
       'run_deployment_sequence',
       'service',
-      'Run the blocking deployment checklist and wait for the controller to reach a terminal deployment state.',
+      'Start the deployment checklist and follow each step live as firmware advances through the sequence.',
       undefined,
-      { timeoutMs: 47000 },
+      { timeoutMs: 4000 },
     )
   }
 
@@ -461,7 +478,11 @@ export function DeploymentWorkbench({
           </p>
           <div className="checklist">
             {checklistSteps.map((step) => (
-              <details key={step.key} className={`deployment-step ${rowClass(step.status)}`.trim()}>
+              <details
+                key={step.key}
+                className={`deployment-step ${rowClass(step.status)}`.trim()}
+                open={step.status === 'failed' || step.status === 'in_progress'}
+              >
                 <summary className={`check-row deployment-step__summary ${rowClass(step.status)}`.trim()}>
                   <div className="check-row__copy">
                     <strong className="check-row__label">{step.label}</strong>
@@ -473,9 +494,41 @@ export function DeploymentWorkbench({
                 </summary>
                 <div className="deployment-step__body">
                   <p>{deploymentStepDetails[step.key]?.validates ?? 'No additional validation note recorded for this deployment step.'}</p>
+                  {step.status === 'failed' ? (
+                    <div className="deployment-step__failure">
+                      <strong>Failure detail</strong>
+                      <p>
+                        {deployment.failureCode !== 'none'
+                          ? `${deployment.failureCode}: ${deployment.failureReason || 'The controller reported a deployment failure without a reason string.'}`
+                          : deployment.failureReason || 'The controller reported this checklist step as failed, but no failure string was attached.'}
+                      </p>
+                    </div>
+                  ) : null}
                 </div>
               </details>
             ))}
+          </div>
+          <div className="deployment-log-strip">
+            <div className="cutout-head">
+              <strong>Recent deployment logs</strong>
+            </div>
+            {deploymentLogEvents.length > 0 ? (
+              <div className="deployment-log-list">
+                {deploymentLogEvents.map((event) => (
+                  <div key={event.id} className="deployment-log-entry">
+                    <div>
+                      <strong>{event.title}</strong>
+                      <span>{event.category}</span>
+                    </div>
+                    <p>{event.detail}</p>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="panel-note">
+                No deployment-specific logs captured in this session yet.
+              </p>
+            )}
           </div>
         </article>
       </div>
