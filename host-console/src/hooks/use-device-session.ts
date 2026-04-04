@@ -67,6 +67,10 @@ function makeEventId(suffix: string): string {
   return `${Date.now()}-${Math.random().toString(16).slice(2, 8)}-${suffix}`
 }
 
+function browserSupportsWebSerial(): boolean {
+  return typeof navigator !== 'undefined' && 'serial' in navigator
+}
+
 function moduleFromCommand(cmd: string): string {
   if (cmd.includes('gpio')) {
     return 'service'
@@ -757,6 +761,18 @@ export function useDeviceSession() {
 
     return new MockTransport()
   }, [transportKind, wifiUrl])
+
+  const supportsBrowserFlash = useMemo(() => {
+    if (transportKind === 'mock') {
+      return transport.supportsFirmwareTransfer
+    }
+
+    if (transportKind === 'serial' || transportKind === 'wifi') {
+      return browserSupportsWebSerial()
+    }
+
+    return false
+  }, [transport, transportKind])
 
   const appendEvent = useCallback((event: SessionEvent) => {
     setEvents((current) => [annotateSessionEvent(event), ...current].slice(0, 250))
@@ -1791,8 +1807,13 @@ export function useDeviceSession() {
   const beginFirmwareTransfer = useCallback(
     async (pkg: FirmwarePackageDescriptor) => {
       const currentTransport = transportRef.current
+      const useWifiSerialFallback =
+        transportKindRef.current === 'wifi' &&
+        currentTransport?.beginFirmwareTransfer === undefined &&
+        browserSupportsWebSerial()
+      const flashTransport = useWifiSerialFallback ? new WebSerialTransport() : currentTransport
 
-      if (currentTransport?.beginFirmwareTransfer === undefined) {
+      if (flashTransport?.beginFirmwareTransfer === undefined) {
         appendEvent({
           id: makeEventId('firmware-unsupported'),
           atIso: new Date().toISOString(),
@@ -1816,9 +1837,40 @@ export function useDeviceSession() {
       flashRecoveryUntilRef.current = Date.now() + 15000
 
       try {
-        await currentTransport.beginFirmwareTransfer(pkg, (progress) => {
-          setFirmwareProgress(progress)
-        })
+        const unsubscribe =
+          useWifiSerialFallback
+            ? flashTransport.subscribe((message) => {
+                if (message.kind === 'event') {
+                  appendEvent(message.event)
+                }
+              })
+            : null
+
+        try {
+          await flashTransport.beginFirmwareTransfer(pkg, (progress) => {
+            setFirmwareProgress(progress)
+          })
+        } finally {
+          unsubscribe?.()
+          if (useWifiSerialFallback) {
+            await flashTransport.disconnect().catch(() => undefined)
+          }
+        }
+
+        if (useWifiSerialFallback) {
+          appendEvent({
+            id: makeEventId('firmware-wifi-flash'),
+            atIso: new Date().toISOString(),
+            severity: 'info',
+            category: 'firmware',
+            title: 'Browser flash used Web Serial fallback',
+            detail:
+              'The live session remained on Wi‑Fi while the browser opened a temporary Web Serial connection for flashing.',
+            module: 'firmware',
+            source: 'host',
+            operation: 'transfer',
+          })
+        }
       } catch (error) {
         const message =
           error instanceof Error ? error.message : 'Browser flash failed.'
@@ -1934,16 +1986,16 @@ export function useDeviceSession() {
     transportStatus,
     transportDetail,
     transportRecovering,
-    snapshot,
-    telemetryStore: telemetryStoreRef.current,
-    events,
-    commands,
-    firmwareProgress,
-    sessionAutosave,
-    supportsFirmwareTransfer: transport.supportsFirmwareTransfer,
-    connect,
-    disconnect,
-    issueCommand,
+      snapshot,
+      telemetryStore: telemetryStoreRef.current,
+      events,
+      commands,
+      firmwareProgress,
+      sessionAutosave,
+    supportsFirmwareTransfer: supportsBrowserFlash,
+      connect,
+      disconnect,
+      issueCommand,
     issueCommandAwaitAck,
     beginFirmwareTransfer,
     exportSession,

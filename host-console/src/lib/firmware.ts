@@ -1,6 +1,10 @@
 import { formatBytes } from './format'
 import { parseEmbeddedFirmwareSignature } from './firmware-signature'
-import type { DeviceSnapshot, FirmwarePackageDescriptor } from '../types'
+import type {
+  DeviceSnapshot,
+  FirmwarePackageDescriptor,
+  TransportKind,
+} from '../types'
 
 export type FirmwareChecklistItem = {
   label: string
@@ -147,8 +151,14 @@ export async function parseFirmwareFile(file: File): Promise<FirmwarePackageDesc
 export function buildFirmwareChecklist(
   snapshot: DeviceSnapshot,
   connected: boolean,
+  transportKind: TransportKind,
+  supportsFirmwareTransfer: boolean,
   pkg: FirmwarePackageDescriptor | null,
 ): FirmwareChecklistItem[] {
+  const browserFlashTransportReady =
+    supportsFirmwareTransfer &&
+    (transportKind === 'serial' || transportKind === 'wifi' || transportKind === 'mock')
+
   return [
     {
       label: 'Package loaded',
@@ -177,11 +187,17 @@ export function buildFirmwareChecklist(
     },
     {
       label: 'Host link live',
-      pass: connected,
+      pass: connected || browserFlashTransportReady,
       note: connected
         ? 'Device transport is active.'
-        : 'Connect the controller before staging an update.',
-      blocking: true,
+        : browserFlashTransportReady
+          ? transportKind === 'serial'
+            ? 'Web Serial flashing can request or reopen the approved port when the flash starts.'
+            : transportKind === 'wifi'
+              ? 'Browser flashing can open a temporary Web Serial connection even while the live session transport stays on Wi‑Fi.'
+            : 'Mock transport can simulate the full browser flashing workflow without a live board link.'
+          : 'Switch to Web Serial and connect the controller before staging an update.',
+      blocking: !browserFlashTransportReady,
     },
     {
       label: 'Beam outputs off',

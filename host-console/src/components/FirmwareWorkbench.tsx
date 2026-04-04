@@ -36,8 +36,15 @@ export function FirmwareWorkbench({
 }: FirmwareWorkbenchProps) {
   const [shaCopied, setShaCopied] = useState(false)
   const checklist = useMemo(
-    () => buildFirmwareChecklist(snapshot, connected, packageDescriptor),
-    [connected, packageDescriptor, snapshot],
+    () =>
+      buildFirmwareChecklist(
+        snapshot,
+        connected,
+        transportKind,
+        supportsFirmwareTransfer,
+        packageDescriptor,
+      ),
+    [connected, packageDescriptor, snapshot, supportsFirmwareTransfer, transportKind],
   )
 
   const readyToTransfer = checklist.every((item) => item.pass || !item.blocking)
