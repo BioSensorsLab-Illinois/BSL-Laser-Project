@@ -30,6 +30,7 @@ import { parseFirmwareFile } from './lib/firmware'
 import { formatNumber, formatRelativeUptime } from './lib/format'
 import { useDeviceSession } from './hooks/use-device-session'
 import { useGlobalHoverHelp } from './hooks/use-global-hover-help'
+import { useLiveSnapshot } from './hooks/use-live-snapshot'
 import {
   buildSafetyChecks,
   formatEnumLabel,
@@ -69,16 +70,16 @@ const navItems: Array<{
     detail: 'Transport and Wi-Fi',
   },
   {
-    id: 'control',
-    label: 'Control',
-    icon: FlaskConical,
-    detail: 'Laser, TEC, PWM',
-  },
-  {
     id: 'deployment',
     label: 'Deployment',
     icon: Zap,
     detail: 'Checklist and target',
+  },
+  {
+    id: 'control',
+    label: 'Control',
+    icon: FlaskConical,
+    detail: 'Laser, TEC, PWM',
   },
   {
     id: 'bringup',
@@ -150,46 +151,47 @@ function App() {
     disableSessionAutosave,
   } = useDeviceSession()
   useGlobalHoverHelp()
+  const liveSnapshot = useLiveSnapshot(snapshot, telemetryStore)
 
-  const stateTone = toneFromSystemState(snapshot.session.state)
-  const benchEstimate = useMemo(() => deriveBenchEstimate(snapshot), [snapshot])
-  const safetyChecks = useMemo(() => buildSafetyChecks(snapshot), [snapshot])
+  const stateTone = toneFromSystemState(liveSnapshot.session.state)
+  const benchEstimate = useMemo(() => deriveBenchEstimate(liveSnapshot), [liveSnapshot])
+  const safetyChecks = useMemo(() => buildSafetyChecks(liveSnapshot), [liveSnapshot])
   const safetySummary = useMemo(() => summarizeSafetyChecks(safetyChecks), [safetyChecks])
-  const tofDisplayDistance = useMemo(() => getTofDisplayDistanceM(snapshot), [snapshot])
+  const tofDisplayDistance = useMemo(() => getTofDisplayDistanceM(liveSnapshot), [liveSnapshot])
   const sessionFacts = useMemo(
     () => [
       {
         label: 'Firmware build',
-        value: snapshot.identity.firmwareVersion,
-        detail: `Protocol ${snapshot.identity.protocolVersion}`,
+        value: liveSnapshot.identity.firmwareVersion,
+        detail: `Protocol ${liveSnapshot.identity.protocolVersion}`,
       },
       {
         label: 'Hardware rev',
-        value: snapshot.identity.hardwareRevision,
-        detail: `Serial ${snapshot.identity.serialNumber}`,
+        value: liveSnapshot.identity.hardwareRevision,
+        detail: `Serial ${liveSnapshot.identity.serialNumber}`,
       },
       {
         label: 'Boot reason',
-        value: formatEnumLabel(snapshot.session.bootReason),
-        detail: `Uptime ${formatRelativeUptime(snapshot.session.uptimeSeconds)}`,
+        value: formatEnumLabel(liveSnapshot.session.bootReason),
+        detail: `Uptime ${formatRelativeUptime(liveSnapshot.session.uptimeSeconds)}`,
       },
       {
         label: 'Power source',
-        value: snapshot.pd.sourceIsHostOnly ? 'USB host only' : formatEnumLabel(snapshot.session.powerTier),
-        detail: `${formatNumber(snapshot.pd.sourceVoltageV, 1)} V · ${formatNumber(snapshot.pd.sourceCurrentA, 2)} A`,
+        value: liveSnapshot.pd.sourceIsHostOnly ? 'USB host only' : formatEnumLabel(liveSnapshot.session.powerTier),
+        detail: `${formatNumber(liveSnapshot.pd.sourceVoltageV, 1)} V · ${formatNumber(liveSnapshot.pd.sourceCurrentA, 2)} A`,
       },
     ],
     [
-      snapshot.identity.firmwareVersion,
-      snapshot.identity.hardwareRevision,
-      snapshot.identity.protocolVersion,
-      snapshot.identity.serialNumber,
-      snapshot.pd.sourceCurrentA,
-      snapshot.pd.sourceIsHostOnly,
-      snapshot.pd.sourceVoltageV,
-      snapshot.session.bootReason,
-      snapshot.session.powerTier,
-      snapshot.session.uptimeSeconds,
+      liveSnapshot.identity.firmwareVersion,
+      liveSnapshot.identity.hardwareRevision,
+      liveSnapshot.identity.protocolVersion,
+      liveSnapshot.identity.serialNumber,
+      liveSnapshot.pd.sourceCurrentA,
+      liveSnapshot.pd.sourceIsHostOnly,
+      liveSnapshot.pd.sourceVoltageV,
+      liveSnapshot.session.bootReason,
+      liveSnapshot.session.powerTier,
+      liveSnapshot.session.uptimeSeconds,
     ],
   )
   const workflowSteps = useMemo(
@@ -208,18 +210,18 @@ function App() {
       },
       {
         label: 'Outputs safe',
-        pass: !snapshot.laser.nirEnabled && !snapshot.laser.alignmentEnabled,
+        pass: !liveSnapshot.laser.nirEnabled && !liveSnapshot.laser.alignmentEnabled,
         detail:
-          !snapshot.laser.nirEnabled && !snapshot.laser.alignmentEnabled
+          !liveSnapshot.laser.nirEnabled && !liveSnapshot.laser.alignmentEnabled
             ? 'No optical output requested'
-            : snapshot.laser.nirEnabled
+            : liveSnapshot.laser.nirEnabled
               ? 'NIR laser request is active'
               : 'Green alignment laser is active',
       },
       {
         label: 'Fault state',
-        pass: !snapshot.fault.latched,
-        detail: snapshot.fault.latched ? snapshot.fault.activeCode : 'No latched fault',
+        pass: !liveSnapshot.fault.latched,
+        detail: liveSnapshot.fault.latched ? liveSnapshot.fault.activeCode : 'No latched fault',
       },
       {
         label: 'Gate health',
@@ -227,7 +229,7 @@ function App() {
         detail: `${safetySummary.passCount}/${safetySummary.total} interlocks passing`,
       },
     ],
-    [safetySummary, snapshot.fault.activeCode, snapshot.fault.latched, snapshot.laser.alignmentEnabled, snapshot.laser.nirEnabled, transportKind, transportStatus],
+    [liveSnapshot.fault.activeCode, liveSnapshot.fault.latched, liveSnapshot.laser.alignmentEnabled, liveSnapshot.laser.nirEnabled, safetySummary, transportKind, transportStatus],
   )
 
   async function handlePickFirmware(file: File) {
@@ -357,7 +359,7 @@ function App() {
           </div>
           <div className={`state-pill is-${stateTone}`}>
             <Zap size={14} />
-            <span>{snapshot.session.state.replaceAll('_', ' ')}</span>
+            <span>{liveSnapshot.session.state.replaceAll('_', ' ')}</span>
           </div>
           <p>Launcher: <code>./start-host-console.command</code></p>
         </div>
@@ -394,7 +396,7 @@ function App() {
                   <p className="eyebrow">System readiness</p>
                   <strong>{safetySummary.label}</strong>
                   <p className="hero-summary__copy">
-                    {formatEnumLabel(snapshot.session.state)} · {formatEnumLabel(snapshot.session.powerTier)} · {snapshot.fault.latched ? snapshot.fault.activeCode : 'No latched fault'}
+                    {formatEnumLabel(liveSnapshot.session.state)} · {formatEnumLabel(liveSnapshot.session.powerTier)} · {liveSnapshot.fault.latched ? liveSnapshot.fault.activeCode : 'No latched fault'}
                   </p>
                 </div>
                 <div className={`state-pill is-${safetySummary.tone}`}>
@@ -439,7 +441,7 @@ function App() {
         </header>
 
         <div className={deviceLinkLost ? 'offline-dim' : undefined}>
-          <StatusRail snapshot={snapshot} telemetryStore={telemetryStore} />
+          <StatusRail snapshot={liveSnapshot} telemetryStore={telemetryStore} />
         </div>
 
         <AnimatePresence mode="wait">
@@ -453,9 +455,9 @@ function App() {
           >
             {activeView === 'overview' ? (
               <>
-                <SafetyMatrix snapshot={snapshot} />
+                <SafetyMatrix snapshot={liveSnapshot} />
 
-                <ModuleReadinessPanel snapshot={snapshot} telemetryStore={telemetryStore} />
+                <ModuleReadinessPanel snapshot={liveSnapshot} telemetryStore={telemetryStore} />
 
                 <section className="telemetry-grid">
                   <article className="panel-section">
@@ -468,23 +470,23 @@ function App() {
                     <dl className="telemetry-list">
                       <div>
                         <dt>Green alignment laser</dt>
-                        <dd>{snapshot.laser.alignmentEnabled ? 'On' : 'Safe off'}</dd>
+                    <dd>{liveSnapshot.laser.alignmentEnabled ? 'On' : 'Safe off'}</dd>
                       </div>
                       <div>
                         <dt>NIR laser</dt>
-                        <dd>{snapshot.laser.nirEnabled ? 'On' : 'Safe off'}</dd>
+                    <dd>{liveSnapshot.laser.nirEnabled ? 'On' : 'Safe off'}</dd>
                       </div>
                       <div>
                         <dt>Driver standby</dt>
-                        <dd>{snapshot.laser.driverStandby ? 'asserted' : 'released'}</dd>
+                    <dd>{liveSnapshot.laser.driverStandby ? 'asserted' : 'released'}</dd>
                       </div>
                       <div>
                         <dt>Measured current</dt>
-                        <dd>{formatNumber(snapshot.laser.measuredCurrentA, 3)} A</dd>
+                    <dd>{formatNumber(liveSnapshot.laser.measuredCurrentA, 3)} A</dd>
                       </div>
                       <div>
                         <dt>Commanded current</dt>
-                        <dd>{formatNumber(snapshot.laser.commandedCurrentA, 3)} A</dd>
+                    <dd>{formatNumber(liveSnapshot.laser.commandedCurrentA, 3)} A</dd>
                       </div>
                       <div>
                         <dt>Optical estimate</dt>
@@ -503,21 +505,21 @@ function App() {
                     <dl className="telemetry-list">
                       <div>
                         <dt>PD contract</dt>
-                        <dd>{snapshot.pd.contractValid ? 'Negotiated' : 'Unavailable'}</dd>
+                        <dd>{liveSnapshot.pd.contractValid ? 'Negotiated' : 'Unavailable'}</dd>
                       </div>
                       <div>
                         <dt>Source</dt>
                         <dd>
-                          {formatNumber(snapshot.pd.sourceVoltageV, 1)} V / {formatNumber(snapshot.pd.sourceCurrentA, 1)} A
+                          {formatNumber(liveSnapshot.pd.sourceVoltageV, 1)} V / {formatNumber(liveSnapshot.pd.sourceCurrentA, 1)} A
                         </dd>
                       </div>
                       <div>
                         <dt>TEC rail</dt>
-                        <dd>{snapshot.rails.tec.enabled ? 'enabled' : 'off'} · {snapshot.rails.tec.pgood ? 'pgood' : 'bad'}</dd>
+                        <dd>{liveSnapshot.rails.tec.enabled ? 'enabled' : 'off'} · {liveSnapshot.rails.tec.pgood ? 'pgood' : 'bad'}</dd>
                       </div>
                       <div>
                         <dt>LD rail</dt>
-                        <dd>{snapshot.rails.ld.enabled ? 'enabled' : 'off'} · {snapshot.rails.ld.pgood ? 'pgood' : 'bad'}</dd>
+                        <dd>{liveSnapshot.rails.ld.enabled ? 'enabled' : 'off'} · {liveSnapshot.rails.ld.pgood ? 'pgood' : 'bad'}</dd>
                       </div>
                       <div>
                         <dt>Total estimated draw</dt>
@@ -540,23 +542,23 @@ function App() {
                     <dl className="telemetry-list">
                       <div>
                         <dt>Target temp</dt>
-                        <dd>{formatNumber(snapshot.tec.targetTempC, 1)} °C</dd>
+                        <dd>{formatNumber(liveSnapshot.tec.targetTempC, 1)} °C</dd>
                       </div>
                       <div>
                         <dt>Actual temp</dt>
-                        <dd>{formatNumber(snapshot.tec.tempC, 2)} °C</dd>
+                        <dd>{formatNumber(liveSnapshot.tec.tempC, 2)} °C</dd>
                       </div>
                       <div>
                         <dt>Target wavelength</dt>
-                        <dd>{formatNumber(snapshot.tec.targetLambdaNm, 1)} nm</dd>
+                        <dd>{formatNumber(liveSnapshot.tec.targetLambdaNm, 1)} nm</dd>
                       </div>
                       <div>
                         <dt>TEC voltage</dt>
-                        <dd>{formatNumber(snapshot.tec.voltageV, 2)} V</dd>
+                        <dd>{formatNumber(liveSnapshot.tec.voltageV, 2)} V</dd>
                       </div>
                       <div>
                         <dt>TEC current</dt>
-                        <dd>{formatNumber(snapshot.tec.currentA, 2)} A</dd>
+                        <dd>{formatNumber(liveSnapshot.tec.currentA, 2)} A</dd>
                       </div>
                       <div>
                         <dt>Cooling estimate</dt>
@@ -575,19 +577,19 @@ function App() {
                     <dl className="telemetry-list">
                       <div>
                         <dt>IMU freshness</dt>
-                        <dd>{snapshot.imu.valid && snapshot.imu.fresh ? 'Fresh and valid' : 'Stale or invalid'}</dd>
+                        <dd>{liveSnapshot.imu.valid && liveSnapshot.imu.fresh ? 'Fresh and valid' : 'Stale or invalid'}</dd>
                       </div>
                       <div>
                         <dt>Beam pitch</dt>
-                        <dd>{formatNumber(snapshot.imu.beamPitchDeg, 1)}°</dd>
+                        <dd>{formatNumber(liveSnapshot.imu.beamPitchDeg, 1)}°</dd>
                       </div>
                       <div>
                         <dt>Pitch limit</dt>
-                        <dd>{formatNumber(snapshot.imu.beamPitchLimitDeg, 1)}°</dd>
+                        <dd>{formatNumber(liveSnapshot.imu.beamPitchLimitDeg, 1)}°</dd>
                       </div>
                       <div>
                         <dt>ToF validity</dt>
-                        <dd>{formatTofValidityLabel(snapshot)}</dd>
+                        <dd>{formatTofValidityLabel(liveSnapshot)}</dd>
                       </div>
                       <div>
                         <dt>Distance</dt>
@@ -599,7 +601,7 @@ function App() {
                       </div>
                       <div>
                         <dt>Allowed window</dt>
-                        <dd>{formatTofWindowSummary(snapshot)}</dd>
+                        <dd>{formatTofWindowSummary(liveSnapshot)}</dd>
                       </div>
                     </dl>
                   </article>
@@ -621,7 +623,7 @@ function App() {
 
             {activeView === 'connection' ? (
               <ConnectionWorkbench
-                snapshot={snapshot}
+                snapshot={liveSnapshot}
                 transportKind={transportKind}
                 transportStatus={transportStatus}
                 transportDetail={transportDetail}
@@ -636,7 +638,7 @@ function App() {
 
             {activeView === 'control' ? (
               <ControlWorkbench
-                snapshot={snapshot}
+                snapshot={liveSnapshot}
                 telemetryStore={telemetryStore}
                 transportKind={transportKind}
                 transportStatus={transportStatus}
@@ -647,7 +649,7 @@ function App() {
 
             {activeView === 'deployment' ? (
               <DeploymentWorkbench
-                snapshot={snapshot}
+                snapshot={liveSnapshot}
                 telemetryStore={telemetryStore}
                 events={events}
                 transportStatus={transportStatus}
@@ -657,11 +659,11 @@ function App() {
 
             {activeView === 'bringup' ? (
               <BringupWorkbench
-                snapshot={snapshot}
+                snapshot={liveSnapshot}
                 telemetryStore={telemetryStore}
-                transportStatus={snapshot.deployment.active ? 'disconnected' : transportStatus}
+                transportStatus={liveSnapshot.deployment.active ? 'disconnected' : transportStatus}
                 transportRecovering={transportRecovering}
-                deploymentLocked={snapshot.deployment.active}
+                deploymentLocked={liveSnapshot.deployment.active}
                 onIssueCommandAwaitAck={issueCommandAwaitAck}
               />
             ) : null}
@@ -717,7 +719,7 @@ function App() {
 
             {activeView === 'firmware' ? (
               <FirmwareWorkbench
-                snapshot={snapshot}
+                snapshot={liveSnapshot}
                 packageDescriptor={packageDescriptor}
                 firmwareProgress={firmwareProgress}
                 connected={transportStatus === 'connected'}
@@ -731,10 +733,10 @@ function App() {
 
             {activeView === 'service' ? (
               <CommandDeck
-                snapshot={snapshot}
+                snapshot={liveSnapshot}
                 transportKind={transportKind}
-                transportStatus={snapshot.deployment.active ? 'disconnected' : transportStatus}
-                deploymentLocked={snapshot.deployment.active}
+                transportStatus={liveSnapshot.deployment.active ? 'disconnected' : transportStatus}
+                deploymentLocked={liveSnapshot.deployment.active}
                 onIssueCommandAwaitAck={issueCommandAwaitAck}
               />
             ) : null}
@@ -743,7 +745,7 @@ function App() {
       </main>
 
       <InspectorRail
-        snapshot={snapshot}
+        snapshot={liveSnapshot}
         commands={commands}
         transportKind={transportKind}
         transportStatus={transportStatus}
@@ -765,7 +767,7 @@ function App() {
       />
 
       <ConnectionStatusTag
-        snapshot={snapshot}
+        snapshot={liveSnapshot}
         transportKind={transportKind}
         transportStatus={transportStatus}
         transportDetail={transportDetail}

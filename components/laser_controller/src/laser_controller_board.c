@@ -128,6 +128,7 @@ static void laser_controller_board_normalize_pd_profiles(
     laser_controller_service_pd_profile_t *normalized_profiles,
     uint8_t *profile_count_encoded);
 static void laser_controller_board_release_pcn_pwm_if_needed(uint32_t gpio_num);
+static void laser_controller_board_release_tof_sideband_if_needed(uint32_t gpio_num);
 #define LASER_CONTROLLER_DRV2605_STANDBY_BIT   0x40U
 #define LASER_CONTROLLER_DRV2605_RESET_BIT     0x80U
 #define LASER_CONTROLLER_PCN_PWM_SPEED_MODE    LEDC_LOW_SPEED_MODE
@@ -227,6 +228,14 @@ typedef struct {
     uint32_t frequency_hz;
 } laser_controller_board_tof_illumination_t;
 
+typedef enum {
+    LASER_CONTROLLER_TOF_SIDEBAND_MODE_FLOAT = 0,
+    LASER_CONTROLLER_TOF_SIDEBAND_MODE_LOW,
+    LASER_CONTROLLER_TOF_SIDEBAND_MODE_HIGH,
+    LASER_CONTROLLER_TOF_SIDEBAND_MODE_PWM,
+    LASER_CONTROLLER_TOF_SIDEBAND_MODE_OVERRIDE,
+} laser_controller_board_tof_sideband_mode_t;
+
 static const uint8_t kVl53l1xDefaultConfiguration[] = {
     0x00, 0x00, 0x00, 0x01, 0x02, 0x00, 0x02, 0x08, 0x00, 0x08, 0x10,
     0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0xff, 0x00, 0x0f, 0x00, 0x00,
@@ -308,6 +317,9 @@ static laser_controller_time_ms_t s_dac_last_attempt_ms;
 static bool s_gpio_ready;
 static bool s_pwm_active;
 static bool s_tof_illumination_pwm_active;
+static laser_controller_board_tof_sideband_mode_t s_tof_sideband_mode;
+static uint32_t s_tof_sideband_applied_duty_cycle_pct;
+static uint32_t s_tof_sideband_applied_frequency_hz;
 static laser_controller_pd_snapshot_t s_pd_snapshot;
 static float s_last_ld_voltage_v = -1.0f;
 static float s_last_tec_voltage_v = -1.0f;
@@ -437,6 +449,7 @@ static void laser_controller_board_apply_gpio_overrides(void)
         }
 
         laser_controller_board_release_pcn_pwm_if_needed(gpio_num);
+        laser_controller_board_release_tof_sideband_if_needed(gpio_num);
         memset(&config, 0, sizeof(config));
         config.pin_bit_mask = (1ULL << gpio_num);
         config.mode = override_config.mode == LASER_CONTROLLER_SERVICE_GPIO_MODE_INPUT ?
@@ -667,21 +680,83 @@ static void laser_controller_board_stop_tof_illumination_pwm(void)
     }
 }
 
-static esp_err_t laser_controller_board_apply_tof_sideband_state_locked(bool tof_armed)
+static bool laser_controller_board_service_owns_tof_sideband(void)
+{
+    return laser_controller_service_mode_requested() &&
+           laser_controller_service_module_write_enabled(
+               LASER_CONTROLLER_MODULE_TOF);
+}
+
+static void laser_controller_board_release_tof_sideband_if_needed(
+    uint32_t gpio_num)
+{
+    if (gpio_num != LASER_CONTROLLER_GPIO_TOF_LED_CTRL) {
+        return;
+    }
+
+    laser_controller_board_stop_tof_illumination_pwm();
+    (void)gpio_reset_pin((gpio_num_t)gpio_num);
+    gpio_func_sel(gpio_num, PIN_FUNC_GPIO);
+    esp_rom_gpio_connect_out_signal(gpio_num, SIG_GPIO_OUT_IDX, false, false);
+}
+
+static esp_err_t laser_controller_board_apply_tof_sideband_state_locked(
+    bool service_owns_sideband)
 {
     gpio_config_t config = { 0 };
     esp_err_t err = ESP_OK;
+    laser_controller_board_tof_sideband_mode_t desired_mode =
+        LASER_CONTROLLER_TOF_SIDEBAND_MODE_FLOAT;
+    const uint32_t desired_frequency_hz = laser_controller_board_clamp_u32(
+        s_tof_illumination.frequency_hz,
+        LASER_CONTROLLER_TOF_LED_PWM_MIN_FREQ_HZ,
+        LASER_CONTROLLER_TOF_LED_PWM_MAX_FREQ_HZ);
+    uint32_t desired_duty_cycle_pct = laser_controller_board_clamp_u32(
+        s_tof_illumination.duty_cycle_pct,
+        0U,
+        100U);
+
+    if (laser_controller_board_gpio_override_active(
+            LASER_CONTROLLER_GPIO_TOF_LED_CTRL)) {
+        laser_controller_board_release_tof_sideband_if_needed(
+            LASER_CONTROLLER_GPIO_TOF_LED_CTRL);
+        s_tof_sideband_mode = LASER_CONTROLLER_TOF_SIDEBAND_MODE_OVERRIDE;
+        s_tof_sideband_applied_duty_cycle_pct = 0U;
+        s_tof_sideband_applied_frequency_hz = 0U;
+        return ESP_OK;
+    }
 
     config.pin_bit_mask = (1ULL << LASER_CONTROLLER_GPIO_TOF_LED_CTRL);
     config.pull_down_en = GPIO_PULLDOWN_DISABLE;
     config.pull_up_en = GPIO_PULLUP_DISABLE;
     config.intr_type = GPIO_INTR_DISABLE;
 
-    laser_controller_board_stop_tof_illumination_pwm();
+    if (!service_owns_sideband) {
+        desired_mode = LASER_CONTROLLER_TOF_SIDEBAND_MODE_LOW;
+    } else if (!s_tof_illumination.enabled || desired_duty_cycle_pct == 0U) {
+        desired_mode = LASER_CONTROLLER_TOF_SIDEBAND_MODE_LOW;
+    } else if (desired_duty_cycle_pct >= 100U) {
+        desired_mode = LASER_CONTROLLER_TOF_SIDEBAND_MODE_HIGH;
+    } else {
+        desired_mode = LASER_CONTROLLER_TOF_SIDEBAND_MODE_PWM;
+    }
 
-    if (!tof_armed) {
+    if (s_tof_sideband_mode == desired_mode &&
+        (desired_mode != LASER_CONTROLLER_TOF_SIDEBAND_MODE_PWM ||
+         (s_tof_sideband_applied_duty_cycle_pct == desired_duty_cycle_pct &&
+          s_tof_sideband_applied_frequency_hz == desired_frequency_hz))) {
+        return ESP_OK;
+    }
+
+    laser_controller_board_release_tof_sideband_if_needed(
+        LASER_CONTROLLER_GPIO_TOF_LED_CTRL);
+
+    if (desired_mode == LASER_CONTROLLER_TOF_SIDEBAND_MODE_FLOAT) {
         config.mode = GPIO_MODE_INPUT;
         (void)gpio_config(&config);
+        s_tof_sideband_mode = desired_mode;
+        s_tof_sideband_applied_duty_cycle_pct = 0U;
+        s_tof_sideband_applied_frequency_hz = 0U;
         return ESP_OK;
     }
 
@@ -691,15 +766,12 @@ static esp_err_t laser_controller_board_apply_tof_sideband_state_locked(bool tof
         return err;
     }
 
-    if (s_tof_illumination.enabled && s_tof_illumination.duty_cycle_pct > 0U) {
+    if (desired_mode == LASER_CONTROLLER_TOF_SIDEBAND_MODE_PWM) {
         ledc_timer_config_t timer_config = {
             .speed_mode = LASER_CONTROLLER_TOF_LED_PWM_SPEED_MODE,
             .duty_resolution = LASER_CONTROLLER_TOF_LED_PWM_RESOLUTION,
             .timer_num = LASER_CONTROLLER_TOF_LED_PWM_TIMER,
-            .freq_hz = laser_controller_board_clamp_u32(
-                s_tof_illumination.frequency_hz,
-                LASER_CONTROLLER_TOF_LED_PWM_MIN_FREQ_HZ,
-                LASER_CONTROLLER_TOF_LED_PWM_MAX_FREQ_HZ),
+            .freq_hz = desired_frequency_hz,
             .clk_cfg = LEDC_AUTO_CLK,
             .deconfigure = false,
         };
@@ -710,9 +782,9 @@ static esp_err_t laser_controller_board_apply_tof_sideband_state_locked(bool tof
             .intr_type = LEDC_INTR_DISABLE,
             .timer_sel = LASER_CONTROLLER_TOF_LED_PWM_TIMER,
             .duty = (laser_controller_board_clamp_u32(
-                        s_tof_illumination.duty_cycle_pct,
+                        desired_duty_cycle_pct,
                         1U,
-                        100U) *
+                        99U) *
                      LASER_CONTROLLER_TOF_LED_PWM_DUTY_MAX) /
                     100U,
             .hpoint = 0,
@@ -728,17 +800,26 @@ static esp_err_t laser_controller_board_apply_tof_sideband_state_locked(bool tof
 
         if (err == ESP_OK) {
             s_tof_illumination_pwm_active = true;
+            s_tof_sideband_mode = desired_mode;
+            s_tof_sideband_applied_duty_cycle_pct = desired_duty_cycle_pct;
+            s_tof_sideband_applied_frequency_hz = desired_frequency_hz;
             return ESP_OK;
         }
     }
 
-    (void)gpio_set_level(LASER_CONTROLLER_GPIO_TOF_LED_CTRL, 0);
+    (void)gpio_set_level(
+        LASER_CONTROLLER_GPIO_TOF_LED_CTRL,
+        desired_mode == LASER_CONTROLLER_TOF_SIDEBAND_MODE_HIGH ? 1 : 0);
+    s_tof_sideband_mode = desired_mode;
+    s_tof_sideband_applied_duty_cycle_pct =
+        desired_mode == LASER_CONTROLLER_TOF_SIDEBAND_MODE_HIGH ? 100U : 0U;
+    s_tof_sideband_applied_frequency_hz = 0U;
     return err;
 }
 
-static void laser_controller_board_apply_tof_sideband_state(bool tof_armed)
+static void laser_controller_board_apply_tof_sideband_state(bool service_owns_sideband)
 {
-    (void)laser_controller_board_apply_tof_sideband_state_locked(tof_armed);
+    (void)laser_controller_board_apply_tof_sideband_state_locked(service_owns_sideband);
 }
 
 static void laser_controller_board_drive_safe_gpio_levels(
@@ -2489,6 +2570,8 @@ static void laser_controller_board_capture_tof_readback(
     const bool tof_expected =
         laser_controller_service_module_write_enabled(
             LASER_CONTROLLER_MODULE_TOF);
+    const bool service_owns_tof_sideband =
+        laser_controller_board_service_owns_tof_sideband();
     bool data_ready = false;
     uint8_t boot_state = 0U;
     uint16_t sensor_id = 0U;
@@ -2496,7 +2579,7 @@ static void laser_controller_board_capture_tof_readback(
     uint16_t distance_mm = 0U;
     esp_err_t err;
 
-    laser_controller_board_apply_tof_sideband_state(tof_expected);
+    laser_controller_board_apply_tof_sideband_state(service_owns_tof_sideband);
 
     if (!tof_expected) {
         if (s_tof_runtime.ranging) {
@@ -3757,6 +3840,9 @@ void laser_controller_board_init_safe_defaults(void)
     s_dac_last_error = ESP_OK;
     s_dac_last_attempt_ms = 0U;
     s_tof_illumination_pwm_active = false;
+    s_tof_sideband_mode = LASER_CONTROLLER_TOF_SIDEBAND_MODE_FLOAT;
+    s_tof_sideband_applied_duty_cycle_pct = 0U;
+    s_tof_sideband_applied_frequency_hz = 0U;
     laser_controller_board_clear_dac_readback();
     laser_controller_board_clear_pd_readback();
     laser_controller_board_clear_imu_readback();
@@ -4220,6 +4306,9 @@ void laser_controller_board_reset_gpio_debug_state(void)
     bool preserve_spi_pins = false;
 
     laser_controller_board_stop_tof_illumination_pwm();
+    s_tof_sideband_mode = LASER_CONTROLLER_TOF_SIDEBAND_MODE_FLOAT;
+    s_tof_sideband_applied_duty_cycle_pct = 0U;
+    s_tof_sideband_applied_frequency_hz = 0U;
     laser_controller_board_lock_bus();
 
     if (s_i2c_ready && s_i2c_bus != NULL) {
@@ -4281,8 +4370,7 @@ void laser_controller_board_reset_gpio_debug_state(void)
     laser_controller_board_drive_safe_gpio_levels(&s_last_outputs);
     laser_controller_board_apply_gpio_overrides();
     laser_controller_board_apply_tof_sideband_state(
-        laser_controller_service_module_write_enabled(
-            LASER_CONTROLLER_MODULE_TOF));
+        laser_controller_board_service_owns_tof_sideband());
     laser_controller_board_capture_gpio_inspector();
 }
 
@@ -4535,8 +4623,7 @@ esp_err_t laser_controller_board_set_tof_illumination(
         LASER_CONTROLLER_TOF_LED_PWM_MAX_FREQ_HZ);
 
     return laser_controller_board_apply_tof_sideband_state_locked(
-        laser_controller_service_module_write_enabled(
-            LASER_CONTROLLER_MODULE_TOF));
+        laser_controller_board_service_owns_tof_sideband());
 }
 
 esp_err_t laser_controller_board_fire_haptic_test(void)

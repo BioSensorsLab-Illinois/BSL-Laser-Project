@@ -112,6 +112,9 @@ Append dated findings here. Keep observed bench facts separate from inference.
   - `laser_output_disable` returns to ready posture without powering rails down
   The temporary hook was removed and the clean baseline image was reflashed afterward.
 
+### 2026-04-04
+- [Build-verified only] Runtime safety thresholds and timeout policy are now part of the persisted bring-up profile schema and are reapplied into the live controller config on boot. Device-side profile save now covers bring-up module/debug settings, PD policy, and runtime safety policy together.
+
 ## System-Level Refactors Still Needed
 - Replace the hand-rolled JSON parser with a more robust structured parser once footprint and determinism are acceptable.
 - Formalize analog signal validity for LD and TEC telemetry so floating ADC paths do not create hidden safety ambiguity.

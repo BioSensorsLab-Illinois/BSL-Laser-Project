@@ -3724,6 +3724,12 @@ static void laser_controller_comms_handle_command_line(const char *line)
                 "Deployment target edits are blocked while the deployment checklist is running.");
             return;
         }
+        if (status.deployment.ready) {
+            laser_controller_comms_emit_error_response(
+                id,
+                "Deployment target edits are locked once deployment is ready. Use the Control page runtime target instead.");
+            return;
+        }
 
         if (laser_controller_comms_extract_string(
                 line,
@@ -3754,18 +3760,6 @@ static void laser_controller_comms_handle_command_line(const char *line)
                 id,
                 "Deployment target could not be applied because deployment mode is not active.");
             return;
-        }
-
-        if (target.target_mode == LASER_CONTROLLER_DEPLOYMENT_TARGET_MODE_LAMBDA) {
-            laser_controller_bench_set_target_lambda_nm(
-                &status.config,
-                target.target_lambda_nm,
-                now_ms);
-        } else {
-            laser_controller_bench_set_target_temp_c(
-                &status.config,
-                target.target_temp_c,
-                now_ms);
         }
 
         laser_controller_comms_refresh_status_after_mutation(&status, 25U);
@@ -3834,7 +3828,6 @@ static void laser_controller_comms_handle_command_line(const char *line)
 
     if (strcmp(command, "exit_service_mode") == 0) {
         laser_controller_service_set_mode_requested(false, now_ms);
-        laser_controller_bench_clear_requests(now_ms);
         laser_controller_logger_log(now_ms, "service", "service mode exited");
         if (!laser_controller_comms_wait_for_service_mode(false, &status)) {
             laser_controller_comms_emit_error_response(
@@ -4343,6 +4336,11 @@ static void laser_controller_comms_handle_command_line(const char *line)
         }
 
         laser_controller_bench_set_target_temp_c(&status.config, target_temp_c, now_ms);
+        laser_controller_service_set_runtime_target(
+            LASER_CONTROLLER_BENCH_TARGET_MODE_TEMP,
+            target_temp_c,
+            laser_controller_comms_lambda_from_temp(&status.config, target_temp_c),
+            now_ms);
         if (status.deployment.active) {
             (void)laser_controller_app_set_deployment_target(
                 &(laser_controller_deployment_target_t){
@@ -4368,6 +4366,7 @@ static void laser_controller_comms_handle_command_line(const char *line)
 
     if (strcmp(command, "set_target_lambda") == 0) {
         float target_lambda_nm = 0.0f;
+        laser_controller_bench_status_t bench_status_after = status.bench;
 
         if (!laser_controller_comms_extract_float(line, "\"lambda_nm\":", &target_lambda_nm)) {
             laser_controller_comms_emit_error_response(id, "Missing lambda_nm.");
@@ -4375,6 +4374,12 @@ static void laser_controller_comms_handle_command_line(const char *line)
         }
 
         laser_controller_bench_set_target_lambda_nm(&status.config, target_lambda_nm, now_ms);
+        laser_controller_bench_copy_status(&bench_status_after);
+        laser_controller_service_set_runtime_target(
+            LASER_CONTROLLER_BENCH_TARGET_MODE_LAMBDA,
+            bench_status_after.target_temp_c,
+            bench_status_after.target_lambda_nm,
+            now_ms);
         if (status.deployment.active) {
             (void)laser_controller_app_set_deployment_target(
                 &(laser_controller_deployment_target_t){

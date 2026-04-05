@@ -94,8 +94,8 @@ const deploymentStepDetails: Record<
     validates: 'TEC good is asserted and the analog thermal channels remain plausible and within the configured deployment envelope.',
   },
   ready_posture: {
-    summary: 'Confirms the final idle runtime posture used before the Control page is allowed to request optical output.',
-    validates: 'Rails remain good, the driver is in standby, PCN is high, loop-good is present, and the deployment ready state can be asserted safely.',
+    summary: 'Temporarily drives the laser driver into its active-current posture to validate LPGD, then returns to the low-current idle posture used by the Control page.',
+    validates: 'SBDN stays ON, PCN goes high long enough to confirm LPGD, then firmware returns PCN low while keeping both rails up for Control-page handoff.',
   },
 }
 
@@ -156,19 +156,33 @@ export function DeploymentWorkbench({
   const [targetLambdaNm, setTargetLambdaNm] = useState(() =>
     formatNumber(deployment.targetLambdaNm, 1),
   )
+  const [targetDirty, setTargetDirty] = useState(false)
   const [safetyDraft, setSafetyDraft] = useState<SafetyDraft>(() =>
     makeSafetyDraft(liveSnapshot),
   )
+  const [safetyDirty, setSafetyDirty] = useState(false)
 
   useEffect(() => {
-    setTargetMode(deployment.targetMode)
-    setTargetTempC(formatNumber(deployment.targetTempC, 1))
-    setTargetLambdaNm(formatNumber(deployment.targetLambdaNm, 1))
-  }, [deployment.targetLambdaNm, deployment.targetMode, deployment.targetTempC])
+    if (!targetDirty || !deployment.active) {
+      setTargetMode(deployment.targetMode)
+      setTargetTempC(formatNumber(deployment.targetTempC, 1))
+      setTargetLambdaNm(formatNumber(deployment.targetLambdaNm, 1))
+      setTargetDirty(false)
+    }
+  }, [
+    deployment.active,
+    deployment.targetLambdaNm,
+    deployment.targetMode,
+    deployment.targetTempC,
+    targetDirty,
+  ])
 
   useEffect(() => {
-    setSafetyDraft(makeSafetyDraft(liveSnapshot))
-  }, [liveSnapshot.safety])
+    if (!safetyDirty || !deployment.active) {
+      setSafetyDraft(makeSafetyDraft(liveSnapshot))
+      setSafetyDirty(false)
+    }
+  }, [deployment.active, liveSnapshot, safetyDirty])
 
   const checklistSteps = useMemo(
     () => deployment.steps,
@@ -220,7 +234,7 @@ export function DeploymentWorkbench({
   }
 
   async function applyDeploymentTarget() {
-    await onIssueCommandAwaitAck(
+    const result = await onIssueCommandAwaitAck(
       'set_deployment_target',
       'write',
       'Set the deployment temperature or wavelength target for checklist execution and ready posture.',
@@ -229,10 +243,13 @@ export function DeploymentWorkbench({
         : { target_mode: 'temp', temp_c: parseNumber(targetTempC, deployment.targetTempC) },
       { timeoutMs: 3000 },
     )
+    if (result.ok) {
+      setTargetDirty(false)
+    }
   }
 
   async function applyDeploymentSafety() {
-    await onIssueCommandAwaitAck(
+    const result = await onIssueCommandAwaitAck(
       'set_deployment_safety',
       'write',
       'Apply deployment safety thresholds and timeouts live in firmware.',
@@ -304,6 +321,9 @@ export function DeploymentWorkbench({
       },
       { timeoutMs: 3500 },
     )
+    if (result.ok) {
+      setSafetyDirty(false)
+    }
   }
 
   return (
@@ -314,7 +334,7 @@ export function DeploymentWorkbench({
           <h2>Deployment mode</h2>
         </div>
         <p className="panel-note">
-          Firmware owns deployment sequencing. This page only starts the checklist, edits the deployment target and safety envelope, and displays progress and failure state.
+          Firmware owns deployment sequencing. This page starts the checklist, edits the deployment target and safety envelope, and displays progress and failure state. Normal Control-page operation is intended to happen while deployment mode remains active and ready.
         </p>
       </div>
 
@@ -374,7 +394,7 @@ export function DeploymentWorkbench({
               void exitDeploymentMode()
             }}
           >
-            Exit deployment mode
+            {deployment.ready ? 'Power down and exit deployment' : 'Exit deployment mode'}
           </button>
           <button
             type="button"
@@ -398,16 +418,22 @@ export function DeploymentWorkbench({
             <button
               type="button"
               className={targetMode === 'temp' ? 'segmented__button is-active' : 'segmented__button'}
-              disabled={!deployment.active || deployment.running}
-              onClick={() => setTargetMode('temp')}
+              disabled={!deployment.active || deployment.running || deployment.ready}
+              onClick={() => {
+                setTargetMode('temp')
+                setTargetDirty(true)
+              }}
             >
               Temperature
             </button>
             <button
               type="button"
               className={targetMode === 'lambda' ? 'segmented__button is-active' : 'segmented__button'}
-              disabled={!deployment.active || deployment.running}
-              onClick={() => setTargetMode('lambda')}
+              disabled={!deployment.active || deployment.running || deployment.ready}
+              onClick={() => {
+                setTargetMode('lambda')
+                setTargetDirty(true)
+              }}
             >
               Wavelength
             </button>
@@ -418,6 +444,7 @@ export function DeploymentWorkbench({
                 setTargetMode(deployment.targetMode)
                 setTargetTempC(formatNumber(deployment.targetTempC, 1))
                 setTargetLambdaNm(formatNumber(deployment.targetLambdaNm, 1))
+                setTargetDirty(false)
               }}
             >
               Sync live
@@ -429,8 +456,11 @@ export function DeploymentWorkbench({
               <input
                 type="number"
                 value={targetTempC}
-                disabled={!deployment.active || deployment.running}
-                onChange={(event) => setTargetTempC(event.target.value)}
+                disabled={!deployment.active || deployment.running || deployment.ready}
+                onChange={(event) => {
+                  setTargetTempC(event.target.value)
+                  setTargetDirty(true)
+                }}
               />
             </label>
             <label className="field">
@@ -438,8 +468,11 @@ export function DeploymentWorkbench({
               <input
                 type="number"
                 value={targetLambdaNm}
-                disabled={!deployment.active || deployment.running}
-                onChange={(event) => setTargetLambdaNm(event.target.value)}
+                disabled={!deployment.active || deployment.running || deployment.ready}
+                onChange={(event) => {
+                  setTargetLambdaNm(event.target.value)
+                  setTargetDirty(true)
+                }}
               />
             </label>
           </div>
@@ -447,7 +480,7 @@ export function DeploymentWorkbench({
             <button
               type="button"
               className="action-button is-inline"
-              disabled={!connected || !deployment.active || deployment.running}
+              disabled={!connected || !deployment.active || deployment.running || deployment.ready}
               onClick={() => {
                 void applyDeploymentTarget()
               }}
@@ -508,28 +541,6 @@ export function DeploymentWorkbench({
               </details>
             ))}
           </div>
-          <div className="deployment-log-strip">
-            <div className="cutout-head">
-              <strong>Recent deployment logs</strong>
-            </div>
-            {deploymentLogEvents.length > 0 ? (
-              <div className="deployment-log-list">
-                {deploymentLogEvents.map((event) => (
-                  <div key={event.id} className="deployment-log-entry">
-                    <div>
-                      <strong>{event.title}</strong>
-                      <span>{event.category}</span>
-                    </div>
-                    <p>{event.detail}</p>
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <p className="panel-note">
-                No deployment-specific logs captured in this session yet.
-              </p>
-            )}
-          </div>
         </article>
       </div>
 
@@ -567,15 +578,29 @@ export function DeploymentWorkbench({
                 type="text"
                 value={safetyDraft[key]}
                 disabled={!deployment.active || deployment.running}
-                onChange={(event) =>
+                onChange={(event) => {
                   setSafetyDraft((current) => ({
                     ...current,
                     [key]: event.target.value,
                   }))
-                }
+                  setSafetyDirty(true)
+                }}
               />
             </label>
           ))}
+        </div>
+        <div className="button-row is-compact">
+          <button
+            type="button"
+            className="action-button is-inline"
+            disabled={!deployment.active || deployment.running}
+            onClick={() => {
+              setSafetyDraft(makeSafetyDraft(liveSnapshot))
+              setSafetyDirty(false)
+            }}
+          >
+            Sync live safety
+          </button>
         </div>
         <div className="button-row is-compact">
           <button
@@ -627,6 +652,29 @@ export function DeploymentWorkbench({
             <small>{deployment.failureReason || 'No deployment failure recorded.'}</small>
           </div>
         </div>
+      </article>
+
+      <article className="panel-cutout">
+        <div className="cutout-head">
+          <strong>Recent deployment logs</strong>
+        </div>
+        {deploymentLogEvents.length > 0 ? (
+          <div className="deployment-log-list">
+            {deploymentLogEvents.map((event) => (
+              <div key={event.id} className="deployment-log-entry">
+                <div>
+                  <strong>{event.title}</strong>
+                  <span>{event.category}</span>
+                </div>
+                <p>{event.detail}</p>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <p className="panel-note">
+            No deployment-specific logs captured in this session yet.
+          </p>
+        )}
       </article>
     </section>
   )

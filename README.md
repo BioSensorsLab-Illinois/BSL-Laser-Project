@@ -258,6 +258,8 @@ The refactored GUI now includes:
 - a richer event viewer with module-aware filters and decoded I2C/SPI activity
 - a firmware page with a board-aware visual guide for the ESP32-S3 `RST` and `BOOT` buttons plus raw app-binary browser flashing over Web Serial
 - live power estimates for laser input, TEC input, cooling power, and total wall draw
+
+Device-side bring-up profile persistence now also includes the runtime safety policy edited from the Bring-up service page. Saving the active bring-up profile to NVS preserves those safety thresholds and timeout settings across reboot.
 - host-local bring-up draft persistence so partially populated bench builds can be repeated consistently
 
 The firmware command endpoint now matches that GUI surface for the current bench image:

@@ -267,7 +267,7 @@ export function ControlWorkbench({
   const nirActionLabel = nirRequested || nirActive ? 'Disable NIR Laser' : 'Enable NIR Laser'
   const nirActionTitle = nirActive
     ? 'Drop the NIR output request and return the beam path safe.'
-    : 'Request NIR output through the normal runtime safety gate. If bring-up service control is still active, this page will hand ownership back to runtime first.'
+    : 'Request NIR output through the normal runtime safety gate. If bring-up service control is still active, the request will stay staged until service mode is exited.'
   const alignmentActionCmd =
     alignmentRequested || alignmentActive ? 'disable_alignment' : 'enable_alignment'
   const alignmentActionLabel =
@@ -275,7 +275,7 @@ export function ControlWorkbench({
   const alignmentActionTitle =
     alignmentRequested || alignmentActive
       ? 'Drop the green alignment request and return the alignment path safe.'
-      : 'Request the green alignment laser through the normal runtime safety gate. If bring-up service control is still active, this page will hand ownership back to runtime first.'
+      : 'Request the green alignment laser through the normal runtime safety gate. If bring-up service control is still active, the request will stay staged until service mode is exited.'
 
   const issueRuntimeControlCommand = useCallback(
     async (

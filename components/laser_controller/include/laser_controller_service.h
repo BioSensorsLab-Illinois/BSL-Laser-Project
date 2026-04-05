@@ -6,6 +6,7 @@
 
 #include "esp_err.h"
 
+#include "laser_controller_bench.h"
 #include "laser_controller_config.h"
 #include "laser_controller_types.h"
 
@@ -171,6 +172,11 @@ typedef struct {
     uint32_t haptic_library;
     laser_controller_service_haptic_actuator_t haptic_actuator;
     uint32_t haptic_rtp_level;
+    laser_controller_safety_thresholds_t safety_thresholds;
+    laser_controller_timeout_policy_t safety_timeouts;
+    laser_controller_bench_target_mode_t runtime_target_mode;
+    laser_controller_celsius_t runtime_target_temp_c;
+    laser_controller_nm_t runtime_target_lambda_nm;
     char last_i2c_scan[LASER_CONTROLLER_SERVICE_TEXT_LEN];
     char last_i2c_op[LASER_CONTROLLER_SERVICE_TEXT_LEN];
     char last_spi_op[LASER_CONTROLLER_SERVICE_TEXT_LEN];
@@ -193,6 +199,13 @@ void laser_controller_service_get_haptic_config(
     laser_controller_service_haptic_config_t *config);
 void laser_controller_service_get_tof_illumination_config(
     laser_controller_service_tof_illumination_t *config);
+void laser_controller_service_get_runtime_safety_policy(
+    laser_controller_safety_thresholds_t *thresholds,
+    laser_controller_timeout_policy_t *timeouts);
+void laser_controller_service_get_runtime_target(
+    laser_controller_bench_target_mode_t *target_mode,
+    laser_controller_celsius_t *target_temp_c,
+    laser_controller_nm_t *target_lambda_nm);
 void laser_controller_service_report_module_probe(
     laser_controller_module_t module,
     bool detected,
@@ -255,6 +268,15 @@ void laser_controller_service_set_tof_config(
     float min_range_m,
     float max_range_m,
     uint32_t stale_timeout_ms,
+    laser_controller_time_ms_t now_ms);
+void laser_controller_service_set_runtime_safety_policy(
+    const laser_controller_safety_thresholds_t *thresholds,
+    const laser_controller_timeout_policy_t *timeouts,
+    laser_controller_time_ms_t now_ms);
+void laser_controller_service_set_runtime_target(
+    laser_controller_bench_target_mode_t target_mode,
+    laser_controller_celsius_t target_temp_c,
+    laser_controller_nm_t target_lambda_nm,
     laser_controller_time_ms_t now_ms);
 esp_err_t laser_controller_service_set_tof_illumination(
     bool enabled,

@@ -422,9 +422,6 @@ export class MockTransport implements DeviceTransport {
           failureReason: '',
           steps: makeDefaultDeploymentSteps(),
         }
-        this.state.alignmentRequested = false
-        this.state.laserRequested = false
-        this.state.modulationEnabled = false
         break
       case 'run_deployment_sequence': {
         const hostOnly = this.state.powerTier === 'programming_only' && this.state.pdPowerW <= 5.1
@@ -899,8 +896,6 @@ export class MockTransport implements DeviceTransport {
         this.state.bringup.serviceModeActive = false
         this.state.bringup.illumination.tof.enabled = false
         this.state.systemState = 'SAFE_IDLE'
-        this.state.laserRequested = false
-        this.state.alignmentRequested = false
         this.state.hapticDriverEnabled = false
         break
       case 'apply_bringup_preset':

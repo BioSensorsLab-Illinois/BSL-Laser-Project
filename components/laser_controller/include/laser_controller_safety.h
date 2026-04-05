@@ -27,6 +27,7 @@ typedef struct {
     bool last_distance_blocked;
     bool last_lambda_drift_blocked;
     bool last_tec_temp_adc_blocked;
+    bool driver_operate_expected;
     laser_controller_power_tier_t power_tier;
     laser_controller_nm_t target_lambda_nm;
     laser_controller_nm_t actual_lambda_nm;

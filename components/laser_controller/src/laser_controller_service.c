@@ -16,7 +16,7 @@
 #define LASER_CONTROLLER_LSM6DSO_WHOAMI 0x6CU
 #define LASER_CONTROLLER_SERVICE_NVS_NAMESPACE "laser_ctrl"
 #define LASER_CONTROLLER_SERVICE_NVS_KEY       "svc_profile"
-#define LASER_CONTROLLER_SERVICE_PROFILE_VER   4U
+#define LASER_CONTROLLER_SERVICE_PROFILE_VER   6U
 #define LASER_CONTROLLER_SERVICE_PROFILE_VER_MIN 3U
 #define LASER_CONTROLLER_SERVICE_DAC_MAX_V     2.5f
 #define LASER_CONTROLLER_SERVICE_DEFAULT_TEC_CHANNEL_V 0.821104f
@@ -104,6 +104,91 @@ typedef struct {
     uint32_t haptic_library;
     laser_controller_service_haptic_actuator_t haptic_actuator;
     uint32_t haptic_rtp_level;
+} laser_controller_service_persisted_profile_v4_t;
+
+typedef struct {
+    uint32_t version;
+    char profile_name[LASER_CONTROLLER_SERVICE_PROFILE_NAME_LEN];
+    bool ld_rail_debug_enabled;
+    bool tec_rail_debug_enabled;
+    laser_controller_service_persisted_module_t
+        modules[LASER_CONTROLLER_MODULE_COUNT];
+    float dac_ld_channel_v;
+    float dac_tec_channel_v;
+    laser_controller_service_dac_reference_t dac_reference;
+    bool dac_gain_2x;
+    bool dac_ref_div;
+    laser_controller_service_dac_sync_t dac_sync_mode;
+    uint32_t imu_odr_hz;
+    uint32_t imu_accel_range_g;
+    uint32_t imu_gyro_range_dps;
+    bool imu_gyro_enabled;
+    bool imu_lpf2_enabled;
+    bool imu_timestamp_enabled;
+    bool imu_bdu_enabled;
+    bool imu_if_inc_enabled;
+    bool imu_i2c_disabled;
+    float tof_min_range_m;
+    float tof_max_range_m;
+    uint32_t tof_stale_timeout_ms;
+    laser_controller_service_pd_profile_t
+        pd_profiles[LASER_CONTROLLER_SERVICE_PD_PROFILE_COUNT];
+    float pd_programming_only_max_w;
+    float pd_reduced_mode_min_w;
+    float pd_reduced_mode_max_w;
+    float pd_full_mode_min_w;
+    bool pd_firmware_plan_enabled;
+    uint32_t haptic_effect_id;
+    laser_controller_service_haptic_mode_t haptic_mode;
+    uint32_t haptic_library;
+    laser_controller_service_haptic_actuator_t haptic_actuator;
+    uint32_t haptic_rtp_level;
+    laser_controller_safety_thresholds_t safety_thresholds;
+    laser_controller_timeout_policy_t safety_timeouts;
+} laser_controller_service_persisted_profile_v5_t;
+
+typedef struct {
+    uint32_t version;
+    char profile_name[LASER_CONTROLLER_SERVICE_PROFILE_NAME_LEN];
+    bool ld_rail_debug_enabled;
+    bool tec_rail_debug_enabled;
+    laser_controller_service_persisted_module_t
+        modules[LASER_CONTROLLER_MODULE_COUNT];
+    float dac_ld_channel_v;
+    float dac_tec_channel_v;
+    laser_controller_service_dac_reference_t dac_reference;
+    bool dac_gain_2x;
+    bool dac_ref_div;
+    laser_controller_service_dac_sync_t dac_sync_mode;
+    uint32_t imu_odr_hz;
+    uint32_t imu_accel_range_g;
+    uint32_t imu_gyro_range_dps;
+    bool imu_gyro_enabled;
+    bool imu_lpf2_enabled;
+    bool imu_timestamp_enabled;
+    bool imu_bdu_enabled;
+    bool imu_if_inc_enabled;
+    bool imu_i2c_disabled;
+    float tof_min_range_m;
+    float tof_max_range_m;
+    uint32_t tof_stale_timeout_ms;
+    laser_controller_service_pd_profile_t
+        pd_profiles[LASER_CONTROLLER_SERVICE_PD_PROFILE_COUNT];
+    float pd_programming_only_max_w;
+    float pd_reduced_mode_min_w;
+    float pd_reduced_mode_max_w;
+    float pd_full_mode_min_w;
+    bool pd_firmware_plan_enabled;
+    uint32_t haptic_effect_id;
+    laser_controller_service_haptic_mode_t haptic_mode;
+    uint32_t haptic_library;
+    laser_controller_service_haptic_actuator_t haptic_actuator;
+    uint32_t haptic_rtp_level;
+    laser_controller_safety_thresholds_t safety_thresholds;
+    laser_controller_timeout_policy_t safety_timeouts;
+    laser_controller_bench_target_mode_t runtime_target_mode;
+    laser_controller_celsius_t runtime_target_temp_c;
+    laser_controller_nm_t runtime_target_lambda_nm;
 } laser_controller_service_persisted_profile_t;
 
 typedef struct {
@@ -130,6 +215,37 @@ static float laser_controller_service_clamp_float(float value, float minimum, fl
     return value;
 }
 
+static void laser_controller_service_load_default_runtime_safety(
+    laser_controller_safety_thresholds_t *thresholds,
+    laser_controller_timeout_policy_t *timeouts)
+{
+    laser_controller_config_t config = { 0 };
+
+    laser_controller_config_load_defaults(&config);
+    if (thresholds != NULL) {
+        *thresholds = config.thresholds;
+    }
+    if (timeouts != NULL) {
+        *timeouts = config.timeouts;
+    }
+}
+
+static void laser_controller_service_load_default_runtime_target(
+    laser_controller_bench_target_mode_t *target_mode,
+    laser_controller_celsius_t *target_temp_c,
+    laser_controller_nm_t *target_lambda_nm)
+{
+    if (target_mode != NULL) {
+        *target_mode = LASER_CONTROLLER_BENCH_TARGET_MODE_TEMP;
+    }
+    if (target_temp_c != NULL) {
+        *target_temp_c = 25.0f;
+    }
+    if (target_lambda_nm != NULL) {
+        *target_lambda_nm = 785.0f;
+    }
+}
+
 static bool laser_controller_service_pd_config_valid(
     const laser_controller_power_policy_t *power_policy,
     const laser_controller_service_pd_profile_t *profiles,
@@ -137,6 +253,12 @@ static bool laser_controller_service_pd_config_valid(
 static void laser_controller_service_sync_shadow_regs_locked(void);
 static void laser_controller_service_migrate_v3_profile(
     const laser_controller_service_persisted_profile_v3_t *legacy,
+    laser_controller_service_persisted_profile_t *profile);
+static void laser_controller_service_migrate_v4_profile(
+    const laser_controller_service_persisted_profile_v4_t *legacy,
+    laser_controller_service_persisted_profile_t *profile);
+static void laser_controller_service_migrate_v5_profile(
+    const laser_controller_service_persisted_profile_v5_t *legacy,
     laser_controller_service_persisted_profile_t *profile);
 static void laser_controller_service_normalize_pd_profiles(
     const laser_controller_service_pd_profile_t *profiles,
@@ -512,6 +634,118 @@ static void laser_controller_service_migrate_v3_profile(
     profile->haptic_rtp_level = legacy->haptic_rtp_level;
     profile->ld_rail_debug_enabled = false;
     profile->tec_rail_debug_enabled = false;
+    laser_controller_service_load_default_runtime_safety(
+        &profile->safety_thresholds,
+        &profile->safety_timeouts);
+}
+
+static void laser_controller_service_migrate_v4_profile(
+    const laser_controller_service_persisted_profile_v4_t *legacy,
+    laser_controller_service_persisted_profile_t *profile)
+{
+    if (legacy == NULL || profile == NULL) {
+        return;
+    }
+
+    memset(profile, 0, sizeof(*profile));
+    profile->version = LASER_CONTROLLER_SERVICE_PROFILE_VER;
+    laser_controller_service_copy_text(
+        profile->profile_name,
+        sizeof(profile->profile_name),
+        legacy->profile_name);
+    profile->ld_rail_debug_enabled = legacy->ld_rail_debug_enabled;
+    profile->tec_rail_debug_enabled = legacy->tec_rail_debug_enabled;
+    memcpy(profile->modules, legacy->modules, sizeof(profile->modules));
+    profile->dac_ld_channel_v = legacy->dac_ld_channel_v;
+    profile->dac_tec_channel_v = legacy->dac_tec_channel_v;
+    profile->dac_reference = legacy->dac_reference;
+    profile->dac_gain_2x = legacy->dac_gain_2x;
+    profile->dac_ref_div = legacy->dac_ref_div;
+    profile->dac_sync_mode = legacy->dac_sync_mode;
+    profile->imu_odr_hz = legacy->imu_odr_hz;
+    profile->imu_accel_range_g = legacy->imu_accel_range_g;
+    profile->imu_gyro_range_dps = legacy->imu_gyro_range_dps;
+    profile->imu_gyro_enabled = legacy->imu_gyro_enabled;
+    profile->imu_lpf2_enabled = legacy->imu_lpf2_enabled;
+    profile->imu_timestamp_enabled = legacy->imu_timestamp_enabled;
+    profile->imu_bdu_enabled = legacy->imu_bdu_enabled;
+    profile->imu_if_inc_enabled = legacy->imu_if_inc_enabled;
+    profile->imu_i2c_disabled = legacy->imu_i2c_disabled;
+    profile->tof_min_range_m = legacy->tof_min_range_m;
+    profile->tof_max_range_m = legacy->tof_max_range_m;
+    profile->tof_stale_timeout_ms = legacy->tof_stale_timeout_ms;
+    memcpy(profile->pd_profiles, legacy->pd_profiles, sizeof(profile->pd_profiles));
+    profile->pd_programming_only_max_w = legacy->pd_programming_only_max_w;
+    profile->pd_reduced_mode_min_w = legacy->pd_reduced_mode_min_w;
+    profile->pd_reduced_mode_max_w = legacy->pd_reduced_mode_max_w;
+    profile->pd_full_mode_min_w = legacy->pd_full_mode_min_w;
+    profile->pd_firmware_plan_enabled = legacy->pd_firmware_plan_enabled;
+    profile->haptic_effect_id = legacy->haptic_effect_id;
+    profile->haptic_mode = legacy->haptic_mode;
+    profile->haptic_library = legacy->haptic_library;
+    profile->haptic_actuator = legacy->haptic_actuator;
+    profile->haptic_rtp_level = legacy->haptic_rtp_level;
+    laser_controller_service_load_default_runtime_safety(
+        &profile->safety_thresholds,
+        &profile->safety_timeouts);
+    laser_controller_service_load_default_runtime_target(
+        &profile->runtime_target_mode,
+        &profile->runtime_target_temp_c,
+        &profile->runtime_target_lambda_nm);
+}
+
+static void laser_controller_service_migrate_v5_profile(
+    const laser_controller_service_persisted_profile_v5_t *legacy,
+    laser_controller_service_persisted_profile_t *profile)
+{
+    if (legacy == NULL || profile == NULL) {
+        return;
+    }
+
+    memset(profile, 0, sizeof(*profile));
+    profile->version = LASER_CONTROLLER_SERVICE_PROFILE_VER;
+    laser_controller_service_copy_text(
+        profile->profile_name,
+        sizeof(profile->profile_name),
+        legacy->profile_name);
+    profile->ld_rail_debug_enabled = legacy->ld_rail_debug_enabled;
+    profile->tec_rail_debug_enabled = legacy->tec_rail_debug_enabled;
+    memcpy(profile->modules, legacy->modules, sizeof(profile->modules));
+    profile->dac_ld_channel_v = legacy->dac_ld_channel_v;
+    profile->dac_tec_channel_v = legacy->dac_tec_channel_v;
+    profile->dac_reference = legacy->dac_reference;
+    profile->dac_gain_2x = legacy->dac_gain_2x;
+    profile->dac_ref_div = legacy->dac_ref_div;
+    profile->dac_sync_mode = legacy->dac_sync_mode;
+    profile->imu_odr_hz = legacy->imu_odr_hz;
+    profile->imu_accel_range_g = legacy->imu_accel_range_g;
+    profile->imu_gyro_range_dps = legacy->imu_gyro_range_dps;
+    profile->imu_gyro_enabled = legacy->imu_gyro_enabled;
+    profile->imu_lpf2_enabled = legacy->imu_lpf2_enabled;
+    profile->imu_timestamp_enabled = legacy->imu_timestamp_enabled;
+    profile->imu_bdu_enabled = legacy->imu_bdu_enabled;
+    profile->imu_if_inc_enabled = legacy->imu_if_inc_enabled;
+    profile->imu_i2c_disabled = legacy->imu_i2c_disabled;
+    profile->tof_min_range_m = legacy->tof_min_range_m;
+    profile->tof_max_range_m = legacy->tof_max_range_m;
+    profile->tof_stale_timeout_ms = legacy->tof_stale_timeout_ms;
+    memcpy(profile->pd_profiles, legacy->pd_profiles, sizeof(profile->pd_profiles));
+    profile->pd_programming_only_max_w = legacy->pd_programming_only_max_w;
+    profile->pd_reduced_mode_min_w = legacy->pd_reduced_mode_min_w;
+    profile->pd_reduced_mode_max_w = legacy->pd_reduced_mode_max_w;
+    profile->pd_full_mode_min_w = legacy->pd_full_mode_min_w;
+    profile->pd_firmware_plan_enabled = legacy->pd_firmware_plan_enabled;
+    profile->haptic_effect_id = legacy->haptic_effect_id;
+    profile->haptic_mode = legacy->haptic_mode;
+    profile->haptic_library = legacy->haptic_library;
+    profile->haptic_actuator = legacy->haptic_actuator;
+    profile->haptic_rtp_level = legacy->haptic_rtp_level;
+    profile->safety_thresholds = legacy->safety_thresholds;
+    profile->safety_timeouts = legacy->safety_timeouts;
+    laser_controller_service_load_default_runtime_target(
+        &profile->runtime_target_mode,
+        &profile->runtime_target_temp_c,
+        &profile->runtime_target_lambda_nm);
 }
 
 static void laser_controller_service_export_persisted_locked(
@@ -574,11 +808,18 @@ static void laser_controller_service_export_persisted_locked(
     profile->haptic_library = s_service.status.haptic_library;
     profile->haptic_actuator = s_service.status.haptic_actuator;
     profile->haptic_rtp_level = s_service.status.haptic_rtp_level;
+    profile->safety_thresholds = s_service.status.safety_thresholds;
+    profile->safety_timeouts = s_service.status.safety_timeouts;
+    profile->runtime_target_mode = s_service.status.runtime_target_mode;
+    profile->runtime_target_temp_c = s_service.status.runtime_target_temp_c;
+    profile->runtime_target_lambda_nm = s_service.status.runtime_target_lambda_nm;
 }
 
 static bool laser_controller_service_profile_is_valid(
     const laser_controller_service_persisted_profile_t *profile)
 {
+    laser_controller_config_t candidate = { 0 };
+
     if (profile == NULL ||
         profile->version < LASER_CONTROLLER_SERVICE_PROFILE_VER_MIN ||
         profile->version > LASER_CONTROLLER_SERVICE_PROFILE_VER ||
@@ -598,7 +839,19 @@ static bool laser_controller_service_profile_is_valid(
         return false;
     }
 
-    return true;
+    laser_controller_config_load_defaults(&candidate);
+    candidate.thresholds = profile->safety_thresholds;
+    candidate.timeouts = profile->safety_timeouts;
+    if (!laser_controller_config_validate_runtime_safety(&candidate)) {
+        return false;
+    }
+
+    return (profile->runtime_target_mode == LASER_CONTROLLER_BENCH_TARGET_MODE_TEMP ||
+            profile->runtime_target_mode == LASER_CONTROLLER_BENCH_TARGET_MODE_LAMBDA) &&
+           profile->runtime_target_temp_c >= 5.0f &&
+           profile->runtime_target_temp_c <= 65.0f &&
+           profile->runtime_target_lambda_nm >= 771.2f &&
+           profile->runtime_target_lambda_nm <= 790.0f;
 }
 
 static void laser_controller_service_apply_persisted_locked(
@@ -665,6 +918,11 @@ static void laser_controller_service_apply_persisted_locked(
     s_service.status.haptic_library = profile->haptic_library;
     s_service.status.haptic_actuator = profile->haptic_actuator;
     s_service.status.haptic_rtp_level = profile->haptic_rtp_level;
+    s_service.status.safety_thresholds = profile->safety_thresholds;
+    s_service.status.safety_timeouts = profile->safety_timeouts;
+    s_service.status.runtime_target_mode = profile->runtime_target_mode;
+    s_service.status.runtime_target_temp_c = profile->runtime_target_temp_c;
+    s_service.status.runtime_target_lambda_nm = profile->runtime_target_lambda_nm;
     memset(
         s_service.status.gpio_overrides,
         0,
@@ -680,6 +938,8 @@ static bool laser_controller_service_load_profile_locked(void)
 {
     nvs_handle_t handle = 0;
     laser_controller_service_persisted_profile_t profile;
+    laser_controller_service_persisted_profile_v5_t profile_v5;
+    laser_controller_service_persisted_profile_v4_t profile_v4;
     laser_controller_service_persisted_profile_v3_t legacy_profile;
     size_t size = 0U;
     esp_err_t err;
@@ -702,6 +962,18 @@ static bool laser_controller_service_load_profile_locked(void)
 
     if (size == sizeof(profile)) {
         err = nvs_get_blob(handle, LASER_CONTROLLER_SERVICE_NVS_KEY, &profile, &size);
+    } else if (size == sizeof(profile_v5)) {
+        err = nvs_get_blob(handle, LASER_CONTROLLER_SERVICE_NVS_KEY, &profile_v5, &size);
+        if (err == ESP_OK) {
+            laser_controller_service_migrate_v5_profile(&profile_v5, &profile);
+            size = sizeof(profile);
+        }
+    } else if (size == sizeof(profile_v4)) {
+        err = nvs_get_blob(handle, LASER_CONTROLLER_SERVICE_NVS_KEY, &profile_v4, &size);
+        if (err == ESP_OK) {
+            laser_controller_service_migrate_v4_profile(&profile_v4, &profile);
+            size = sizeof(profile);
+        }
     } else if (size == sizeof(legacy_profile)) {
         err = nvs_get_blob(
             handle,
@@ -809,6 +1081,13 @@ static void laser_controller_service_apply_core_preset_locked(const char *profil
     s_service.status.haptic_actuator =
         LASER_CONTROLLER_SERVICE_HAPTIC_ACTUATOR_ERM;
     s_service.status.haptic_rtp_level = 96U;
+    laser_controller_service_load_default_runtime_safety(
+        &s_service.status.safety_thresholds,
+        &s_service.status.safety_timeouts);
+    laser_controller_service_load_default_runtime_target(
+        &s_service.status.runtime_target_mode,
+        &s_service.status.runtime_target_temp_c,
+        &s_service.status.runtime_target_lambda_nm);
     laser_controller_service_sanitize_dac_settings_locked();
     laser_controller_service_copy_text(
         s_service.status.last_i2c_scan,
@@ -1168,6 +1447,38 @@ void laser_controller_service_get_tof_illumination_config(
     config->enabled = s_service.status.tof_illumination_enabled;
     config->duty_cycle_pct = s_service.status.tof_illumination_duty_cycle_pct;
     config->frequency_hz = s_service.status.tof_illumination_frequency_hz;
+    portEXIT_CRITICAL(&s_service_lock);
+}
+
+void laser_controller_service_get_runtime_safety_policy(
+    laser_controller_safety_thresholds_t *thresholds,
+    laser_controller_timeout_policy_t *timeouts)
+{
+    portENTER_CRITICAL(&s_service_lock);
+    if (thresholds != NULL) {
+        *thresholds = s_service.status.safety_thresholds;
+    }
+    if (timeouts != NULL) {
+        *timeouts = s_service.status.safety_timeouts;
+    }
+    portEXIT_CRITICAL(&s_service_lock);
+}
+
+void laser_controller_service_get_runtime_target(
+    laser_controller_bench_target_mode_t *target_mode,
+    laser_controller_celsius_t *target_temp_c,
+    laser_controller_nm_t *target_lambda_nm)
+{
+    portENTER_CRITICAL(&s_service_lock);
+    if (target_mode != NULL) {
+        *target_mode = s_service.status.runtime_target_mode;
+    }
+    if (target_temp_c != NULL) {
+        *target_temp_c = s_service.status.runtime_target_temp_c;
+    }
+    if (target_lambda_nm != NULL) {
+        *target_lambda_nm = s_service.status.runtime_target_lambda_nm;
+    }
     portEXIT_CRITICAL(&s_service_lock);
 }
 
@@ -1654,6 +1965,42 @@ void laser_controller_service_set_tof_config(
     laser_controller_service_touch_profile_locked();
     laser_controller_service_write_action_locked(
         "ToF threshold tuning staged.",
+        now_ms);
+    portEXIT_CRITICAL(&s_service_lock);
+}
+
+void laser_controller_service_set_runtime_safety_policy(
+    const laser_controller_safety_thresholds_t *thresholds,
+    const laser_controller_timeout_policy_t *timeouts,
+    laser_controller_time_ms_t now_ms)
+{
+    if (thresholds == NULL || timeouts == NULL) {
+        return;
+    }
+
+    portENTER_CRITICAL(&s_service_lock);
+    s_service.status.safety_thresholds = *thresholds;
+    s_service.status.safety_timeouts = *timeouts;
+    laser_controller_service_touch_profile_locked();
+    laser_controller_service_write_action_locked(
+        "Runtime safety policy staged for profile persistence.",
+        now_ms);
+    portEXIT_CRITICAL(&s_service_lock);
+}
+
+void laser_controller_service_set_runtime_target(
+    laser_controller_bench_target_mode_t target_mode,
+    laser_controller_celsius_t target_temp_c,
+    laser_controller_nm_t target_lambda_nm,
+    laser_controller_time_ms_t now_ms)
+{
+    portENTER_CRITICAL(&s_service_lock);
+    s_service.status.runtime_target_mode = target_mode;
+    s_service.status.runtime_target_temp_c = target_temp_c;
+    s_service.status.runtime_target_lambda_nm = target_lambda_nm;
+    laser_controller_service_touch_profile_locked();
+    laser_controller_service_write_action_locked(
+        "Runtime target staged for profile persistence.",
         now_ms);
     portEXIT_CRITICAL(&s_service_lock);
 }

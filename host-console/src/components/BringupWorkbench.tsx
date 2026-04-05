@@ -4079,7 +4079,7 @@ async function setLdSbdnMode(mode: LdSbdnMode) {
               type="button"
               className="action-button is-inline"
               disabled={!commandReady || operation !== null}
-              title="Ask the current bench firmware to persist the active bring-up profile. Service mode is not required."
+              title="Ask the current bench firmware to persist the active bring-up profile, including runtime safety thresholds and hold-time policy. Service mode is not required."
               onClick={() =>
                 void runCommandSequence(
                   'Save bring-up profile',
@@ -4089,7 +4089,7 @@ async function setLdSbdnMode(mode: LdSbdnMode) {
                       detail: 'Requesting device-side profile save...',
                       cmd: 'save_bringup_profile',
                       risk: 'write',
-                      note: 'Request device-side persistence for the active bring-up profile.',
+                      note: 'Request device-side persistence for the active bring-up profile, including runtime safety policy.',
                     },
                   ],
                 )

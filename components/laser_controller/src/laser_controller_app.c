@@ -45,7 +45,7 @@
 #define LASER_CONTROLLER_DEPLOYMENT_DAC_WAIT_MS      800U
 #define LASER_CONTROLLER_DEPLOYMENT_PERIPHERAL_WAIT_MS 2500U
 #define LASER_CONTROLLER_DEPLOYMENT_READY_WAIT_MS    1200U
-#define LASER_CONTROLLER_DEPLOYMENT_STEP_DELAY_MS    1000U
+#define LASER_CONTROLLER_DEPLOYMENT_STEP_DELAY_MS    300U
 #define LASER_CONTROLLER_DEPLOYMENT_RAIL_SEQUENCE_MIN_WAIT_MS 4000U
 #define LASER_CONTROLLER_DEPLOYMENT_READY_MIN_WAIT_MS 3000U
 #define LASER_CONTROLLER_DEPLOYMENT_TEC_RESERVE_W    15.0f
@@ -313,7 +313,8 @@ static laser_controller_celsius_t laser_controller_deployment_target_temp_c(
     const laser_controller_context_t *context,
     const laser_controller_bench_status_t *bench_status)
 {
-    if (context != NULL && context->deployment.active) {
+    if (context != NULL && context->deployment.active &&
+        !context->deployment.ready) {
         return context->deployment.target.target_temp_c;
     }
 
@@ -325,7 +326,8 @@ static laser_controller_nm_t laser_controller_deployment_target_lambda_nm(
     const laser_controller_context_t *context,
     const laser_controller_bench_status_t *bench_status)
 {
-    if (context != NULL && context->deployment.active) {
+    if (context != NULL && context->deployment.active &&
+        !context->deployment.ready) {
         return context->deployment.target.target_lambda_nm;
     }
 
@@ -485,12 +487,37 @@ static void laser_controller_deployment_complete_current_step(
     next_step = (laser_controller_deployment_step_t)(context->deployment.current_step + 1U);
 
     if (next_step >= LASER_CONTROLLER_DEPLOYMENT_STEP_COUNT) {
+        if (context->deployment.target.target_mode ==
+            LASER_CONTROLLER_DEPLOYMENT_TARGET_MODE_LAMBDA) {
+            laser_controller_bench_set_target_lambda_nm(
+                &context->config,
+                context->deployment.target.target_lambda_nm,
+                now_ms);
+        } else {
+            laser_controller_bench_set_target_temp_c(
+                &context->config,
+                context->deployment.target.target_temp_c,
+                now_ms);
+        }
         context->deployment.current_step = LASER_CONTROLLER_DEPLOYMENT_STEP_NONE;
         context->deployment.running = false;
         context->deployment.ready = true;
         context->deployment.failed = false;
         context->deployment.failure_code = LASER_CONTROLLER_FAULT_NONE;
         context->deployment.failure_reason[0] = '\0';
+        if (context->fault_latched ||
+            context->active_fault_code != LASER_CONTROLLER_FAULT_NONE ||
+            context->active_fault_class != LASER_CONTROLLER_FAULT_CLASS_NONE) {
+            laser_controller_logger_logf(
+                now_ms,
+                "deploy",
+                "deployment success cleared stale fault latch: %s (%s)",
+                laser_controller_fault_code_name(context->active_fault_code),
+                laser_controller_fault_class_name(context->active_fault_class));
+        }
+        context->fault_latched = false;
+        context->active_fault_code = LASER_CONTROLLER_FAULT_NONE;
+        context->active_fault_class = LASER_CONTROLLER_FAULT_CLASS_NONE;
         context->deployment_step_started_ms = now_ms;
         context->deployment_phase_started_ms = now_ms;
         context->deployment_step_action_performed = false;
@@ -645,13 +672,12 @@ static bool laser_controller_deployment_ready_posture_confirmed(
            inputs != NULL &&
            context->last_outputs.enable_ld_vin &&
            context->last_outputs.enable_tec_vin &&
-           context->last_outputs.assert_driver_standby &&
-           !context->last_outputs.select_driver_low_current &&
+           !context->last_outputs.assert_driver_standby &&
+           context->last_outputs.select_driver_low_current &&
            inputs->ld_rail_pgood &&
            inputs->tec_rail_pgood &&
-           inputs->driver_loop_good &&
-           laser_controller_deployment_pin_is_low(inputs, LASER_CONTROLLER_GPIO_LD_SBDN) &&
-           laser_controller_deployment_pin_is_high(inputs, LASER_CONTROLLER_GPIO_LD_PCN) &&
+           laser_controller_deployment_pin_is_high(inputs, LASER_CONTROLLER_GPIO_LD_SBDN) &&
+           laser_controller_deployment_pin_is_low(inputs, LASER_CONTROLLER_GPIO_LD_PCN) &&
            !inputs->pcn_pwm_active &&
            !inputs->tof_illumination_pwm_active;
 }
@@ -791,7 +817,9 @@ static void laser_controller_deployment_tick(
                 now_ms,
                 LASER_CONTROLLER_FAULT_LD_RAIL_BAD,
                 "deployment LD rail lost PGOOD");
-        } else if (!context->last_inputs.driver_loop_good) {
+        } else if (!context->last_outputs.assert_driver_standby &&
+                   !context->last_outputs.select_driver_low_current &&
+                   !context->last_inputs.driver_loop_good) {
             laser_controller_deployment_invalidate_ready(
                 context,
                 now_ms,
@@ -1010,7 +1038,28 @@ static void laser_controller_deployment_tick(
             }
             break;
         case LASER_CONTROLLER_DEPLOYMENT_STEP_READY_POSTURE:
-            if (laser_controller_deployment_ready_posture_confirmed(context)) {
+            if (context->deployment_substep == 0U) {
+                if (context->last_inputs.ld_rail_pgood &&
+                    context->last_inputs.tec_rail_pgood &&
+                    context->last_inputs.driver_loop_good &&
+                    laser_controller_deployment_pin_is_high(
+                        &context->last_inputs,
+                        LASER_CONTROLLER_GPIO_LD_SBDN) &&
+                    laser_controller_deployment_pin_is_high(
+                        &context->last_inputs,
+                        LASER_CONTROLLER_GPIO_LD_PCN) &&
+                    !context->last_inputs.pcn_pwm_active) {
+                    context->deployment_substep = 1U;
+                    context->deployment_phase_started_ms = now_ms;
+                } else if ((now_ms - context->deployment_phase_started_ms) >=
+                           deployment_ready_wait_ms) {
+                    laser_controller_deployment_fail(
+                        context,
+                        now_ms,
+                        LASER_CONTROLLER_FAULT_LD_LOOP_BAD,
+                        "deployment ready test could not validate LPGD with driver enabled");
+                }
+            } else if (laser_controller_deployment_ready_posture_confirmed(context)) {
                 laser_controller_deployment_complete_current_step(context, now_ms);
                 laser_controller_logger_log(
                     now_ms,
@@ -1338,7 +1387,9 @@ static laser_controller_board_outputs_t laser_controller_derive_outputs(
                 case LASER_CONTROLLER_DEPLOYMENT_STEP_READY_POSTURE:
                     outputs.enable_tec_vin = true;
                     outputs.enable_ld_vin = true;
-                    outputs.select_driver_low_current = false;
+                    outputs.assert_driver_standby = false;
+                    outputs.select_driver_low_current =
+                        context->deployment_substep != 0U;
                     return outputs;
                 default:
                     return outputs;
@@ -1352,8 +1403,8 @@ static laser_controller_board_outputs_t laser_controller_derive_outputs(
         outputs.enable_tec_vin = true;
         outputs.enable_ld_vin = true;
         outputs.enable_alignment_laser = decision->alignment_output_enable;
-        outputs.assert_driver_standby = !decision->nir_output_enable;
-        outputs.select_driver_low_current = false;
+        outputs.assert_driver_standby = false;
+        outputs.select_driver_low_current = !decision->nir_output_enable;
         if (decision->fault_present &&
             decision->fault_class == LASER_CONTROLLER_FAULT_CLASS_SYSTEM_MAJOR) {
             outputs.enable_ld_vin = false;
@@ -1559,6 +1610,9 @@ static void laser_controller_run_fast_cycle(laser_controller_context_t *context)
     snapshot.last_distance_blocked = context->last_distance_blocked;
     snapshot.last_lambda_drift_blocked = context->lambda_drift_filter.state;
     snapshot.last_tec_temp_adc_blocked = context->tec_temp_adc_filter.state;
+    snapshot.driver_operate_expected =
+        !context->last_outputs.assert_driver_standby &&
+        !context->last_outputs.select_driver_low_current;
     snapshot.power_tier = context->power_tier;
     snapshot.host_request_alignment =
         context->deployment.active && context->deployment.ready &&
@@ -1765,22 +1819,54 @@ esp_err_t laser_controller_app_start(void)
             NULL);
         s_context.config.power = stored_power_policy;
     }
+    laser_controller_service_get_runtime_safety_policy(
+        &s_context.config.thresholds,
+        &s_context.config.timeouts);
     s_context.config_valid = laser_controller_config_validate(&s_context.config);
 
     const laser_controller_time_ms_t now_ms = laser_controller_board_uptime_ms();
+    {
+        laser_controller_bench_target_mode_t saved_target_mode =
+            LASER_CONTROLLER_BENCH_TARGET_MODE_TEMP;
+        laser_controller_celsius_t saved_target_temp_c = 25.0f;
+        laser_controller_nm_t saved_target_lambda_nm = 785.0f;
+
+        laser_controller_service_get_runtime_target(
+            &saved_target_mode,
+            &saved_target_temp_c,
+            &saved_target_lambda_nm);
+        if (saved_target_mode == LASER_CONTROLLER_BENCH_TARGET_MODE_LAMBDA) {
+            laser_controller_bench_set_target_lambda_nm(
+                &s_context.config,
+                saved_target_lambda_nm,
+                now_ms);
+        } else {
+            laser_controller_bench_set_target_temp_c(
+                &s_context.config,
+                saved_target_temp_c,
+                now_ms);
+        }
+    }
     laser_controller_state_machine_init(&s_context.state_machine, now_ms);
     laser_controller_deployment_reset_step_status(
         &s_context,
         LASER_CONTROLLER_DEPLOYMENT_STEP_STATUS_INACTIVE);
-    s_context.deployment.target.target_mode =
-        LASER_CONTROLLER_DEPLOYMENT_TARGET_MODE_TEMP;
-    s_context.deployment.target.target_temp_c =
-        laser_controller_deployment_clamp_target_temp_c(
+    {
+        laser_controller_bench_status_t bench_status;
+
+        laser_controller_bench_copy_status(&bench_status);
+        s_context.deployment.target.target_mode =
+            bench_status.target_mode == LASER_CONTROLLER_BENCH_TARGET_MODE_LAMBDA ?
+                LASER_CONTROLLER_DEPLOYMENT_TARGET_MODE_LAMBDA :
+                LASER_CONTROLLER_DEPLOYMENT_TARGET_MODE_TEMP;
+        s_context.deployment.target.target_temp_c =
+            laser_controller_deployment_clamp_target_temp_c(
+                &s_context.config,
+                bench_status.target_temp_c);
+        s_context.deployment.target.target_lambda_nm = laser_controller_lambda_from_temp(
             &s_context.config,
-            LASER_CONTROLLER_DEPLOYMENT_DEFAULT_TEMP_C);
-    s_context.deployment.target.target_lambda_nm = laser_controller_lambda_from_temp(
-        &s_context.config,
-        s_context.deployment.target.target_temp_c);
+            s_context.deployment.target.target_temp_c);
+    }
     s_context.deployment.max_laser_current_a =
         s_context.config.thresholds.max_laser_current_a;
     s_context.deployment.max_optical_power_w =
@@ -1862,7 +1948,7 @@ bool laser_controller_app_copy_status(laser_controller_runtime_status_t *status)
     portEXIT_CRITICAL(&s_runtime_status_lock);
     laser_controller_bench_copy_status(&status->bench);
     laser_controller_service_copy_status(&status->bringup);
-    if (status->deployment.active) {
+    if (status->deployment.active && !status->deployment.ready) {
         status->bench.target_mode =
             status->deployment.target.target_mode ==
                     LASER_CONTROLLER_DEPLOYMENT_TARGET_MODE_TEMP ?
@@ -1947,6 +2033,10 @@ esp_err_t laser_controller_app_set_runtime_safety_policy(
     portEXIT_CRITICAL(&s_context_lock);
 
     now_ms = laser_controller_board_uptime_ms();
+    laser_controller_service_set_runtime_safety_policy(
+        &policy->thresholds,
+        &policy->timeouts,
+        now_ms);
     laser_controller_bench_copy_status(&bench_status);
     laser_controller_bench_set_laser_current_a(
         &candidate,
@@ -2058,6 +2148,10 @@ bool laser_controller_deployment_copy_status(
 esp_err_t laser_controller_app_enter_deployment_mode(void)
 {
     const laser_controller_time_ms_t now_ms = laser_controller_board_uptime_ms();
+    laser_controller_bench_target_mode_t saved_target_mode =
+        LASER_CONTROLLER_BENCH_TARGET_MODE_TEMP;
+    laser_controller_celsius_t saved_target_temp_c = 25.0f;
+    laser_controller_nm_t saved_target_lambda_nm = 785.0f;
 
     if (!s_context.started || !s_context.config_valid) {
         return ESP_ERR_INVALID_STATE;
@@ -2069,6 +2163,10 @@ esp_err_t laser_controller_app_enter_deployment_mode(void)
 
     laser_controller_service_prepare_for_deployment(now_ms);
     laser_controller_bench_clear_requests(now_ms);
+    laser_controller_service_get_runtime_target(
+        &saved_target_mode,
+        &saved_target_temp_c,
+        &saved_target_lambda_nm);
 
     portENTER_CRITICAL(&s_context_lock);
     s_context.deployment.active = true;
@@ -2079,6 +2177,26 @@ esp_err_t laser_controller_app_enter_deployment_mode(void)
     s_context.deployment.last_completed_step = LASER_CONTROLLER_DEPLOYMENT_STEP_NONE;
     s_context.deployment.failure_code = LASER_CONTROLLER_FAULT_NONE;
     s_context.deployment.failure_reason[0] = '\0';
+    if (saved_target_mode == LASER_CONTROLLER_BENCH_TARGET_MODE_LAMBDA) {
+        s_context.deployment.target.target_mode =
+            LASER_CONTROLLER_DEPLOYMENT_TARGET_MODE_LAMBDA;
+        s_context.deployment.target.target_temp_c =
+            laser_controller_deployment_clamp_target_temp_c(
+                &s_context.config,
+                laser_controller_temp_from_lambda(
+                    &s_context.config,
+                    saved_target_lambda_nm));
+    } else {
+        s_context.deployment.target.target_mode =
+            LASER_CONTROLLER_DEPLOYMENT_TARGET_MODE_TEMP;
+        s_context.deployment.target.target_temp_c =
+            laser_controller_deployment_clamp_target_temp_c(
+                &s_context.config,
+                saved_target_temp_c);
+    }
+    s_context.deployment.target.target_lambda_nm = laser_controller_lambda_from_temp(
+        &s_context.config,
+        s_context.deployment.target.target_temp_c);
     laser_controller_deployment_reset_step_status(
         &s_context,
         LASER_CONTROLLER_DEPLOYMENT_STEP_STATUS_INACTIVE);
@@ -2100,6 +2218,7 @@ esp_err_t laser_controller_app_enter_deployment_mode(void)
 esp_err_t laser_controller_app_exit_deployment_mode(void)
 {
     const laser_controller_time_ms_t now_ms = laser_controller_board_uptime_ms();
+    laser_controller_bench_status_t bench_status = { 0 };
 
     if (!s_context.started || !s_context.deployment.active ||
         s_context.deployment.running) {
@@ -2107,7 +2226,13 @@ esp_err_t laser_controller_app_exit_deployment_mode(void)
     }
 
     laser_controller_service_prepare_for_deployment(now_ms);
+    laser_controller_bench_copy_status(&bench_status);
     laser_controller_bench_clear_requests(now_ms);
+    laser_controller_bench_set_modulation(
+        false,
+        bench_status.modulation_frequency_hz,
+        bench_status.modulation_duty_cycle_pct,
+        now_ms);
 
     portENTER_CRITICAL(&s_context_lock);
     s_context.deployment.active = false;
@@ -2186,6 +2311,7 @@ esp_err_t laser_controller_app_set_deployment_target(
 
     sanitized = *target;
     if (sanitized.target_mode == LASER_CONTROLLER_DEPLOYMENT_TARGET_MODE_LAMBDA) {
+        sanitized.target_mode = LASER_CONTROLLER_DEPLOYMENT_TARGET_MODE_LAMBDA;
         sanitized.target_temp_c = laser_controller_deployment_clamp_target_temp_c(
             &s_context.config,
             laser_controller_temp_from_lambda(
@@ -2207,6 +2333,14 @@ esp_err_t laser_controller_app_set_deployment_target(
     portENTER_CRITICAL(&s_context_lock);
     s_context.deployment.target = sanitized;
     portEXIT_CRITICAL(&s_context_lock);
+
+    laser_controller_service_set_runtime_target(
+        sanitized.target_mode == LASER_CONTROLLER_DEPLOYMENT_TARGET_MODE_LAMBDA ?
+            LASER_CONTROLLER_BENCH_TARGET_MODE_LAMBDA :
+            LASER_CONTROLLER_BENCH_TARGET_MODE_TEMP,
+        sanitized.target_temp_c,
+        sanitized.target_lambda_nm,
+        now_ms);
 
     laser_controller_logger_logf(
         now_ms,
