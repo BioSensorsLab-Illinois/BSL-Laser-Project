@@ -1614,11 +1614,11 @@ static void laser_controller_run_fast_cycle(laser_controller_context_t *context)
         !context->last_outputs.assert_driver_standby &&
         !context->last_outputs.select_driver_low_current;
     snapshot.power_tier = context->power_tier;
-    snapshot.host_request_alignment =
-        context->deployment.active && context->deployment.ready &&
-        bench_status.requested_alignment;
+    snapshot.host_request_alignment = false;
     snapshot.host_request_nir =
         context->deployment.active && context->deployment.ready &&
+        bench_status.runtime_mode ==
+            LASER_CONTROLLER_RUNTIME_MODE_MODULATED_HOST &&
         bench_status.requested_nir;
     snapshot.target_lambda_nm = laser_controller_deployment_target_lambda_nm(
         context,

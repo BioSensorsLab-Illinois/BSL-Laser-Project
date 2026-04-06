@@ -151,6 +151,8 @@ export function DeploymentWorkbench({
   const liveSnapshot = useLiveSnapshot(snapshot, telemetryStore)
   const connected = transportStatus === 'connected'
   const deployment = liveSnapshot.deployment
+  const usbOnlyPowerBlocked =
+    liveSnapshot.pd.sourceIsHostOnly || liveSnapshot.pd.sourceVoltageV < 9
   const [targetMode, setTargetMode] = useState<DeploymentTargetMode>(deployment.targetMode)
   const [targetTempC, setTargetTempC] = useState(() => formatNumber(deployment.targetTempC, 1))
   const [targetLambdaNm, setTargetLambdaNm] = useState(() =>
@@ -330,11 +332,11 @@ export function DeploymentWorkbench({
     <section className="panel-section">
       <div className="panel-section__head">
         <div>
-          <p className="eyebrow">Deployment</p>
-          <h2>Deployment mode</h2>
+          <p className="eyebrow">Inline deployment</p>
+          <h2>Pre-enable checklist</h2>
         </div>
         <p className="panel-note">
-          Firmware owns deployment sequencing. This page starts the checklist, edits the deployment target and safety envelope, and displays progress and failure state. Normal Control-page operation is intended to happen while deployment mode remains active and ready.
+          Firmware still owns deployment sequencing. This section now lives on the Control page so checklist state, failure reason, target edits, and runtime controls stay in one place.
         </p>
       </div>
 
@@ -356,6 +358,11 @@ export function DeploymentWorkbench({
                 ? 'Control-page runtime actions are unlocked in this session. Bring-up and service writes stay locked.'
                 : 'Deployment mode is the only supported path from validated bring-up hardware into normal runtime operation.'}
           </p>
+          {usbOnlyPowerBlocked ? (
+            <p>
+              USB-only Phase 1 bench detected. Power-independent checks can still be exercised, but PD, TEC rail, LD rail, and final ready posture remain intentionally blocked here.
+            </p>
+          ) : null}
         </div>
         <div className="status-badges">
           <span className={connected ? 'status-badge is-on' : 'status-badge'}>

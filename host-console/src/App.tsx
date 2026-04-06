@@ -48,7 +48,7 @@ import type {
 
 const HOST_THEME_STORAGE_KEY = 'bsl-host-theme'
 
-type AppView = 'overview' | 'connection' | 'control' | 'deployment' | 'bringup' | 'events' | 'firmware' | 'service'
+type AppView = 'overview' | 'connection' | 'control' | 'bringup' | 'events' | 'firmware' | 'service'
 type EventLogView = 'system' | 'comms'
 
 const navItems: Array<{
@@ -70,16 +70,10 @@ const navItems: Array<{
     detail: 'Transport and Wi-Fi',
   },
   {
-    id: 'deployment',
-    label: 'Deployment',
-    icon: Zap,
-    detail: 'Checklist and target',
-  },
-  {
     id: 'control',
     label: 'Control',
     icon: FlaskConical,
-    detail: 'Laser, TEC, PWM',
+    detail: 'Checklist, laser, TEC',
   },
   {
     id: 'bringup',
@@ -637,31 +631,30 @@ function App() {
             ) : null}
 
             {activeView === 'control' ? (
-              <ControlWorkbench
-                snapshot={liveSnapshot}
-                telemetryStore={telemetryStore}
-                transportKind={transportKind}
-                transportStatus={transportStatus}
-                transportRecovering={transportRecovering}
-                onIssueCommandAwaitAck={issueCommandAwaitAck}
-              />
-            ) : null}
-
-            {activeView === 'deployment' ? (
-              <DeploymentWorkbench
-                snapshot={liveSnapshot}
-                telemetryStore={telemetryStore}
-                events={events}
-                transportStatus={transportStatus}
-                onIssueCommandAwaitAck={issueCommandAwaitAck}
-              />
+              <>
+                <DeploymentWorkbench
+                  snapshot={liveSnapshot}
+                  telemetryStore={telemetryStore}
+                  events={events}
+                  transportStatus={transportStatus}
+                  onIssueCommandAwaitAck={issueCommandAwaitAck}
+                />
+                <ControlWorkbench
+                  snapshot={liveSnapshot}
+                  telemetryStore={telemetryStore}
+                  transportKind={transportKind}
+                  transportStatus={transportStatus}
+                  transportRecovering={transportRecovering}
+                  onIssueCommandAwaitAck={issueCommandAwaitAck}
+                />
+              </>
             ) : null}
 
             {activeView === 'bringup' ? (
               <BringupWorkbench
                 snapshot={liveSnapshot}
                 telemetryStore={telemetryStore}
-                transportStatus={liveSnapshot.deployment.active ? 'disconnected' : transportStatus}
+                transportStatus={transportStatus}
                 transportRecovering={transportRecovering}
                 deploymentLocked={liveSnapshot.deployment.active}
                 onIssueCommandAwaitAck={issueCommandAwaitAck}

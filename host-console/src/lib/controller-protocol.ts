@@ -89,11 +89,13 @@ function decodeFastTelemetryPayload(payload: unknown): RealtimeTelemetryPatch {
       nirEnabled: hasBit(laserFlags, 1),
       driverStandby: hasBit(laserFlags, 2),
       loopGood: hasBit(laserFlags, 3),
+      telemetryValid: hasBit(laserFlags, 4),
       measuredCurrentA: measuredCurrentMa / 1000,
       driverTempC: driverTempCenti / 100,
     },
     tec: {
       tempGood: hasBit(tecFlags, 0),
+      telemetryValid: hasBit(tecFlags, 1),
       tempC: tecTempCenti / 100,
       tempAdcVoltageV: tecTempAdcMv / 1000,
       currentA: tecCurrentCentiA / 100,

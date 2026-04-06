@@ -12,6 +12,7 @@ Rules:
   - GUI interaction logic
   - rendered-page quality
   - validation completeness
+  - whether any Phase 2 claim was made without the required powered-hardware bench evidence
 
 If meaningful issues are found:
 

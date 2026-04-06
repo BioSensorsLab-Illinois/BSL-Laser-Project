@@ -41,6 +41,9 @@ function clamp(value: number, min: number, max: number): number {
 export function makeDefaultBenchControlStatus(): BenchControlStatus {
   return {
     targetMode: 'lambda',
+    runtimeMode: 'modulated_host',
+    runtimeModeSwitchAllowed: false,
+    runtimeModeLockReason: 'Enter deployment mode before changing runtime mode.',
     requestedAlignmentEnabled: false,
     requestedNirEnabled: false,
     modulationEnabled: false,

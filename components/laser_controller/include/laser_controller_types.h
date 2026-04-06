@@ -12,6 +12,11 @@ typedef float laser_controller_radians_t;
 typedef float laser_controller_nm_t;
 
 typedef enum {
+    LASER_CONTROLLER_RUNTIME_MODE_BINARY_TRIGGER = 0,
+    LASER_CONTROLLER_RUNTIME_MODE_MODULATED_HOST,
+} laser_controller_runtime_mode_t;
+
+typedef enum {
     LASER_CONTROLLER_POWER_TIER_UNKNOWN = 0,
     LASER_CONTROLLER_POWER_TIER_PROGRAMMING_ONLY,
     LASER_CONTROLLER_POWER_TIER_INSUFFICIENT,
@@ -25,4 +30,3 @@ typedef struct {
     bool stage1_edge;
     bool stage2_edge;
 } laser_controller_button_state_t;
-

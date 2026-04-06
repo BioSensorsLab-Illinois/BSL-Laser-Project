@@ -569,9 +569,9 @@ function describeLdSbdnMode(snapshot: DeviceSnapshot) {
     if (pin.overrideMode === 'input') {
       return {
         mode: 'standby-hiz' as const,
-        label: 'Standby',
+        label: 'Legacy Hi-Z',
         tone: 'warn' as const,
-        detail: 'GPIO13 is released to high impedance so SBDN sits in the standby threshold window.',
+        detail: 'GPIO13 is released to high impedance. V2 does not treat standby Hi-Z as a normal operating posture.',
       }
     }
 
@@ -595,9 +595,9 @@ function describeLdSbdnMode(snapshot: DeviceSnapshot) {
   if (!pin.outputEnabled && pin.inputEnabled) {
     return {
       mode: 'standby-hiz' as const,
-      label: 'Standby',
+      label: 'Legacy Hi-Z',
       tone: 'warn' as const,
-      detail: 'Firmware currently leaves GPIO13 high impedance for standby.',
+      detail: 'GPIO13 is high impedance. V2 expects SBDN to be low for shutdown or high for powered runtime.',
     }
   }
 
@@ -1266,7 +1266,14 @@ export function BringupWorkbench({
   const serviceModeRequested = commandReady && snapshot.bringup.serviceModeRequested
   const serviceModeActive = commandReady && snapshot.bringup.serviceModeActive
   const readsDisabled = !commandReady || operation !== null
-  const writesDisabled = !commandReady || operation !== null
+  const writesDisabled = !commandReady || operation !== null || deploymentLocked
+  const writeLockReason = !commandReady
+    ? 'Controller link is offline.'
+    : operation !== null
+      ? 'Another controller action is still running.'
+      : deploymentLocked
+        ? 'Deployment mode owns the hardware. Bring-up writes are locked until deployment is exited.'
+        : ''
   const liveModules = connected ? snapshot.bringup.modules : form.modules
   const displayModules = useMemo(
     () => mergePlannedAndLiveModules(snapshot, form.modules, liveModules, connected),
@@ -3632,8 +3639,12 @@ async function setLdSbdnMode(mode: LdSbdnMode) {
             <button
               type="button"
               className="action-button is-inline is-accent"
-              disabled={!commandReady || serviceModeActive || operation !== null}
-              title="Request service mode with beam permission held off."
+              disabled={!commandReady || serviceModeActive || operation !== null || deploymentLocked}
+              title={
+                deploymentLocked
+                  ? 'Deployment mode is active. Exit deployment mode before opening a guarded write session.'
+                  : 'Request service mode with beam permission held off.'
+              }
               onClick={() => {
                 void requestServiceMode()
               }}
@@ -3643,8 +3654,12 @@ async function setLdSbdnMode(mode: LdSbdnMode) {
             <button
               type="button"
               className="action-button is-inline"
-              disabled={!commandReady || !serviceModeActive || operation !== null}
-              title="Return the controller to normal safe supervision."
+              disabled={!commandReady || !serviceModeActive || operation !== null || deploymentLocked}
+              title={
+                deploymentLocked
+                  ? 'Deployment mode is active. Bring-up write-session controls stay locked until deployment mode is exited.'
+                  : 'Return the controller to normal safe supervision.'
+              }
               onClick={() =>
                 void runCommandSequence(
                   'Exit write session',
@@ -6223,17 +6238,6 @@ async function setLdSbdnMode(mode: LdSbdnMode) {
                     </button>
                     <button
                       type="button"
-                      className={sbdnStatus.mode === 'standby-hiz' ? 'segmented__button is-active' : 'segmented__button'}
-                      disabled={writesDisabled}
-                      title="Release GPIO13 to high impedance for standby."
-                      onClick={() => {
-                        void setLdSbdnMode('standby-hiz')
-                      }}
-                    >
-                      Standby
-                    </button>
-                    <button
-                      type="button"
                       className={sbdnStatus.mode === 'on-pu' ? 'segmented__button is-active' : 'segmented__button'}
                       disabled={writesDisabled}
                       title="Drive GPIO13 high to force the laser driver on."
@@ -6856,14 +6860,18 @@ async function setLdSbdnMode(mode: LdSbdnMode) {
               </span>
               <span
                 className={
-                  serviceModeActive
+                  deploymentLocked
+                    ? 'status-badge is-on'
+                    : serviceModeActive
                     ? 'status-badge is-on'
                     : serviceModeRequested
                       ? 'status-badge is-warn'
                       : 'status-badge'
                 }
               >
-                {serviceModeActive
+                {deploymentLocked
+                  ? 'In deployment'
+                  : serviceModeActive
                   ? 'Write session active'
                   : serviceModeRequested
                     ? 'Write session requested'
@@ -6950,14 +6958,16 @@ async function setLdSbdnMode(mode: LdSbdnMode) {
               </span>
               <span
                 className={
-                  serviceModeActive
+                  deploymentLocked
+                    ? 'status-badge is-on'
+                    : serviceModeActive
                     ? 'status-badge is-on'
                     : serviceModeRequested
                       ? 'status-badge is-warn'
                       : 'status-badge'
                 }
               >
-                {serviceModeActive ? 'Service active' : serviceModeRequested ? 'Service requested' : 'Service off'}
+                {deploymentLocked ? 'In deployment' : serviceModeActive ? 'Service active' : serviceModeRequested ? 'Service requested' : 'Service off'}
               </span>
               {livePageScore !== null ? (
                 <span className={livePageScore.tone === 'critical' ? 'status-badge is-warn' : 'status-badge is-on'}>
@@ -6968,6 +6978,11 @@ async function setLdSbdnMode(mode: LdSbdnMode) {
           </div>
 
           {renderActivePage()}
+          {deploymentLocked ? (
+            <p className="inline-help" title={writeLockReason}>
+              Deployment mode is active. Bring-up reads stay visible, but write actions are locked because deployment now owns the hardware path.
+            </p>
+          ) : null}
         </div>
       </div>
 

@@ -24,6 +24,7 @@ export type Severity = 'ok' | 'info' | 'warn' | 'critical'
 export type ThemeMode = 'dark' | 'light'
 export type EventSource = 'firmware' | 'host' | 'derived'
 export type EventBus = 'i2c' | 'spi'
+export type RuntimeMode = 'binary_trigger' | 'modulated_host'
 
 export type TransportKind = 'mock' | 'serial' | 'wifi'
 export type WirelessMode = 'softap' | 'station'
@@ -127,6 +128,7 @@ export interface LaserStatus {
   alignmentEnabled: boolean
   nirEnabled: boolean
   driverStandby: boolean
+  telemetryValid: boolean
   commandVoltageV: number
   measuredCurrentA: number
   commandedCurrentA: number
@@ -140,6 +142,7 @@ export interface TecStatus {
   targetTempC: number
   targetLambdaNm: number
   actualLambdaNm: number
+  telemetryValid: boolean
   commandVoltageV: number
   tempGood: boolean
   tempC: number
@@ -151,6 +154,9 @@ export interface TecStatus {
 
 export interface BenchControlStatus {
   targetMode: BenchTargetMode
+  runtimeMode: RuntimeMode
+  runtimeModeSwitchAllowed: boolean
+  runtimeModeLockReason: string
   requestedAlignmentEnabled: boolean
   requestedNirEnabled: boolean
   modulationEnabled: boolean

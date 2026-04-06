@@ -359,19 +359,16 @@ export function observeBringupModuleStatus(
       const detected =
         snapshot.rails.ld.enabled ||
         snapshot.rails.ld.pgood ||
-        snapshot.laser.measuredCurrentA > 0 ||
-        snapshot.laser.driverTempC !== 0
-      const healthy = snapshot.rails.ld.pgood || snapshot.laser.loopGood
+        snapshot.laser.telemetryValid
+      const healthy = snapshot.rails.ld.pgood
       return { detected, healthy }
     }
     case 'tec': {
       const detected =
         snapshot.rails.tec.enabled ||
         snapshot.rails.tec.pgood ||
-        snapshot.tec.tempC !== 0 ||
-        snapshot.tec.currentA !== 0 ||
-        snapshot.tec.voltageV !== 0
-      const healthy = snapshot.rails.tec.pgood || snapshot.tec.tempGood
+        snapshot.tec.telemetryValid
+      const healthy = snapshot.rails.tec.pgood
       return { detected, healthy }
     }
   }
@@ -391,6 +388,15 @@ export function mergeObservedBringupModules(
     status: BringupModuleStatus,
   ): BringupModuleStatus => {
     const observed = observeBringupModuleStatus(module, snapshot)
+
+    if (snapshot.deployment.active) {
+      return {
+        ...status,
+        detected: observed.detected,
+        healthy: observed.healthy,
+      }
+    }
+
     return {
       ...status,
       detected: status.detected || observed.detected,

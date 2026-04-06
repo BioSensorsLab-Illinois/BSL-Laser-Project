@@ -107,6 +107,8 @@ typedef struct {
 typedef struct {
     bool ld_rail_pgood;
     bool tec_rail_pgood;
+    bool ld_telemetry_valid;
+    bool tec_telemetry_valid;
     bool pd_contract_valid;
     bool pd_source_is_host_only;
     float pd_negotiated_power_w;

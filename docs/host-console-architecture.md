@@ -56,7 +56,7 @@ The visual direction is a light clinical instrument console rather than a generi
 - [host-console/src/components/CommandDeck.tsx](/Users/zz4/BSL/BSL-Laser/host-console/src/components/CommandDeck.tsx)
   Guarded read, write, service, and mock-injection command panels.
 - [host-console/src/components/ControlWorkbench.tsx](/Users/zz4/BSL/BSL-Laser/host-console/src/components/ControlWorkbench.tsx)
-  Bench-control workspace for staged laser, TEC, and modulation requests.
+  Control workspace for the inline pre-enable checklist, runtime-mode selection, staged laser requests, TEC targets, and modulation requests.
 - [host-console/src/components/BringupWorkbench.tsx](/Users/zz4/BSL/BSL-Laser/host-console/src/components/BringupWorkbench.tsx)
   Service-mode bring-up workspace for module expectations, bus diagnostics, and tuning.
 - [host-console/src/components/FirmwareWorkbench.tsx](/Users/zz4/BSL/BSL-Laser/host-console/src/components/FirmwareWorkbench.tsx)
@@ -102,12 +102,13 @@ Current limitation:
 
 Shows:
 
+- inline deployment entry, checklist progress, failure reason, and safety/target edits
+- runtime-mode selection between `binary_trigger` and `modulated_host`
 - staged laser power, TEC target, and modulation requests
-- explicitly armed service-only output intent commands
 - live power and efficiency estimates
-- visual status feedback for NIR, alignment, TEC settling, and faults
+- visual status feedback for NIR, alignment, TEC settling, faults, and OFF / INVALID telemetry
 
-This is a bench workspace, not a normal operator workflow. The controller firmware still decides whether anything may actually turn on.
+This is the runtime workspace. The controller firmware still decides whether anything may actually turn on. On the USB-only Phase 1 bench, the inline checklist must explicitly explain that PD, TEC rail, LD rail, and final ready posture remain blocked.
 
 ### Bring-up
 
@@ -118,6 +119,8 @@ Shows:
 - I2C and SPI diagnostics
 - staged DAC, IMU, ToF, and DRV2605 tuning
 - host-local draft save and restore for partially populated bench builds
+
+When deployment mode is active, Bring-up stays readable for monitoring, but write paths are locked and modules should not appear disconnected just because deployment owns them.
 
 ## Transport Model
 

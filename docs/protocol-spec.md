@@ -86,6 +86,7 @@ Required fields:
 | `run_deployment_sequence` | run the blocking deployment checklist in firmware | deployment-only; checklist owns sequencing and safe abort |
 | `set_deployment_target` | set the deployment temperature or wavelength target | deployment-only; updates the ready-posture target and checklist setpoint |
 | `set_deployment_safety` | update deployment-mode safety thresholds and timeouts | deployment-only; applies live and may immediately drop active output |
+| `set_runtime_mode` | switch runtime control between `binary_trigger` and `modulated_host` | deployment-only mode seam; must be safe-off before switching |
 | `set_laser_power` | stage the bench high-state NIR current request | service-only; host request only, not direct output authority |
 | `set_max_current` | alias for bench high-state NIR current staging | service-only; must never exceed provisioned safety ceiling |
 | `set_runtime_safety` | update runtime safety thresholds, hysteresis, and hold windows | service-only; reject invalid policy values and keep firmware authoritative |
@@ -136,7 +137,11 @@ Current bring-up-specific behavior:
 - `scan_wireless_networks` is intentionally allowed outside service mode so the operator can discover nearby SSIDs before switching the controller into station mode.
 - `scan_wireless_networks` may temporarily pause station reconnect attempts during the scan, then resume them automatically after results are captured.
 - `configure_wireless` is intentionally allowed outside service mode so an operator can move the controller between bench SoftAP and an existing Wi-Fi network without opening a hazardous write session.
-- Runtime control commands such as `set_target_temp`, `set_target_lambda`, `set_laser_power`, `configure_modulation`, `enable_alignment`, and `laser_output_enable` are rejected unless deployment mode is active and the deployment checklist has completed successfully in the current session.
+- Runtime control commands such as `set_target_temp`, `set_target_lambda`, `set_laser_power`, `configure_modulation`, and `laser_output_enable` are rejected unless deployment mode is active and the deployment checklist has completed successfully in the current session.
+- `set_runtime_mode` is allowed while deployment mode is active and the laser path is safe-off. It is blocked while deployment is running, while requests are still staged, while modulation is still active, or while the controller is faulted.
+- In `binary_trigger`, host-owned runtime output commands are rejected. The physical trigger path is the intended owner, but full trigger validation remains blocked until the trigger wiring is source-backed.
+- In `modulated_host`, host-owned runtime output commands are allowed after deployment readiness.
+- `enable_alignment` and `disable_alignment` are intentionally rejected in v2 runtime flow. The old host alignment path is no longer the normal runtime authority.
 - While deployment mode is active, bring-up and GPIO-mutating commands stay rejected even if the controller is otherwise online. Read-only status, fault, telemetry, and wireless-management commands remain available.
 - `configure_wireless` accepts `mode:"softap"` or `mode:"station"`. In station mode the host may also provide `ssid` and `password`; if the password is omitted, the controller reuses the saved credential.
 - `i2c_scan`, `i2c_read`, `spi_read`, and `refresh_pd_status` are intentionally allowed outside service mode because they are read-only probes.

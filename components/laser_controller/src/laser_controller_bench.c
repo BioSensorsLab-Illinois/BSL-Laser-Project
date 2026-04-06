@@ -128,6 +128,7 @@ void laser_controller_bench_init_defaults(void)
     portENTER_CRITICAL(&s_bench_lock);
     memset(&s_bench_status, 0, sizeof(s_bench_status));
     s_bench_status.target_mode = LASER_CONTROLLER_BENCH_TARGET_MODE_LAMBDA;
+    s_bench_status.runtime_mode = LASER_CONTROLLER_RUNTIME_MODE_MODULATED_HOST;
     s_bench_status.modulation_frequency_hz = LASER_CONTROLLER_BENCH_DEFAULT_PWM_HZ;
     s_bench_status.modulation_duty_cycle_pct = LASER_CONTROLLER_BENCH_DEFAULT_PWM_DUTY;
     s_bench_status.target_temp_c = LASER_CONTROLLER_BENCH_DEFAULT_TARGET_TEMP_C;
@@ -255,6 +256,25 @@ void laser_controller_bench_set_modulation(
     portEXIT_CRITICAL(&s_bench_lock);
 }
 
+void laser_controller_bench_set_runtime_mode(
+    laser_controller_runtime_mode_t runtime_mode,
+    laser_controller_time_ms_t now_ms)
+{
+    (void)now_ms;
+    portENTER_CRITICAL(&s_bench_lock);
+    s_bench_status.runtime_mode =
+        runtime_mode == LASER_CONTROLLER_RUNTIME_MODE_BINARY_TRIGGER ?
+            LASER_CONTROLLER_RUNTIME_MODE_BINARY_TRIGGER :
+            LASER_CONTROLLER_RUNTIME_MODE_MODULATED_HOST;
+    s_bench_status.requested_alignment = false;
+    s_bench_status.requested_nir = false;
+    if (s_bench_status.runtime_mode == LASER_CONTROLLER_RUNTIME_MODE_BINARY_TRIGGER) {
+        s_bench_status.modulation_enabled = false;
+        s_bench_status.low_state_current_a = 0.0f;
+    }
+    portEXIT_CRITICAL(&s_bench_lock);
+}
+
 const char *laser_controller_bench_target_mode_name(
     laser_controller_bench_target_mode_t target_mode)
 {
@@ -265,5 +285,18 @@ const char *laser_controller_bench_target_mode_name(
             return "lambda";
         default:
             return "lambda";
+    }
+}
+
+const char *laser_controller_runtime_mode_name(
+    laser_controller_runtime_mode_t runtime_mode)
+{
+    switch (runtime_mode) {
+        case LASER_CONTROLLER_RUNTIME_MODE_BINARY_TRIGGER:
+            return "binary_trigger";
+        case LASER_CONTROLLER_RUNTIME_MODE_MODULATED_HOST:
+            return "modulated_host";
+        default:
+            return "modulated_host";
     }
 }

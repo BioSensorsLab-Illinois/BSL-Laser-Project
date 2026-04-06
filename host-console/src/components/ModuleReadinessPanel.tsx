@@ -1,3 +1,4 @@
+import { useRef } from 'react'
 import { Layers3 } from 'lucide-react'
 
 import { ProgressMeter } from './ProgressMeter'
@@ -23,6 +24,7 @@ type ModuleReadinessSummary = {
 function summarizeModule(
   key: ModuleKey,
   status: DeviceSnapshot['bringup']['modules'][ModuleKey],
+  deploymentActive: boolean,
 ): ModuleReadinessSummary {
   const meta = moduleMeta[key]
 
@@ -40,10 +42,12 @@ function summarizeModule(
 
   if (status.healthy) {
     return {
-      label: 'Ready',
-      detail: status.debugEnabled
-        ? 'Detected, healthy, and writable from bring-up tools.'
-        : 'Detected and healthy on the current bench setup.',
+      label: deploymentActive ? 'In deployment' : 'Ready',
+      detail: deploymentActive
+        ? 'Deployment monitoring still has live readback for this module. Bring-up writes stay locked while deployment owns the path.'
+        : status.debugEnabled
+          ? 'Detected, healthy, and writable from bring-up tools.'
+          : 'Detected and healthy on the current bench setup.',
       progress: 100,
       tone: 'steady',
       state: 'ready',
@@ -54,7 +58,9 @@ function summarizeModule(
     if (meta.validationMode === 'monitored') {
       return {
         label: 'Needs review',
-        detail:
+        detail: deploymentActive
+          ? 'Deployment monitoring lost the expected live electrical truth for this module.'
+          :
           key === 'tec'
             ? 'Live TEC telemetry is present, but TEMPGD or TEC rail PGOOD is still low.'
             : key === 'laserDriver'
@@ -68,9 +74,11 @@ function summarizeModule(
 
     return {
       label: 'Needs review',
-      detail: status.expectedPresent
-        ? 'Hardware responded, but the firmware does not trust it yet.'
-        : `${meta.label} responded even though it is not declared installed.`,
+      detail: deploymentActive
+        ? 'Deployment monitoring lost the expected probe or readback for this module.'
+        : status.expectedPresent
+          ? 'Hardware responded, but the firmware does not trust it yet.'
+          : `${meta.label} responded even though it is not declared installed.`,
       progress: status.debugEnabled ? 72 : 62,
       tone: 'warning',
       state: 'attention',
@@ -108,18 +116,42 @@ export function ModuleReadinessPanel({
   telemetryStore,
 }: ModuleReadinessPanelProps) {
   const liveSnapshot = useLiveSnapshot(snapshot, telemetryStore)
+  const lastHealthyUntilMsRef = useRef<Record<ModuleKey, number>>({
+    imu: 0,
+    dac: 0,
+    haptic: 0,
+    tof: 0,
+    buttons: 0,
+    pd: 0,
+    laserDriver: 0,
+    tec: 0,
+  })
   const modules = mergeObservedBringupModules(
     liveSnapshot.bringup.modules,
     liveSnapshot,
     true,
   )
+  const nowMs = liveSnapshot.session.uptimeSeconds * 1000
+  const deploymentGraceMs = 3000
   const summaries = moduleKeys.map((key) => {
-    const status = modules[key]
+    const status = { ...modules[key] }
+
+    if (liveSnapshot.deployment.active) {
+      if (status.detected || status.healthy) {
+        lastHealthyUntilMsRef.current[key] = nowMs + deploymentGraceMs
+      } else if (nowMs < lastHealthyUntilMsRef.current[key]) {
+        status.detected = true
+        status.healthy = true
+      }
+    } else {
+      lastHealthyUntilMsRef.current[key] = 0
+    }
+
     return {
       key,
       meta: moduleMeta[key],
       status,
-      summary: summarizeModule(key, status),
+      summary: summarizeModule(key, status, liveSnapshot.deployment.active),
     }
   })
 

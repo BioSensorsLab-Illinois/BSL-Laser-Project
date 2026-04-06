@@ -3871,12 +3871,6 @@ void laser_controller_board_read_inputs(
 {
     float voltage_v = 0.0f;
     const laser_controller_time_ms_t now_ms = laser_controller_board_uptime_ms();
-    const bool laser_driver_expected =
-        laser_controller_service_module_expected(
-            LASER_CONTROLLER_MODULE_LASER_DRIVER);
-    const bool tec_expected =
-        laser_controller_service_module_expected(
-            LASER_CONTROLLER_MODULE_TEC);
     const bool imu_expected =
         laser_controller_service_module_expected(
             LASER_CONTROLLER_MODULE_IMU);
@@ -3899,10 +3893,15 @@ void laser_controller_board_read_inputs(
         gpio_get_level(LASER_CONTROLLER_GPIO_PWR_LD_PGOOD) != 0;
     inputs->tec_rail_pgood =
         gpio_get_level(LASER_CONTROLLER_GPIO_PWR_TEC_PGOOD) != 0;
+    inputs->ld_telemetry_valid =
+        inputs->ld_rail_pgood &&
+        (gpio_get_level(LASER_CONTROLLER_GPIO_LD_SBDN) != 0);
+    inputs->tec_telemetry_valid = inputs->tec_rail_pgood;
     inputs->tec_temp_good =
-        gpio_get_level(LASER_CONTROLLER_GPIO_TEC_TEMPGD) != 0;
+        inputs->tec_telemetry_valid &&
+        (gpio_get_level(LASER_CONTROLLER_GPIO_TEC_TEMPGD) != 0);
 
-    if (laser_driver_expected || inputs->ld_rail_pgood) {
+    if (inputs->ld_telemetry_valid) {
         inputs->driver_loop_good =
             gpio_get_level(LASER_CONTROLLER_GPIO_LD_LPGD) != 0;
 
@@ -3915,6 +3914,12 @@ void laser_controller_board_read_inputs(
             inputs->laser_current_monitor_voltage_v = voltage_v;
             inputs->measured_laser_current_a = 2.4f * voltage_v;
         }
+    } else {
+        inputs->driver_loop_good = false;
+        inputs->laser_driver_temp_voltage_v = 0.0f;
+        inputs->laser_driver_temp_c = 0.0f;
+        inputs->laser_current_monitor_voltage_v = 0.0f;
+        inputs->measured_laser_current_a = 0.0f;
     }
 
     if (laser_controller_service_module_expected(LASER_CONTROLLER_MODULE_DAC)) {
@@ -3923,7 +3928,7 @@ void laser_controller_board_read_inputs(
         laser_controller_board_clear_dac_readback();
     }
 
-    if (tec_expected || inputs->tec_rail_pgood) {
+    if (inputs->tec_telemetry_valid) {
         if (laser_controller_board_read_adc_voltage(ADC_CHANNEL_7, &voltage_v) == ESP_OK) {
             inputs->tec_temp_adc_voltage_v = voltage_v;
             inputs->tec_temp_c = laser_controller_board_lookup_tec_temp_c(voltage_v);
@@ -3936,6 +3941,12 @@ void laser_controller_board_read_inputs(
         if (laser_controller_board_read_adc_voltage(ADC_CHANNEL_9, &voltage_v) == ESP_OK) {
             inputs->tec_voltage_v = voltage_v * 2.0f;
         }
+    } else {
+        inputs->tec_temp_c = 0.0f;
+        inputs->tec_temp_adc_voltage_v = 0.0f;
+        inputs->tec_current_a = 0.0f;
+        inputs->tec_voltage_v = 0.0f;
+        inputs->tec_temp_good = false;
     }
 
     if (imu_expected) {

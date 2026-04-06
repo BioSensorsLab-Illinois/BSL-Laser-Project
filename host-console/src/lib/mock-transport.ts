@@ -24,6 +24,7 @@ import type {
   HapticActuator,
   HapticMode,
   ModuleKey,
+  RuntimeMode,
   SessionEvent,
   TransportMessage,
 } from '../types'
@@ -40,6 +41,7 @@ type MockState = {
   targetTempC: number
   targetLambdaNm: number
   targetMode: BenchTargetMode
+  runtimeMode: RuntimeMode
   firmwareVersion: string
   activeFault: string
   faultLatched: boolean
@@ -80,6 +82,34 @@ function clamp(value: number, min: number, max: number): number {
   }
 
   return value
+}
+
+function runtimeModeLockReason(state: MockState): string | null {
+  if (!state.deployment.active) {
+    return 'Enter deployment mode before changing runtime mode.'
+  }
+
+  if (state.deployment.running) {
+    return 'Wait for the deployment checklist to stop before changing runtime mode.'
+  }
+
+  if (state.faultLatched) {
+    return 'Clear the active fault before changing runtime mode.'
+  }
+
+  if (state.alignmentRequested) {
+    return 'Clear the current alignment request before changing runtime mode.'
+  }
+
+  if (state.laserRequested) {
+    return 'Clear the current NIR request before changing runtime mode.'
+  }
+
+  if (state.modulationEnabled) {
+    return 'Disable PCN modulation before changing runtime mode.'
+  }
+
+  return null
 }
 
 function makeDefaultDeploymentSteps(): DeviceSnapshot['deployment']['steps'] {
@@ -229,6 +259,7 @@ export class MockTransport implements DeviceTransport {
     targetTempC: 58.7,
     targetLambdaNm: 786.1,
     targetMode: 'lambda',
+    runtimeMode: 'modulated_host',
     firmwareVersion: 'laser-fw-0.2.0-bench',
     activeFault: 'none',
     faultLatched: false,
@@ -370,6 +401,9 @@ export class MockTransport implements DeviceTransport {
       throw new Error('Mock transport is not connected.')
     }
 
+    let ackOk = true
+    let ackNote = 'Accepted by mock controller.'
+
     this.emit({
       kind: 'event',
       event: this.makeEvent(
@@ -396,6 +430,7 @@ export class MockTransport implements DeviceTransport {
         this.state.alignmentRequested = false
         this.state.laserRequested = false
         this.state.modulationEnabled = false
+        this.state.runtimeMode = 'modulated_host'
         this.state.deployment = {
           ...this.state.deployment,
           active: true,
@@ -407,6 +442,34 @@ export class MockTransport implements DeviceTransport {
           failureCode: 'none',
           failureReason: '',
           steps: makeDefaultDeploymentSteps(),
+        }
+        break
+      case 'set_runtime_mode':
+        if (
+          command.args?.mode !== 'binary_trigger' &&
+          command.args?.mode !== 'modulated_host'
+        ) {
+          ackOk = false
+          ackNote = 'Unsupported runtime mode.'
+          break
+        }
+        {
+          const requestedMode = command.args.mode as RuntimeMode
+          if (
+            requestedMode !== this.state.runtimeMode &&
+            runtimeModeLockReason(this.state) !== null
+          ) {
+            ackOk = false
+            ackNote = runtimeModeLockReason(this.state) ?? 'Runtime mode change rejected.'
+            break
+          }
+          this.state.runtimeMode = requestedMode
+        }
+        this.state.alignmentRequested = false
+        this.state.laserRequested = false
+        if (this.state.runtimeMode === 'binary_trigger') {
+          this.state.modulationEnabled = false
+          this.state.lowStateCurrentA = 0
         }
         break
       case 'exit_deployment_mode':
@@ -568,13 +631,10 @@ export class MockTransport implements DeviceTransport {
         })
         break
       case 'enable_alignment':
-        if (this.state.deployment.ready) {
-          this.state.alignmentRequested = true
-          this.state.laserRequested = false
-        }
-        break
       case 'disable_alignment':
-        this.state.alignmentRequested = false
+        ackOk = false
+        ackNote =
+          'Host alignment requests are disabled in v2. The binary trigger path is reserved for the physical trigger hardware and remains blocked until that wiring is source-backed.'
         break
       case 'set_target_temp':
         if (typeof command.args?.temp_c === 'number' && this.state.deployment.ready) {
@@ -599,6 +659,12 @@ export class MockTransport implements DeviceTransport {
         }
         break
       case 'set_laser_power':
+        if (this.state.runtimeMode !== 'modulated_host') {
+          ackOk = false
+          ackNote =
+            'Host runtime output control is only available in modulated_host mode.'
+          break
+        }
         if (typeof command.args?.optical_power_w === 'number' && this.state.deployment.ready) {
           this.state.laserHighCurrentA = clamp(
             currentFromOpticalPowerW(command.args.optical_power_w),
@@ -829,15 +895,33 @@ export class MockTransport implements DeviceTransport {
         this.bumpBringupRevision('Firmware PDO plan updated.')
         break
       case 'laser_output_enable':
+        if (this.state.runtimeMode !== 'modulated_host') {
+          ackOk = false
+          ackNote =
+            'Host runtime output control is only available in modulated_host mode.'
+          break
+        }
         if (this.state.deployment.ready) {
           this.state.laserRequested = true
           this.state.alignmentRequested = false
         }
         break
       case 'laser_output_disable':
+        if (this.state.runtimeMode !== 'modulated_host') {
+          ackOk = false
+          ackNote =
+            'Host runtime output control is only available in modulated_host mode.'
+          break
+        }
         this.state.laserRequested = false
         break
       case 'configure_modulation':
+        if (this.state.runtimeMode !== 'modulated_host') {
+          ackOk = false
+          ackNote =
+            'Host runtime output control is only available in modulated_host mode.'
+          break
+        }
         if (!this.state.deployment.ready) {
           break
         }
@@ -1181,8 +1265,8 @@ export class MockTransport implements DeviceTransport {
     this.emit({
       kind: 'commandAck',
       commandId: command.id,
-      ok: true,
-      note: 'Accepted by mock controller.',
+      ok: ackOk,
+      note: ackNote,
     })
   }
 
@@ -1477,6 +1561,7 @@ export class MockTransport implements DeviceTransport {
     const tecReady = this.state.tecSettlingTicks <= 0.01
     const deploymentActive = this.state.deployment.active
     const deploymentReady = deploymentActive && this.state.deployment.ready
+    const runtimeModeLock = runtimeModeLockReason(this.state)
     const tecActualTemp =
       this.state.targetTempC -
       this.state.tecSettlingTicks * 0.28 +
@@ -1489,6 +1574,7 @@ export class MockTransport implements DeviceTransport {
       this.state.powerTier !== 'programming_only'
     const nirEnabled =
       this.state.laserRequested &&
+      this.state.runtimeMode === 'modulated_host' &&
       deploymentReady &&
       !this.state.faultLatched &&
       this.state.powerTier === 'full' &&
@@ -1519,29 +1605,6 @@ export class MockTransport implements DeviceTransport {
         ? 3.2
         : 1.35 + (nirEnabled ? 0.24 : 0)
     const actualLambdaNm = estimateWavelengthFromTempC(tecActualTemp)
-    const tempAdcVoltageV = estimateTecVoltageFromTempC(tecActualTemp)
-    const horizonBlocked = this.state.beamPitchDeg > this.state.safety.horizonThresholdDeg
-    const distanceBlocked =
-      this.state.distanceM < this.state.safety.tofMinRangeM ||
-      this.state.distanceM > this.state.safety.tofMaxRangeM
-    const lambdaDriftNm = Math.abs(actualLambdaNm - this.state.targetLambdaNm)
-    const lambdaDriftBlocked = lambdaDriftNm > this.state.safety.lambdaDriftLimitNm
-    const tecTempAdcBlocked = tempAdcVoltageV > this.state.safety.tecTempAdcTripV
-    const activeFaultCode =
-      this.state.faultLatched
-        ? this.state.activeFault
-        : this.state.activeFault !== 'none'
-          ? this.state.activeFault
-          : horizonBlocked
-            ? 'horizon_crossed'
-            : distanceBlocked
-              ? 'tof_out_of_range'
-              : lambdaDriftBlocked
-                ? 'lambda_drift'
-                : tecTempAdcBlocked
-                  ? 'tec_temp_adc_high'
-                  : 'none'
-    const benchDefaults = makeDefaultBenchControlStatus()
     const serviceLdEnabled =
       this.state.serviceMode && this.state.bringup.power.ldRequested
     const serviceTecEnabled =
@@ -1558,6 +1621,39 @@ export class MockTransport implements DeviceTransport {
         : deploymentActive
           ? deploymentReady
           : this.state.powerTier === 'full'
+    const driverStandby = !deploymentReady || this.state.faultLatched
+    const ldTelemetryValid = ldRailEnabled && !driverStandby
+    const tecTelemetryValid = tecRailEnabled
+    const reportedActualLambdaNm = tecTelemetryValid
+      ? actualLambdaNm
+      : this.state.targetLambdaNm
+    const reportedLambdaDriftNm = tecTelemetryValid
+      ? Math.abs(actualLambdaNm - this.state.targetLambdaNm)
+      : 0
+    const tempAdcVoltageV = estimateTecVoltageFromTempC(tecActualTemp)
+    const horizonBlocked = this.state.beamPitchDeg > this.state.safety.horizonThresholdDeg
+    const distanceBlocked =
+      this.state.distanceM < this.state.safety.tofMinRangeM ||
+      this.state.distanceM > this.state.safety.tofMaxRangeM
+    const lambdaDriftBlocked =
+      deploymentReady && reportedLambdaDriftNm > this.state.safety.lambdaDriftLimitNm
+    const tecTempAdcBlocked =
+      tecTelemetryValid && tempAdcVoltageV > this.state.safety.tecTempAdcTripV
+    const activeFaultCode =
+      this.state.faultLatched
+        ? this.state.activeFault
+        : this.state.activeFault !== 'none'
+          ? this.state.activeFault
+          : horizonBlocked
+            ? 'horizon_crossed'
+            : distanceBlocked
+              ? 'tof_out_of_range'
+              : lambdaDriftBlocked
+                ? 'lambda_drift'
+                : tecTempAdcBlocked
+                  ? 'tec_temp_adc_high'
+                  : 'none'
+    const benchDefaults = makeDefaultBenchControlStatus()
 
     if (gpio4 !== undefined) {
       gpio4.inputEnabled = true
@@ -1698,30 +1794,37 @@ export class MockTransport implements DeviceTransport {
       laser: {
         alignmentEnabled,
         nirEnabled,
-        driverStandby: !nirEnabled,
-        commandVoltageV: nirEnabled ? this.state.laserHighCurrentA * (2.5 / 6) : 0,
-        measuredCurrentA,
+        driverStandby,
+        telemetryValid: ldTelemetryValid,
+        commandVoltageV:
+          ldTelemetryValid ? this.state.laserHighCurrentA * (2.5 / 6) : 0,
+        measuredCurrentA: ldTelemetryValid ? measuredCurrentA : 0,
         commandedCurrentA: nirEnabled ? this.state.laserHighCurrentA : 0,
-        currentMonitorVoltageV: measuredCurrentA / 2.4,
-        loopGood: !this.state.faultLatched,
-        driverTempVoltageV:
+        currentMonitorVoltageV: ldTelemetryValid ? measuredCurrentA / 2.4 : 0,
+        loopGood: ldTelemetryValid && !this.state.faultLatched,
+        driverTempVoltageV: ldTelemetryValid
+          ?
           (192.5576 -
             (29.4 + measuredCurrentA * 2.6 + Math.sin(this.state.uptimeSeconds / 11) * 0.8)) /
-          90.104,
-        driverTempC: 29.4 + measuredCurrentA * 2.6 + Math.sin(this.state.uptimeSeconds / 11) * 0.8,
+          90.104
+          : 0,
+        driverTempC: ldTelemetryValid
+          ? 29.4 + measuredCurrentA * 2.6 + Math.sin(this.state.uptimeSeconds / 11) * 0.8
+          : 0,
       },
       tec: {
         targetTempC: this.state.targetTempC,
         targetLambdaNm: this.state.targetLambdaNm,
-        actualLambdaNm,
+        actualLambdaNm: reportedActualLambdaNm,
+        telemetryValid: tecTelemetryValid,
         commandVoltageV: this.state.serviceMode
           ? this.state.bringup.tuning.dacTecChannelV
           : Math.max(0, Math.min(2.5, this.state.targetTempC * (2.5 / 65))),
-        tempGood: tecReady,
-        tempC: tecActualTemp,
-        tempAdcVoltageV,
-        currentA: tecCurrentA,
-        voltageV: tecVoltageV,
+        tempGood: tecTelemetryValid && tecReady,
+        tempC: tecTelemetryValid ? tecActualTemp : 0,
+        tempAdcVoltageV: tecTelemetryValid ? tempAdcVoltageV : 0,
+        currentA: tecTelemetryValid ? tecCurrentA : 0,
+        voltageV: tecTelemetryValid ? tecVoltageV : 0,
         settlingSecondsRemaining: Math.max(0, Math.ceil(this.state.tecSettlingTicks)),
       },
       buttons: {
@@ -1800,6 +1903,9 @@ export class MockTransport implements DeviceTransport {
       bench: {
         ...benchDefaults,
         targetMode: this.state.targetMode,
+        runtimeMode: this.state.runtimeMode,
+        runtimeModeSwitchAllowed: runtimeModeLock === null,
+        runtimeModeLockReason: runtimeModeLock ?? '',
         requestedAlignmentEnabled: this.state.alignmentRequested,
         requestedNirEnabled: this.state.laserRequested,
         modulationEnabled: this.state.modulationEnabled,
@@ -1826,9 +1932,9 @@ export class MockTransport implements DeviceTransport {
         distanceBlocked: interlocksDisabled ? false : distanceBlocked,
         lambdaDriftBlocked: interlocksDisabled ? false : lambdaDriftBlocked,
         tecTempAdcBlocked: interlocksDisabled ? false : tecTempAdcBlocked,
-        actualLambdaNm,
+        actualLambdaNm: reportedActualLambdaNm,
         targetLambdaNm: this.state.targetLambdaNm,
-        lambdaDriftNm,
+        lambdaDriftNm: reportedLambdaDriftNm,
         tempAdcVoltageV,
       },
       bringup: {

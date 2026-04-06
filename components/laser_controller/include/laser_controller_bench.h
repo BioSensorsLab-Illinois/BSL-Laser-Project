@@ -13,6 +13,7 @@ typedef enum {
 
 typedef struct {
     laser_controller_bench_target_mode_t target_mode;
+    laser_controller_runtime_mode_t runtime_mode;
     bool requested_alignment;
     bool requested_nir;
     bool modulation_enabled;
@@ -50,5 +51,10 @@ void laser_controller_bench_set_modulation(
     uint32_t frequency_hz,
     uint32_t duty_cycle_pct,
     laser_controller_time_ms_t now_ms);
+void laser_controller_bench_set_runtime_mode(
+    laser_controller_runtime_mode_t runtime_mode,
+    laser_controller_time_ms_t now_ms);
 const char *laser_controller_bench_target_mode_name(
     laser_controller_bench_target_mode_t target_mode);
+const char *laser_controller_runtime_mode_name(
+    laser_controller_runtime_mode_t runtime_mode);

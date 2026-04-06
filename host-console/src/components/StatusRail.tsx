@@ -245,12 +245,16 @@ export function StatusRail({ snapshot, telemetryStore }: StatusRailProps) {
       label: 'TEC settle',
       icon: ThermometerSnowflake,
       value: tecAvailability.available
-        ? `${formatNumber(liveSnapshot.tec.tempC, 1)} / ${formatNumber(liveSnapshot.tec.targetTempC, 1)} °C`
+        ? liveSnapshot.tec.telemetryValid
+          ? `${formatNumber(liveSnapshot.tec.tempC, 1)} / ${formatNumber(liveSnapshot.tec.targetTempC, 1)} °C`
+          : 'OFF / INVALID'
         : tecAvailability.value,
       detail: tecAvailability.available
-        ? liveSnapshot.tec.tempGood
-          ? 'Settled to target'
-          : `${formatNumber(tecErrorDeg, 1)} °C from target • ${formatNumber(liveSnapshot.tec.voltageV, 2)} VTEC`
+        ? liveSnapshot.tec.telemetryValid
+          ? liveSnapshot.tec.tempGood
+            ? 'Settled to target'
+            : `${formatNumber(tecErrorDeg, 1)} °C from target • ${formatNumber(liveSnapshot.tec.voltageV, 2)} VTEC`
+          : 'TEC readback is invalid while the rail is off or not yet good'
         : tecAvailability.detail,
       progress: tecAvailability.available ? tecPercent : 0,
       tone:
@@ -274,12 +278,16 @@ export function StatusRail({ snapshot, telemetryStore }: StatusRailProps) {
             ? 'Green active'
             : liveSnapshot.laser.driverStandby
               ? 'Standby'
-              : 'Ready'
+              : liveSnapshot.laser.telemetryValid
+                ? 'Ready'
+                : 'OFF / INVALID'
         : laserAvailability.value,
       detail: laserAvailability.available
-        ? liveSnapshot.laser.driverStandby
-          ? `${formatNumber(estimate.averageOpticalPowerW, 2)} W optical estimate • standby asserted`
-          : `${formatNumber(estimate.averageOpticalPowerW, 2)} W optical estimate • output path awake`
+        ? liveSnapshot.laser.telemetryValid
+          ? liveSnapshot.laser.driverStandby
+            ? `${formatNumber(estimate.averageOpticalPowerW, 2)} W optical estimate • standby asserted`
+            : `${formatNumber(estimate.averageOpticalPowerW, 2)} W optical estimate • output path awake`
+          : 'LD telemetry is invalid while the rail is off or SBDN is not high'
         : laserAvailability.detail,
       progress: laserAvailability.available
         ? liveSnapshot.laser.nirEnabled

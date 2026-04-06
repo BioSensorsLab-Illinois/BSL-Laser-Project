@@ -253,6 +253,91 @@ def scenario_deployment_usb_safe_fail(client: ControllerClient) -> None:
     print("deployment-usb-safe-fail: PASS")
 
 
+def scenario_runtime_mode_gating(client: ControllerClient) -> None:
+    enter_resp = client.request(
+        compact({"type": "cmd", "id": 1171, "cmd": "enter_deployment_mode"}),
+        1171,
+        timeout_s=10.0,
+    )
+    enter_snapshot = unwrap_snapshot(enter_resp)
+    require(enter_resp.get("ok") is True, "enter_deployment_mode must succeed")
+    require(enter_snapshot.get("deployment", {}).get("active") is True, "deployment mode must be active before runtime-mode validation")
+
+    binary_resp = client.request(
+        compact(
+            {
+                "type": "cmd",
+                "id": 1172,
+                "cmd": "set_runtime_mode",
+                "mode": "binary_trigger",
+            }
+        ),
+        1172,
+        timeout_s=10.0,
+    )
+    binary_snapshot = unwrap_snapshot(binary_resp)
+    bench = binary_snapshot.get("bench", {})
+    require(binary_resp.get("ok") is True, "set_runtime_mode binary_trigger must succeed while the path is safe-off")
+    require(bench.get("runtimeMode") == "binary_trigger", "runtimeMode must update to binary_trigger")
+
+    blocked_power_resp = client.request(
+        compact(
+            {
+                "type": "cmd",
+                "id": 1173,
+                "cmd": "set_laser_power",
+                "current_a": 1.0,
+            }
+        ),
+        1173,
+        timeout_s=10.0,
+    )
+    require(
+        blocked_power_resp.get("ok") is False,
+        "host power staging must be rejected while runtime output is unavailable",
+    )
+
+    blocked_enable_resp = client.request(
+        compact({"type": "cmd", "id": 1174, "cmd": "laser_output_enable"}),
+        1174,
+        timeout_s=10.0,
+    )
+    require(
+        blocked_enable_resp.get("ok") is False,
+        "host output enable must be rejected while runtime output is unavailable",
+    )
+
+    blocked_alignment_resp = client.request(
+        compact({"type": "cmd", "id": 1175, "cmd": "enable_alignment"}),
+        1175,
+        timeout_s=10.0,
+    )
+    require(
+        blocked_alignment_resp.get("ok") is False,
+        "host alignment requests must be rejected in v2",
+    )
+
+    modulated_resp = client.request(
+        compact(
+            {
+                "type": "cmd",
+                "id": 1176,
+                "cmd": "set_runtime_mode",
+                "mode": "modulated_host",
+            }
+        ),
+        1176,
+        timeout_s=10.0,
+    )
+    modulated_snapshot = unwrap_snapshot(modulated_resp)
+    require(modulated_resp.get("ok") is True, "set_runtime_mode modulated_host must succeed while the path is safe-off")
+    require(
+        modulated_snapshot.get("bench", {}).get("runtimeMode") == "modulated_host",
+        "runtimeMode must update back to modulated_host",
+    )
+    print("runtime-mode-gating: PASS")
+
+
 def scenario_deployment_runtime_flow(client: ControllerClient) -> None:
     enter_resp = client.request(
         compact({"type": "cmd", "id": 1201, "cmd": "enter_deployment_mode"}),
@@ -332,6 +417,7 @@ def main() -> int:
             "parser-matrix",
             "deployment-lockout",
             "deployment-usb-safe-fail",
+            "runtime-mode-gating",
             "deployment-runtime-flow",
         ],
         required=True,
@@ -347,6 +433,8 @@ def main() -> int:
             scenario_deployment_lockout(client)
         elif args.scenario == "deployment-usb-safe-fail":
             scenario_deployment_usb_safe_fail(client)
+        elif args.scenario == "runtime-mode-gating":
+            scenario_runtime_mode_gating(client)
         else:
             scenario_deployment_runtime_flow(client)
     finally:

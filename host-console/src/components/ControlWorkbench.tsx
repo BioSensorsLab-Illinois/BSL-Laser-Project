@@ -206,6 +206,7 @@ export function ControlWorkbench({
     liveSnapshot.deployment.active &&
     liveSnapshot.deployment.ready &&
     !liveSnapshot.deployment.running
+  const modulatedHostMode = liveSnapshot.bench.runtimeMode === 'modulated_host'
   const writesDisabled = !commandReady || !deploymentReady
   const laserAvailability = describeModuleAvailability('Laser path', [
     { key: 'laserDriver', label: 'Laser driver', status: controlModules.laserDriver },
@@ -218,9 +219,11 @@ export function ControlWorkbench({
   const modulationAvailability = describeModuleAvailability('PCN modulation', [
     { key: 'laserDriver', label: 'Laser driver', status: controlModules.laserDriver },
   ])
-  const laserInteractDisabled = writesDisabled || !laserAvailability.available
+  const laserInteractDisabled =
+    writesDisabled || !laserAvailability.available || !modulatedHostMode
   const tecInteractDisabled = writesDisabled || !tecAvailability.available
-  const modulationInteractDisabled = writesDisabled || !modulationAvailability.available
+  const modulationInteractDisabled =
+    writesDisabled || !modulationAvailability.available || !modulatedHostMode
   const tempRange = {
     min: tecCalibrationPoints[0].tempC,
     max: tecCalibrationPoints[tecCalibrationPoints.length - 1].tempC,
@@ -259,7 +262,6 @@ export function ControlWorkbench({
   )
   const nirRequested = liveSnapshot.bench.requestedNirEnabled
   const nirActive = liveSnapshot.laser.nirEnabled
-  const alignmentRequested = liveSnapshot.bench.requestedAlignmentEnabled
   const alignmentActive = liveSnapshot.laser.alignmentEnabled
   const sbdnHigh = (liveSbdnPin?.outputEnabled ?? false) && (liveSbdnPin?.levelHigh ?? false)
   const pcnHigh = (livePcnPin?.outputEnabled ?? false) && (livePcnPin?.levelHigh ?? false)
@@ -267,15 +269,12 @@ export function ControlWorkbench({
   const nirActionLabel = nirRequested || nirActive ? 'Disable NIR Laser' : 'Enable NIR Laser'
   const nirActionTitle = nirActive
     ? 'Drop the NIR output request and return the beam path safe.'
-    : 'Request NIR output through the normal runtime safety gate. If bring-up service control is still active, the request will stay staged until service mode is exited.'
-  const alignmentActionCmd =
-    alignmentRequested || alignmentActive ? 'disable_alignment' : 'enable_alignment'
-  const alignmentActionLabel =
-    alignmentRequested || alignmentActive ? 'Disable Green Laser' : 'Enable Green Laser'
-  const alignmentActionTitle =
-    alignmentRequested || alignmentActive
-      ? 'Drop the green alignment request and return the alignment path safe.'
-      : 'Request the green alignment laser through the normal runtime safety gate. If bring-up service control is still active, the request will stay staged until service mode is exited.'
+      : 'Request NIR output through the normal runtime safety gate. If bring-up service control is still active, the request will stay staged until service mode is exited.'
+  const deploymentBlockedByUsbOnly =
+    liveSnapshot.pd.sourceIsHostOnly || liveSnapshot.pd.sourceVoltageV < 9
+  const runtimeModeNote = modulatedHostMode
+    ? 'Host-owned NIR output and PCN modulation are available once deployment is ready.'
+    : 'Binary trigger mode is selected. Host runtime output controls stay off while the physical trigger path remains blocked pending source-backed wiring.'
 
   const issueRuntimeControlCommand = useCallback(
     async (
@@ -439,10 +438,90 @@ export function ControlWorkbench({
               ? `Deployment current cap ${formatNumber(deploymentCurrentCapA, 2)} A / optical cap ${formatNumber(deploymentOpticalCapW, 2)} W.`
               : 'Runtime output actions are locked until deployment succeeds in the current session.'}
           </span>
+          <span>
+            {deploymentBlockedByUsbOnly
+              ? 'USB-only Phase 1 bench detected. Power-dependent checklist steps stay blocked until a real PD source is available.'
+              : runtimeModeNote}
+          </span>
         </div>
       </div>
 
       <div className="control-layout">
+        <article className="panel-cutout control-module">
+          <div className="cutout-head">
+            <div className="control-module__title">
+              <ShieldAlert size={16} />
+              <strong>Runtime mode</strong>
+            </div>
+            <HelpHint text="The controller now separates binary trigger mode from host-owned modulated mode. Only modulated_host accepts host runtime output requests." />
+          </div>
+
+          <div className="control-module__banner">
+            <div className="control-module__availability">
+              <strong>{liveSnapshot.bench.runtimeMode === 'modulated_host' ? 'modulated_host active' : 'binary_trigger active'}</strong>
+              <p>{runtimeModeNote}</p>
+            </div>
+            <span className={liveSnapshot.bench.runtimeMode === 'modulated_host' ? 'status-badge is-on' : 'status-badge is-warn'}>
+              {liveSnapshot.bench.runtimeMode}
+            </span>
+          </div>
+
+          <div className="segmented is-three">
+            <button
+              type="button"
+              className={liveSnapshot.bench.runtimeMode === 'binary_trigger' ? 'segmented__button is-active' : 'segmented__button'}
+              disabled={!commandReady || (!liveSnapshot.bench.runtimeModeSwitchAllowed && liveSnapshot.bench.runtimeMode !== 'binary_trigger')}
+              title={
+                liveSnapshot.bench.runtimeModeSwitchAllowed || liveSnapshot.bench.runtimeMode === 'binary_trigger'
+                  ? 'Use the binary trigger path. Host runtime output buttons remain disabled.'
+                  : liveSnapshot.bench.runtimeModeLockReason
+              }
+              onClick={() =>
+                issueRuntimeControlCommand(
+                  'set_runtime_mode',
+                  'write',
+                  'Switch the controller runtime mode to binary_trigger.',
+                  { mode: 'binary_trigger' },
+                )
+              }
+            >
+              Binary trigger
+            </button>
+            <button
+              type="button"
+              className={liveSnapshot.bench.runtimeMode === 'modulated_host' ? 'segmented__button is-active' : 'segmented__button'}
+              disabled={!commandReady || (!liveSnapshot.bench.runtimeModeSwitchAllowed && liveSnapshot.bench.runtimeMode !== 'modulated_host')}
+              title={
+                liveSnapshot.bench.runtimeModeSwitchAllowed || liveSnapshot.bench.runtimeMode === 'modulated_host'
+                  ? 'Use host-owned runtime output and PCN modulation.'
+                  : liveSnapshot.bench.runtimeModeLockReason
+              }
+              onClick={() =>
+                issueRuntimeControlCommand(
+                  'set_runtime_mode',
+                  'write',
+                  'Switch the controller runtime mode to modulated_host.',
+                  { mode: 'modulated_host' },
+                )
+              }
+            >
+              Modulated host
+            </button>
+            <button
+              type="button"
+              className="segmented__button"
+              disabled
+              title={liveSnapshot.bench.runtimeModeLockReason || 'Mode changes are only allowed while the laser path is safe-off.'}
+            >
+              {liveSnapshot.bench.runtimeModeSwitchAllowed ? 'Safe to switch' : 'Switch locked'}
+            </button>
+          </div>
+
+          {!liveSnapshot.bench.runtimeModeSwitchAllowed ? (
+            <p className="inline-help">{liveSnapshot.bench.runtimeModeLockReason}</p>
+          ) : null}
+        </article>
+
         <article className="panel-cutout control-module">
           <div className="cutout-head">
             <div className="control-module__title">
@@ -455,7 +534,11 @@ export function ControlWorkbench({
           <div className="control-module__banner">
             <div className="control-module__availability">
               <strong>{laserAvailability.label}</strong>
-              <p>{laserAvailability.detail}</p>
+              <p>
+                {modulatedHostMode
+                  ? laserAvailability.detail
+                  : 'Host-owned laser controls are disabled until the controller is in modulated_host mode.'}
+              </p>
             </div>
             <span className={availabilityBadgeClass(laserAvailability)}>{laserAvailability.state}</span>
           </div>
@@ -466,7 +549,7 @@ export function ControlWorkbench({
                 <input
                   type="checkbox"
                   checked={autoFollowPower}
-                  disabled={!laserAvailability.available}
+                  disabled={laserInteractDisabled}
                   onChange={(event) => setAutoFollowPower(event.target.checked)}
                 />
                 <span>Auto-follow optical power setpoint as the slider moves.</span>
@@ -483,7 +566,7 @@ export function ControlWorkbench({
                   max={deploymentOpticalCapW}
                   step="0.1"
                   value={requestedPowerW}
-                  disabled={!laserAvailability.available}
+                  disabled={laserInteractDisabled}
                   title="Drag to stage the desired optical output estimate."
                   onChange={(event) => setLaserPowerW(event.target.value)}
                 />
@@ -494,7 +577,7 @@ export function ControlWorkbench({
                     max={deploymentOpticalCapW}
                     step="0.1"
                     value={laserPowerW}
-                    disabled={!laserAvailability.available}
+                    disabled={laserInteractDisabled}
                     title="Type the target optical power in watts."
                     onChange={(event) => setLaserPowerW(event.target.value)}
                   />
@@ -542,24 +625,12 @@ export function ControlWorkbench({
                 >
                   {nirActionLabel}
                 </button>
-                <button
-                  type="button"
-                  className="action-button is-inline"
-                  title={alignmentActionTitle}
-                  disabled={laserInteractDisabled}
-                  onClick={() =>
-                    issueRuntimeControlCommand(
-                      alignmentActionCmd,
-                      'write',
-                      alignmentRequested || alignmentActive
-                        ? 'Drop any host-requested green alignment laser output.'
-                        : 'Return ownership from bring-up service mode if needed, then request the green alignment laser for terminated bench aiming checks.',
-                    )
-                  }
-                >
-                  {alignmentActionLabel}
-                </button>
               </div>
+              {!modulatedHostMode ? (
+                <p className="inline-help">
+                  Switch the controller to `modulated_host` to use host-owned NIR output and PCN modulation. Binary trigger mode is reserved for the physical trigger path.
+                </p>
+              ) : null}
             </div>
 
             <div className={laserAvailability.available ? 'control-module__column' : 'control-module__column is-muted'}>
@@ -568,17 +639,17 @@ export function ControlWorkbench({
                   <ScanLine size={14} />
                   NIR laser {liveSnapshot.safety.allowNir ? 'permitted' : 'blocked'}
                 </span>
-                <span className={alignmentRequested ? 'status-badge is-on' : 'status-badge'}>
+                <span className={alignmentActive ? 'status-badge is-on' : 'status-badge'}>
                   <Crosshair size={14} />
-                  Green request {alignmentRequested ? 'staged' : 'clear'}
+                  Green path {alignmentActive ? 'active' : 'idle'}
                 </span>
                 <span className={liveSnapshot.bench.requestedNirEnabled ? 'status-badge is-on' : 'status-badge'}>
                   <Activity size={14} />
                   NIR request {liveSnapshot.bench.requestedNirEnabled ? 'staged' : 'clear'}
                 </span>
-                <span className={liveSnapshot.laser.loopGood ? 'status-badge is-on' : 'status-badge is-warn'}>
+                <span className={liveSnapshot.laser.telemetryValid ? liveSnapshot.laser.loopGood ? 'status-badge is-on' : 'status-badge is-warn' : 'status-badge'}>
                   <Sparkles size={14} />
-                  Loop {liveSnapshot.laser.loopGood ? 'good' : 'degraded'}
+                  Loop {liveSnapshot.laser.telemetryValid ? liveSnapshot.laser.loopGood ? 'good' : 'degraded' : 'off'}
                 </span>
                 <span className={liveSnapshot.rails.ld.enabled ? 'status-badge is-on' : 'status-badge is-warn'}>
                   <Zap size={14} />
@@ -614,8 +685,8 @@ export function ControlWorkbench({
                 </div>
                 <div className="metric-card">
                   <span>Measured current</span>
-                  <strong>{formatNumber(liveSnapshot.laser.measuredCurrentA, 2)} A</strong>
-                  <small>driver monitor readback</small>
+                  <strong>{liveSnapshot.laser.telemetryValid ? `${formatNumber(liveSnapshot.laser.measuredCurrentA, 2)} A` : 'OFF / INVALID'}</strong>
+                  <small>{liveSnapshot.laser.telemetryValid ? 'driver monitor readback' : 'LD telemetry only becomes valid when LD rail PGOOD is high and SBDN is high'}</small>
                 </div>
                 <div className="metric-card">
                   <span>Optical estimate</span>
@@ -624,7 +695,7 @@ export function ControlWorkbench({
                 </div>
                 <div className="metric-card">
                   <span>Driver temp</span>
-                  <strong>{formatNumber(liveSnapshot.laser.driverTempC, 1)} °C</strong>
+                  <strong>{liveSnapshot.laser.telemetryValid ? `${formatNumber(liveSnapshot.laser.driverTempC, 1)} °C` : 'OFF / INVALID'}</strong>
                   <small>{liveSnapshot.laser.driverStandby ? 'standby asserted' : 'standby released'}</small>
                 </div>
               </div>
@@ -655,7 +726,7 @@ export function ControlWorkbench({
                 <button
                   type="button"
                   className={targetMode === 'lambda' ? 'segmented__button is-active' : 'segmented__button'}
-                  disabled={!tecAvailability.available}
+                  disabled={tecInteractDisabled}
                   title="Stage wavelength and let the host estimate temperature."
                   onClick={() => setTargetMode('lambda')}
                 >
@@ -664,7 +735,7 @@ export function ControlWorkbench({
                 <button
                   type="button"
                   className={targetMode === 'temp' ? 'segmented__button is-active' : 'segmented__button'}
-                  disabled={!tecAvailability.available}
+                  disabled={tecInteractDisabled}
                   title="Stage temperature directly."
                   onClick={() => setTargetMode('temp')}
                 >
@@ -673,7 +744,7 @@ export function ControlWorkbench({
                 <button
                   type="button"
                   className="segmented__button"
-                  disabled={!tecAvailability.available}
+                  disabled={tecInteractDisabled}
                   title="Overwrite the editor with the latest live controller targets."
                   onClick={() => {
                     setTargetMode(liveSnapshot.bench.targetMode)
@@ -697,7 +768,7 @@ export function ControlWorkbench({
                     max={wavelengthRange.max}
                     step="0.1"
                     value={requestedLambdaNm}
-                    disabled={!tecAvailability.available}
+                    disabled={tecInteractDisabled}
                     title="Drag to stage the wavelength target."
                     onChange={(event) => setTargetLambdaNm(event.target.value)}
                   />
@@ -708,7 +779,7 @@ export function ControlWorkbench({
                       max={wavelengthRange.max}
                       step="0.1"
                       value={targetLambdaNm}
-                      disabled={!tecAvailability.available}
+                      disabled={tecInteractDisabled}
                       title="Type the target wavelength in nanometers."
                       onChange={(event) => setTargetLambdaNm(event.target.value)}
                     />
@@ -729,7 +800,7 @@ export function ControlWorkbench({
                     max={tempRange.max}
                     step="0.1"
                     value={requestedTempC}
-                    disabled={!tecAvailability.available}
+                    disabled={tecInteractDisabled}
                     title="Drag to stage the TEC target temperature."
                     onChange={(event) => setTargetTempC(event.target.value)}
                   />
@@ -740,7 +811,7 @@ export function ControlWorkbench({
                       max={tempRange.max}
                       step="0.1"
                       value={targetTempC}
-                      disabled={!tecAvailability.available}
+                      disabled={tecInteractDisabled}
                       title="Type the target TEC temperature in degrees Celsius."
                       onChange={(event) => setTargetTempC(event.target.value)}
                     />
@@ -780,23 +851,23 @@ export function ControlWorkbench({
               <div className="metric-grid is-two">
                 <div className="metric-card">
                   <span>Actual lambda</span>
-                  <strong>{formatNumber(liveSnapshot.tec.actualLambdaNm, 2)} nm</strong>
-                  <small>{formatNumber(liveSnapshot.safety.lambdaDriftNm, 2)} nm drift from target</small>
+                  <strong>{liveSnapshot.tec.telemetryValid ? `${formatNumber(liveSnapshot.tec.actualLambdaNm, 2)} nm` : 'OFF / INVALID'}</strong>
+                  <small>{liveSnapshot.tec.telemetryValid ? `${formatNumber(liveSnapshot.safety.lambdaDriftNm, 2)} nm drift from target` : 'TEC telemetry is only valid when TEC rail PGOOD is high'}</small>
                 </div>
                 <div className="metric-card">
                   <span>TEC temp</span>
-                  <strong>{formatNumber(liveSnapshot.tec.tempC, 2)} °C</strong>
-                  <small>{liveSnapshot.tec.tempGood ? 'settled' : 'still settling'}</small>
+                  <strong>{liveSnapshot.tec.telemetryValid ? `${formatNumber(liveSnapshot.tec.tempC, 2)} °C` : 'OFF / INVALID'}</strong>
+                  <small>{liveSnapshot.tec.telemetryValid ? (liveSnapshot.tec.tempGood ? 'settled' : 'still settling') : 'No valid TEC readback while the rail is off'}</small>
                 </div>
                 <div className="metric-card">
                   <span>Temp ADC</span>
-                  <strong>{formatNumber(liveSnapshot.tec.tempAdcVoltageV, 3)} V</strong>
+                  <strong>{liveSnapshot.tec.telemetryValid ? `${formatNumber(liveSnapshot.tec.tempAdcVoltageV, 3)} V` : 'OFF / INVALID'}</strong>
                   <small>trip at {formatNumber(liveSnapshot.safety.tecTempAdcTripV, 3)} V</small>
                 </div>
                 <div className="metric-card">
                   <span>TEC rail</span>
                   <strong>{liveSnapshot.rails.tec.pgood ? 'PGOOD' : 'Waiting'}</strong>
-                  <small>{formatNumber(liveSnapshot.tec.voltageV, 2)} V at {formatNumber(liveSnapshot.tec.currentA, 2)} A</small>
+                  <small>{liveSnapshot.tec.telemetryValid ? `${formatNumber(liveSnapshot.tec.voltageV, 2)} V at ${formatNumber(liveSnapshot.tec.currentA, 2)} A` : 'Rail off or not yet valid'}</small>
                 </div>
               </div>
             </div>
@@ -815,7 +886,11 @@ export function ControlWorkbench({
           <div className="control-module__banner">
             <div className="control-module__availability">
               <strong>{modulationAvailability.label}</strong>
-              <p>{modulationAvailability.detail}</p>
+              <p>
+                {modulatedHostMode
+                  ? modulationAvailability.detail
+                  : 'PCN modulation is disabled until the controller is in modulated_host mode.'}
+              </p>
             </div>
             <span className={availabilityBadgeClass(modulationAvailability)}>{modulationAvailability.state}</span>
           </div>
@@ -823,9 +898,9 @@ export function ControlWorkbench({
           <div className={modulationAvailability.available ? 'control-module__body' : 'control-module__body is-muted'}>
             <label className="arming-toggle is-compact" title="Enable PCN-based high/low current modulation.">
               <input
-                type="checkbox"
-                checked={modulationEnabled}
-                disabled={!modulationAvailability.available}
+                  type="checkbox"
+                  checked={modulationEnabled}
+                  disabled={modulationInteractDisabled}
                 onChange={(event) => setModulationEnabled(event.target.checked)}
               />
               <span>Use PWM on PCN for LD bench modulation. LISL stays fixed low on this board.</span>
@@ -840,7 +915,7 @@ export function ControlWorkbench({
                   max="4000"
                   step="1"
                   value={modulationFrequencyHz}
-                  disabled={!modulationAvailability.available}
+                  disabled={modulationInteractDisabled}
                   title="Set the PCN modulation frequency. Use 0 for a DC/static leg selection."
                   onChange={(event) => setModulationFrequencyHz(event.target.value)}
                 />
@@ -863,7 +938,7 @@ export function ControlWorkbench({
                 max="100"
                 step="1"
                 value={requestedDutyPct}
-                disabled={!modulationAvailability.available}
+                disabled={modulationInteractDisabled}
                 title="Drag to stage the modulation duty cycle."
                 onChange={(event) => setModulationDutyPct(event.target.value)}
               />
@@ -889,6 +964,11 @@ export function ControlWorkbench({
             >
               Apply modulation
             </button>
+            {!modulatedHostMode ? (
+              <p className="inline-help">
+                Binary trigger mode reserves the laser path for the physical trigger hardware. Switch back to `modulated_host` before using PCN modulation.
+              </p>
+            ) : null}
           </div>
         </article>
 

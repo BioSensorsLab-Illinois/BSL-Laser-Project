@@ -226,14 +226,25 @@ If anything hardware-facing is uncertain, check these first:
 
 This workflow-only refactor does not implement these behaviors yet, but future rewrite work must preserve them as tracked product requirements:
 
-- the GUI Deployment page is removed later and replaced with a concise pre-enable checklist on Control
-- checklist success must mean the laser can actually turn on
+- the GUI Deployment page is removed and replaced with an inline pre-enable checklist on Control
+- deployment mode remains firmware-owned, but its user-facing controls live on Control instead of a separate page
+- checklist success must mean the laser can actually turn on once the required hardware is available
 - TEC power must come on before LD power
 - if TEC power is lost, LD power must stop immediately and `PCN` / `SBDN` must be pulled low
 - TEC and LD telemetry must only be treated as valid when their power-good and control-state prerequisites are satisfied
 - full GPIO permission and compatibility issues must be reworked as a core stability protocol
 - during deployment-mode-owned monitoring, bring-up submodules should not look disconnected; disabled write controls must explain why
 - monitored modules with deterministic readback must enter an error state if readback disappears for too long
+- runtime control is split into:
+  - `binary_trigger`
+    Normal ON/OFF mode intended for the physical stage-1 / stage-2 trigger path only
+  - `modulated_host`
+    Host/runtime-controlled mode and the only mode allowed to use host-issued output enable and `PCN` modulation
+- only one runtime mode may be active at a time
+- `binary_trigger` is blocked from completion until the real trigger-button wiring is source-backed in this repo
+- the current USB-only bench is Phase 1 only:
+  - it can validate protocol, GPIO ownership, shared-bus stability, IMU, DAC, ToF, DRV2605 register access, GUI rendering, and safe pin-level behavior
+  - it cannot claim PD, TEC rail, LD rail, deployment-ready completion, or actual laser-enable validation
 
 ## Repo Orientation
 
@@ -257,3 +268,19 @@ When changing workflow or SoP:
 3. Keep the repo-local skill list current.
 4. Keep initiative docs self-contained enough for a fresh agent to resume from them alone.
 5. If a new workflow rule affects all future work, put it here, not only in chat.
+
+## GPIO Ownership Protocol
+
+GPIO stability is a first-class safety requirement on this board.
+
+Every firmware change that touches GPIO, ADC, PWM, I2C, SPI, or sideband control must satisfy these rules:
+
+- each GPIO has exactly one active owner at a time
+- baseline firmware ownership, service override ownership, PWM ownership, and bus-recovery ownership must be explicit
+- ownership handoff must restore the pin to its baseline safe mode before another owner takes control
+- no hidden pull-up, pull-down, open-drain, peripheral-matrix, or direction changes are allowed outside the owning path
+- ADC telemetry on safety-facing analog nets must never be read as valid unless the related powered hardware path is actually on
+- shared-bus recovery must restore `GPIO4/GPIO5` to the intended bus posture after recovery
+- `PCN`, `SBDN`, `PWR_TEC_EN`, and `PWR_LD_EN` must be treated as scope-worthy safety pins during validation
+
+Observed facts and enforcement changes related to GPIO ownership must be written back here when they become repo-level truth.

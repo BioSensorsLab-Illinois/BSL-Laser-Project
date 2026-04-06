@@ -14,6 +14,9 @@ What this skill requires:
 
 - identify all affected rails, GPIOs, readback paths, and ownership boundaries
 - check for permission conflicts, hidden overrides, stale-state conflicts, and telemetry validity ambiguity
+- separate USB-only Phase 1 bench claims from powered-rail Phase 2 claims; do not blur them
+- treat GPIO ownership as mandatory design work, not cleanup
+- for LD and TEC paths, state explicitly when telemetry is valid and when it must be shown as OFF / INVALID
 - if anything is uncertain after repo/doc inspection, ask rather than guessing
 - write new repo-level safety/workflow truth back into `.agent/AGENT.md`
 

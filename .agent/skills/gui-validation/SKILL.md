@@ -17,6 +17,8 @@ Validation rules:
   - hover help
   - interaction flow
   - cross-page consistency
+  - explicit OFF / INVALID / IN-DEPLOYMENT state rendering for hardware-backed telemetry
+  - Control-page explanation of why the inline deployment checklist cannot complete on the USB-only Phase 1 bench
 
 Required evidence:
 

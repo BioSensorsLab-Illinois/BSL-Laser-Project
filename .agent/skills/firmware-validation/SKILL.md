@@ -11,6 +11,9 @@ Validation rules:
 
 - validate actual logic, not only compilation
 - capture the exact command used, the observed outcome, and any mismatch against expected behavior
+- record whether the observed result came from the current USB-only Phase 1 bench or from a powered Phase 2 bench
+- do not claim PD, TEC-rail, LD-rail, deployment-ready, or actual laser-enable validation from the USB-only bench
+- include scope or logic-analyzer checks for `SBDN`, `PCN`, `PWR_TEC_EN`, and `PWR_LD_EN` whenever those paths change
 - if a feature cannot be validated on the current bench setup, say exactly why and what hardware condition is missing
 - do not mark firmware work done until the validation result is written into the active `Status.md`
 
