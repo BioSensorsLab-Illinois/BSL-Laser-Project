@@ -1,0 +1,7 @@
+{
+  "platform": "rpi4",
+  "variant": "rpi4",
+  "pins": [
+    {"gpio": 17, "function": "OUTPUT", "protocol_bus": "gpio", "device": "LED", "direction": "output", "pull": "none", "speed_hz": 0, "notes": ""}
+  ]
+}

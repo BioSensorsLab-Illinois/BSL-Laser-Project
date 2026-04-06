@@ -1,0 +1,24 @@
+{
+  "platform": "rpi",
+  "variant": "rpi4",
+  "module": null,
+  "wifi_enabled": false,
+  "pins": [
+    {
+      "gpio": 17,
+      "function": "OUTPUT",
+      "protocol_bus": "gpio",
+      "device": "LED",
+      "pull": "none",
+      "notes": "LED on GPIO17"
+    },
+    {
+      "gpio": 17,
+      "function": "INPUT",
+      "protocol_bus": "gpio",
+      "device": "button",
+      "pull": "up",
+      "notes": "Button on GPIO17 - conflicts with LED"
+    }
+  ]
+}

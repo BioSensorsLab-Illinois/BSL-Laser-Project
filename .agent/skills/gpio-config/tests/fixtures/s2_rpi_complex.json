@@ -1,0 +1,80 @@
+{
+  "platform": "rpi",
+  "variant": "rpi4",
+  "module": null,
+  "wifi_enabled": false,
+  "pins": [
+    {
+      "gpio": 2,
+      "function": "SDA1",
+      "protocol_bus": "i2c",
+      "device": "BME280",
+      "pull": "up",
+      "notes": "I2C1 data"
+    },
+    {
+      "gpio": 3,
+      "function": "SCL1",
+      "protocol_bus": "i2c",
+      "device": "BME280",
+      "pull": "up",
+      "notes": "I2C1 clock"
+    },
+    {
+      "gpio": 10,
+      "function": "SPI0_MOSI",
+      "protocol_bus": "spi",
+      "device": "MCP3008",
+      "pull": "none",
+      "notes": ""
+    },
+    {
+      "gpio": 9,
+      "function": "SPI0_MISO",
+      "protocol_bus": "spi",
+      "device": "MCP3008",
+      "pull": "none",
+      "notes": ""
+    },
+    {
+      "gpio": 11,
+      "function": "SPI0_SCLK",
+      "protocol_bus": "spi",
+      "device": "MCP3008",
+      "pull": "none",
+      "notes": ""
+    },
+    {
+      "gpio": 8,
+      "function": "SPI0_CE0",
+      "protocol_bus": "spi",
+      "device": "MCP3008",
+      "pull": "none",
+      "notes": ""
+    },
+    {
+      "gpio": 12,
+      "function": "PWM0",
+      "protocol_bus": "pwm",
+      "device": "servo",
+      "pull": "none",
+      "notes": "Hardware PWM channel 0"
+    },
+    {
+      "gpio": 17,
+      "function": "OUTPUT",
+      "protocol_bus": "gpio",
+      "device": "LED_status",
+      "pull": "none",
+      "notes": "Status LED"
+    },
+    {
+      "gpio": 27,
+      "function": "OUTPUT",
+      "protocol_bus": "gpio",
+      "device": "relay",
+      "pull": "none",
+      "notes": "Relay control"
+    }
+  ]
+}

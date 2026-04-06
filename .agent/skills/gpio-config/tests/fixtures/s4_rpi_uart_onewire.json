@@ -1,0 +1,64 @@
+{
+  "platform": "rpi",
+  "variant": "rpi4",
+  "module": null,
+  "wifi_enabled": false,
+  "pins": [
+    {
+      "gpio": 14,
+      "function": "UART_TX",
+      "protocol_bus": "uart",
+      "device": "GPS_NEO6M",
+      "pull": "none",
+      "notes": "UART0 transmit to GPS"
+    },
+    {
+      "gpio": 15,
+      "function": "UART_RX",
+      "protocol_bus": "uart",
+      "device": "GPS_NEO6M",
+      "pull": "none",
+      "notes": "UART0 receive from GPS"
+    },
+    {
+      "gpio": 4,
+      "function": "1WIRE",
+      "protocol_bus": "onewire",
+      "device": "DS18B20",
+      "pull": "up",
+      "notes": "1-Wire temperature sensor"
+    },
+    {
+      "gpio": 17,
+      "function": "OUTPUT",
+      "protocol_bus": "gpio",
+      "device": "relay_1",
+      "pull": "none",
+      "notes": "Relay channel 1"
+    },
+    {
+      "gpio": 22,
+      "function": "OUTPUT",
+      "protocol_bus": "gpio",
+      "device": "relay_2",
+      "pull": "none",
+      "notes": "Relay channel 2"
+    },
+    {
+      "gpio": 23,
+      "function": "OUTPUT",
+      "protocol_bus": "gpio",
+      "device": "relay_3",
+      "pull": "none",
+      "notes": "Relay channel 3"
+    },
+    {
+      "gpio": 27,
+      "function": "OUTPUT",
+      "protocol_bus": "gpio",
+      "device": "relay_4",
+      "pull": "none",
+      "notes": "Relay channel 4"
+    }
+  ]
+}

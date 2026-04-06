@@ -1,0 +1,72 @@
+{
+  "platform": "rpi",
+  "variant": "rpi4",
+  "module": null,
+  "wifi_enabled": false,
+  "pins": [
+    {
+      "gpio": 2,
+      "function": "SDA1",
+      "protocol_bus": "i2c",
+      "device": "BME280",
+      "pull": "up",
+      "notes": "I2C1 data line"
+    },
+    {
+      "gpio": 3,
+      "function": "SCL1",
+      "protocol_bus": "i2c",
+      "device": "BME280",
+      "pull": "up",
+      "notes": "I2C1 clock line"
+    },
+    {
+      "gpio": 10,
+      "function": "SPI0_MOSI",
+      "protocol_bus": "spi",
+      "device": "SSD1306",
+      "pull": "none",
+      "notes": "SPI0 data out"
+    },
+    {
+      "gpio": 9,
+      "function": "SPI0_MISO",
+      "protocol_bus": "spi",
+      "device": "SSD1306",
+      "pull": "none",
+      "notes": "SPI0 data in"
+    },
+    {
+      "gpio": 11,
+      "function": "SPI0_SCLK",
+      "protocol_bus": "spi",
+      "device": "SSD1306",
+      "pull": "none",
+      "notes": "SPI0 clock"
+    },
+    {
+      "gpio": 8,
+      "function": "SPI0_CE0",
+      "protocol_bus": "spi",
+      "device": "SSD1306",
+      "pull": "none",
+      "notes": "SPI0 chip select 0"
+    },
+    {
+      "gpio": 24,
+      "function": "OUTPUT",
+      "protocol_bus": "gpio",
+      "device": "DC_pin",
+      "pull": "none",
+      "notes": "SSD1306 data/command select"
+    },
+    {
+      "gpio": 25,
+      "function": "OUTPUT",
+      "protocol_bus": "gpio",
+      "device": "RST_pin",
+      "pull": "none",
+      "notes": "SSD1306 reset"
+    }
+  ]
+}

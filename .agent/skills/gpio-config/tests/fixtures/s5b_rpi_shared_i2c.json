@@ -1,0 +1,24 @@
+{
+  "platform": "rpi",
+  "variant": "rpi4",
+  "module": null,
+  "wifi_enabled": false,
+  "pins": [
+    {
+      "gpio": 2,
+      "function": "SDA1",
+      "protocol_bus": "i2c",
+      "device": "BME280+SSD1306",
+      "pull": "up",
+      "notes": "Shared I2C1 data for BME280 (0x76) and SSD1306 (0x3C)"
+    },
+    {
+      "gpio": 3,
+      "function": "SCL1",
+      "protocol_bus": "i2c",
+      "device": "BME280+SSD1306",
+      "pull": "up",
+      "notes": "Shared I2C1 clock for BME280 and SSD1306"
+    }
+  ]
+}

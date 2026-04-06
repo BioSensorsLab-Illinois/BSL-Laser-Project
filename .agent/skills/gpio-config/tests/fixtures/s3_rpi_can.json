@@ -1,0 +1,48 @@
+{
+  "platform": "rpi",
+  "variant": "rpi4",
+  "module": null,
+  "wifi_enabled": false,
+  "pins": [
+    {
+      "gpio": 10,
+      "function": "SPI0_MOSI",
+      "protocol_bus": "spi",
+      "device": "MCP2515",
+      "pull": "none",
+      "notes": "CAN controller SPI data out"
+    },
+    {
+      "gpio": 9,
+      "function": "SPI0_MISO",
+      "protocol_bus": "spi",
+      "device": "MCP2515",
+      "pull": "none",
+      "notes": "CAN controller SPI data in"
+    },
+    {
+      "gpio": 11,
+      "function": "SPI0_SCLK",
+      "protocol_bus": "spi",
+      "device": "MCP2515",
+      "pull": "none",
+      "notes": "CAN controller SPI clock"
+    },
+    {
+      "gpio": 8,
+      "function": "SPI0_CE0",
+      "protocol_bus": "spi",
+      "device": "MCP2515",
+      "pull": "none",
+      "notes": "CAN controller chip select"
+    },
+    {
+      "gpio": 25,
+      "function": "INPUT",
+      "protocol_bus": "gpio",
+      "device": "MCP2515_INT",
+      "pull": "up",
+      "notes": "CAN controller interrupt (active low)"
+    }
+  ]
+}
