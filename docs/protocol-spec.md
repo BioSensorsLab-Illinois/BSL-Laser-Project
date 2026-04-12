@@ -9,6 +9,15 @@ Define one command and telemetry model that can be carried over:
 - the current desktop GUI
 - Wi-Fi SoftAP + WebSocket without changing semantics
 
+The active powered-ready host rewrite uses explicit command families:
+
+- `status.*`
+- `deployment.*`
+- `operate.*`
+- `integrate.*`
+
+Legacy command names are still accepted as compatibility aliases during migration.
+
 ## Framing
 
 Use newline-delimited JSON messages.
@@ -77,40 +86,47 @@ Required fields:
 
 | Command | Purpose | Safety Notes |
 | --- | --- | --- |
-| `get_status` | full machine-readable status snapshot | safe read-only |
+| `status.get` | full machine-readable status snapshot | safe read-only |
 | `get_faults` | active and historical faults | safe read-only |
 | `get_bringup_profile` | fetch service-only module expectations and tuning state | safe read-only |
 | `clear_faults` | request fault clear | service-only; must not clear if recovery criteria fail |
-| `enter_deployment_mode` | enter deployment mode and reclaim ownership from bring-up service paths | deployment-only runtime gate; blocks bring-up writes while active |
-| `exit_deployment_mode` | leave deployment mode and return to non-deployed safe supervision | only allowed when the deployment checklist is not running |
-| `run_deployment_sequence` | run the blocking deployment checklist in firmware | deployment-only; checklist owns sequencing and safe abort |
-| `set_deployment_target` | set the deployment temperature or wavelength target | deployment-only; updates the ready-posture target and checklist setpoint |
+| `deployment.enter` | enter deployment mode and reclaim ownership from bring-up service paths | deployment-only runtime gate; blocks bring-up writes while active |
+| `deployment.exit` | leave deployment mode and return to non-deployed safe supervision | only allowed when the deployment checklist is not running |
+| `deployment.run` | start the deployment checklist and stream progress asynchronously | deployment-only; checklist owns sequencing and safe abort |
+| `deployment.set_target` | set the deployment temperature or wavelength target | deployment-only; updates the ready-posture target and checklist setpoint |
 | `set_deployment_safety` | update deployment-mode safety thresholds and timeouts | deployment-only; applies live and may immediately drop active output |
-| `set_runtime_mode` | switch runtime control between `binary_trigger` and `modulated_host` | deployment-only mode seam; must be safe-off before switching |
-| `set_laser_power` | stage the bench high-state NIR current request | service-only; host request only, not direct output authority |
+| `operate.set_mode` | switch runtime control between `binary_trigger` and `modulated_host` | deployment-only mode seam; must be safe-off before switching |
+| `operate.set_alignment` | set the normal green-laser request path | aux-control; deployment must be active and the checklist must not be running; request still obeys safety and power gates |
+| `operate.set_led` | set the normal GPIO6 LED request and brightness | aux-control; deployment must be active and the checklist must not be running; deployment still defaults GPIO6 low until requested |
+| `operate.set_target` | stage the runtime TEC temperature or wavelength target | runtime-only; deployment must already be ready |
+| `operate.set_output` | stage runtime output enable and current together | runtime-only; host request only, not direct output authority |
+| `set_laser_power` | legacy alias for staging the bench high-state NIR current request | compatibility alias |
 | `set_max_current` | alias for bench high-state NIR current staging | service-only; must never exceed provisioned safety ceiling |
-| `set_runtime_safety` | update runtime safety thresholds, hysteresis, and hold windows | service-only; reject invalid policy values and keep firmware authoritative |
+| `integrate.set_safety` | update runtime safety thresholds, hysteresis, and hold windows and persist them immediately | integrate-only; reject invalid policy values and keep firmware authoritative |
+| `set_runtime_safety` | legacy alias for runtime safety updates | compatibility alias |
 | `pd_debug_config` | apply STUSB4500 runtime sink PDOs and update firmware power-tier thresholds | service-only; runtime-register write only, not a hidden NVM reprogramming path |
 | `pd_save_firmware_plan` | validate runtime PDO readback, then save the plan into ESP32 firmware NVS for future auto-reconcile | service-only; MCU-owned persistence, separate from STUSB4500 NVM |
 | `pd_burn_nvm` | validate runtime PDOs, then burn the requested STUSB4500 PDO startup defaults into NVM and verify raw NVM readback | service-only; manufacturing-only action with finite endurance, never for iterative tuning |
-| `set_target_temp` | stage TEC target temperature | service-only; clamp to safe calibrated range |
-| `set_target_lambda` | stage wavelength target | service-only; reject out-of-range or uncalibrated values |
-| `configure_modulation` | stage PCN PWM modulation request | service-only; host request only, not direct PWM authority |
-| `laser_output_enable` | request bench NIR output intent | service-only; still routed through interlocks and may remain off |
-| `laser_output_disable` | clear bench NIR output intent | safe; immediately drops host NIR request |
-| `enable_alignment` | request stage-1 style alignment intent | service-only; still routed through interlocks |
-| `disable_alignment` | clear alignment intent | safe |
+| `set_target_temp` | legacy alias for temperature target staging | compatibility alias |
+| `set_target_lambda` | legacy alias for wavelength target staging | compatibility alias |
+| `operate.set_modulation` | stage PCN PWM modulation request | runtime-only; host request only, not direct PWM authority |
+| `configure_modulation` | legacy alias for modulation staging | compatibility alias |
+| `laser_output_enable` | legacy alias for runtime NIR enable intent | compatibility alias |
+| `laser_output_disable` | legacy alias for runtime NIR disable intent | compatibility alias |
+| `enable_alignment` | legacy alias for enabling the normal green-laser request | compatibility alias; same gate as `operate.set_alignment` |
+| `disable_alignment` | legacy alias for clearing the normal green-laser request | compatibility alias |
 | `reboot` | controlled reboot | safe if outputs dropped first |
 | `enter_service_mode` | protected service path | must be explicitly protected and logged |
 | `exit_service_mode` | leave service mode | safe |
 | `apply_bringup_preset` | stage a known module-population profile such as `soc_imu_dac` | service-only; does not grant beam permission |
 | `set_profile_name` | rename the active bring-up profile | safe bring-up metadata; does not require service mode |
 | `set_module_state` | declare whether a module is expected present and debug-enabled | safe bring-up metadata; does not require service mode |
-| `save_bringup_profile` | request device-side persistence of the bring-up profile | safe bring-up metadata write; may be unavailable in early firmware |
+| `integrate.save_profile` | request device-side persistence of the bring-up profile | safe bring-up metadata write |
+| `save_bringup_profile` | legacy alias for integrate profile persistence | compatibility alias |
 | `scan_wireless_networks` | ask the controller to scan nearby Wi-Fi SSIDs for station-mode setup | read-only transport diagnostic; may briefly pause station reconnect attempts while the scan runs |
 | `configure_wireless` | switch the controller between bench SoftAP and existing-Wi-Fi station mode | transport-management write; may intentionally drop the current wireless socket while the controller changes networks |
 | `set_supply_enable` | request the LD or TEC MPM3530 VIN rail on/off during service bring-up | service-only; beam outputs stay forced safe |
-| `refresh_pd_status` | force an immediate STUSB4500 contract/PDO refresh | read-only diagnostic; does not require service mode |
+| `refresh_pd_status` | force an immediate STUSB4500 contract/PDO refresh | read-only diagnostic for Integrate only; rejected while deployment mode is active |
 | `dac_debug_set` | stage DAC channel shadow voltages for bench validation | service-only; actuator shadow, not direct beam authority |
 | `dac_debug_config` | stage DAC reference, gain, divider, and update policy | service-only; safe shadow/config only |
 | `imu_debug_config` | tune IMU ODR, full-scale, and runtime interface flags during bring-up | service-only |
@@ -137,14 +153,34 @@ Current bring-up-specific behavior:
 - `scan_wireless_networks` is intentionally allowed outside service mode so the operator can discover nearby SSIDs before switching the controller into station mode.
 - `scan_wireless_networks` may temporarily pause station reconnect attempts during the scan, then resume them automatically after results are captured.
 - `configure_wireless` is intentionally allowed outside service mode so an operator can move the controller between bench SoftAP and an existing Wi-Fi network without opening a hazardous write session.
-- Runtime control commands such as `set_target_temp`, `set_target_lambda`, `set_laser_power`, `configure_modulation`, and `laser_output_enable` are rejected unless deployment mode is active and the deployment checklist has completed successfully in the current session.
-- `set_runtime_mode` is allowed while deployment mode is active and the laser path is safe-off. It is blocked while deployment is running, while requests are still staged, while modulation is still active, or while the controller is faulted.
+- Aux-control commands such as `operate.set_alignment`, `operate.set_led`, `enable_alignment`, and `disable_alignment` are rejected unless deployment mode is active and the checklist is not currently running.
+- Runtime control commands such as `operate.set_target`, `operate.set_output`, and `operate.set_modulation` are rejected unless deployment mode is active and the deployment checklist has completed successfully in the current session.
+- `operate.set_mode` is allowed while deployment mode is active and the laser path is safe-off. It is blocked while deployment is running, while requests are still staged, while modulation is still active, or while the controller is faulted.
 - In `binary_trigger`, host-owned runtime output commands are rejected. The physical trigger path is the intended owner, but full trigger validation remains blocked until the trigger wiring is source-backed.
 - In `modulated_host`, host-owned runtime output commands are allowed after deployment readiness.
+- `deployment.run` acknowledges start immediately. Terminal success or failure is observed through later status polling and telemetry updates, not by blocking the command response until completion.
+- `deployment` telemetry now carries deployment-v2 truth directly:
+  - `phase`
+  - `readyIdle`
+  - `readyQualified`
+  - `readyInvalidated`
+  - `primaryFailureCode`
+  - `primaryFailureReason`
+  - `secondaryEffects[]`
+  - `readyTruth`
+- Each deployment step now carries `startedAtMs` and `completedAtMs`.
+- `integrate.set_safety` applies runtime safety immediately and also requests device-side persistence so the same thresholds survive reboot and are reused automatically by deployment.
+- `integrate.set_safety` now owns `off_current_threshold_a`; the default is `0.2 A`, and idle bias current below that threshold is treated as intentional in deployment ready-idle posture.
+- STUSB4500 ownership is intentionally narrow:
+  - passive/general firmware reads are allowed for status and deployment qualification
+  - one boot-time firmware reconcile write window only when firmware PDO auto-load-on-mismatch is enabled
+  - explicit Integrate PD actions are the only non-boot path allowed to force refreshes or write STUSB runtime/NVM state
+  - deployment and Operate paths must never trigger explicit STUSB refreshes, soft resets, PDO writes, or NVM writes
 - `enable_alignment` and `disable_alignment` are intentionally rejected in v2 runtime flow. The old host alignment path is no longer the normal runtime authority.
 - While deployment mode is active, bring-up and GPIO-mutating commands stay rejected even if the controller is otherwise online. Read-only status, fault, telemetry, and wireless-management commands remain available.
 - `configure_wireless` accepts `mode:"softap"` or `mode:"station"`. In station mode the host may also provide `ssid` and `password`; if the password is omitted, the controller reuses the saved credential.
-- `i2c_scan`, `i2c_read`, `spi_read`, and `refresh_pd_status` are intentionally allowed outside service mode because they are read-only probes.
+- `i2c_scan`, `i2c_read`, and `spi_read` are intentionally allowed outside service mode because they are read-only probes.
+- `refresh_pd_status` remains an explicit Integrate PD action and is rejected when deployment mode is active.
 - `set_supply_enable` is intentionally separate from beam-control commands. In `SERVICE_MODE`, it only requests the LD or TEC MPM3530 VIN rail while alignment stays off and the laser driver stays in standby.
 - `set_haptic_enable` is intentionally separate from `haptic_debug_config`. It directly controls the dedicated ERM enable line on `GPIO48` during service bring-up so the operator can prove the motor power path independently from DRV2605 register writes.
 - `haptic_external_trigger_pattern` is intentionally hazardous and transient. It is only for bench validation of DRV2605 external-trigger modes and must never hide the fact that `IO37` is a shared `ERM_TRIG / GN_LD_EN` net.
@@ -155,6 +191,7 @@ Current bring-up-specific behavior:
 - `pd_debug_config` now writes the runtime PDO registers, verifies the STUSB4500 readback, and sends a PD soft reset so the source renegotiates against the new PDO set.
 - `pd_save_firmware_plan` first applies the same runtime PDO update, then refreshes live STUSB4500 readback, and only saves the plan into MCU NVS if the live PDO table matches the requested plan.
 - `pd_save_firmware_plan` also stores whether firmware auto-reconcile is enabled. When enabled, the ESP32 compares the saved PDO plan against live STUSB4500 runtime PDO readback when the controller is online and only re-applies it if the chip does not already match.
+- Firmware PDO auto-reconcile is boot-time only. After the boot reconcile window closes, firmware does not revisit STUSB4500 automatically.
 - `pd_burn_nvm` is intentionally a separate command from runtime PDO apply so the host can warn about finite NVM endurance and final-provisioning intent.
 - `pd_burn_nvm` first applies the requested runtime PDOs, refreshes live STUSB4500 readback, aborts if runtime verification fails, then writes the STUSB4500 raw NVM banks and compares raw NVM readback before reporting success.
 - The current implementation preserves non-PDO NVM bytes by reading the full 5-bank map first and only patching the PDO-related fields before writing the full image back.
@@ -358,8 +395,8 @@ Current bring-up-specific behavior:
 
 The bench image now uses two async telemetry tiers:
 
-- `live_telemetry`: the lightweight high-rate stream for UI motion and fast numeric readback. It carries the current `session`, `pd`, `rails`, `imu`, `tof`, `laser`, `tec`, `safety`, `buttons`, compact `bringup` service state, and `fault`.
-- `status_snapshot`: the slower richer snapshot for periodic reconciliation. It still carries identity, GPIO inspector state, haptic peripheral readback, and the compact bring-up status block.
+- `live_telemetry`: the lightweight high-rate stream for UI motion and fast numeric readback. It carries the current `session`, `pd`, `bench`, `rails`, `imu`, `tof`, `laser`, `tec`, `safety`, `buttons`, compact `bringup` service state, deployment state, and split `fault` summary.
+- `status_snapshot`: the slower richer snapshot for periodic reconciliation. It now also carries `bench`, `buttons`, identity, GPIO inspector state, haptic peripheral readback, and the compact bring-up status block.
 
 Representative `live_telemetry` event:
 
@@ -391,7 +428,24 @@ Representative `live_telemetry` event:
         "tof": { "enabled": true, "dutyCyclePct": 35, "frequencyHz": 5000 }
       }
     },
-    "fault": { "latched": false, "activeCode": "none", "activeCount": 0, "tripCounter": 0 }
+    "bench": {
+      "targetMode": "lambda",
+      "runtimeMode": "modulated_host",
+      "requestedAlignmentEnabled": false,
+      "requestedNirEnabled": false,
+      "requestedCurrentA": 0.0,
+      "requestedLedEnabled": false,
+      "requestedLedDutyCyclePct": 0
+    },
+    "fault": {
+      "latched": false,
+      "activeCode": "none",
+      "activeClass": "none",
+      "latchedCode": "none",
+      "latchedClass": "none",
+      "activeCount": 0,
+      "tripCounter": 0
+    }
   }
 }
 ```

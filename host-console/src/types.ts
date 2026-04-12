@@ -85,6 +85,9 @@ export interface PdStatus {
   sinkProfileCount: number
   sinkProfiles: PdSinkProfile[]
   sourceIsHostOnly: boolean
+  lastUpdatedMs: number
+  snapshotFresh: boolean
+  source: 'none' | 'boot_reconcile' | 'integrate_refresh' | 'cached'
 }
 
 export interface WirelessStatus {
@@ -158,7 +161,16 @@ export interface BenchControlStatus {
   runtimeModeSwitchAllowed: boolean
   runtimeModeLockReason: string
   requestedAlignmentEnabled: boolean
+  appliedAlignmentEnabled: boolean
   requestedNirEnabled: boolean
+  requestedCurrentA: number
+  requestedLedEnabled: boolean
+  requestedLedDutyCyclePct: number
+  appliedLedOwner: 'none' | 'integrate_service' | 'operate_runtime' | 'deployment'
+  appliedLedPinHigh: boolean
+  illuminationEnabled: boolean
+  illuminationDutyCyclePct: number
+  illuminationFrequencyHz: number
   modulationEnabled: boolean
   modulationFrequencyHz: number
   modulationDutyCyclePct: number
@@ -169,22 +181,54 @@ export interface DeploymentStep {
   key: string
   label: string
   status: DeploymentStepStatus
+  startedAtMs: number
+  completedAtMs: number
+}
+
+export interface DeploymentSecondaryEffect {
+  code: string
+  reason: string
+  atMs: number
+}
+
+export interface DeploymentReadyTruth {
+  tecRailPgoodRaw: boolean
+  tecRailPgoodFiltered: boolean
+  tecTempGood: boolean
+  tecAnalogPlausible: boolean
+  ldRailPgoodRaw: boolean
+  ldRailPgoodFiltered: boolean
+  driverLoopGood: boolean
+  sbdnHigh: boolean
+  pcnLow: boolean
+  idleBiasCurrentA: number
 }
 
 export interface DeploymentStatus {
   active: boolean
   running: boolean
   ready: boolean
+  readyIdle: boolean
+  readyQualified: boolean
+  readyInvalidated: boolean
   failed: boolean
+  phase: 'inactive' | 'entry' | 'checklist' | 'ready_idle' | 'failed'
+  sequenceId: number
   currentStep: string
+  currentStepIndex: number
   lastCompletedStep: string
+  lastCompletedStepKey: string
   failureCode: string
   failureReason: string
+  primaryFailureCode: string
+  primaryFailureReason: string
+  secondaryEffects: DeploymentSecondaryEffect[]
   targetMode: DeploymentTargetMode
   targetTempC: number
   targetLambdaNm: number
   maxLaserCurrentA: number
   maxOpticalPowerW: number
+  readyTruth: DeploymentReadyTruth
   steps: DeploymentStep[]
 }
 
@@ -381,6 +425,9 @@ export interface BringupStatus {
 export interface FaultSummary {
   latched: boolean
   activeCode: string
+  activeClass: string
+  latchedCode: string
+  latchedClass: string
   activeCount: number
   tripCounter: number
   lastFaultAtIso: string | null
@@ -399,6 +446,9 @@ export interface RealtimePdStatus {
   sourceCurrentA: number
   operatingCurrentA: number
   sourceIsHostOnly: boolean
+  lastUpdatedMs: number
+  snapshotFresh: boolean
+  source: PdStatus['source']
 }
 
 export interface RealtimeSafetyStatus {
@@ -427,22 +477,36 @@ export interface RealtimeDeploymentStatus {
   active: boolean
   running: boolean
   ready: boolean
+  readyIdle: boolean
+  readyQualified: boolean
+  readyInvalidated: boolean
   failed: boolean
+  phase: DeploymentStatus['phase']
+  sequenceId: number
   currentStep: string
+  currentStepIndex: number
   lastCompletedStep: string
+  lastCompletedStepKey: string
   failureCode: string
   failureReason: string
+  primaryFailureCode: string
+  primaryFailureReason: string
+  secondaryEffects: DeploymentSecondaryEffect[]
   targetMode: DeploymentTargetMode
   targetTempC: number
   targetLambdaNm: number
   maxLaserCurrentA: number
   maxOpticalPowerW: number
+  readyTruth: DeploymentReadyTruth
   steps: DeploymentStep[]
 }
 
 export interface RealtimeFaultSummary {
   latched: boolean
   activeCode: string
+  activeClass: string
+  latchedCode: string
+  latchedClass: string
   activeCount: number
   tripCounter: number
 }
@@ -454,6 +518,7 @@ type DeepPartial<T> = {
 export interface RealtimeTelemetry {
   session: RealtimeSessionStatus
   pd: RealtimePdStatus
+  bench: BenchControlStatus
   rails: {
     ld: RailState
     tec: RailState
@@ -497,6 +562,7 @@ export interface SafetyStatus {
   tecMaxCommandC: number
   tecReadyToleranceC: number
   maxLaserCurrentA: number
+  offCurrentThresholdA: number
   actualLambdaNm: number
   targetLambdaNm: number
   lambdaDriftNm: number

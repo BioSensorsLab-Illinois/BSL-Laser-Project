@@ -301,6 +301,7 @@ void laser_controller_safety_evaluate(
         !snapshot->service_mode_active &&
         hw->ld_rail_pgood &&
         !snapshot->driver_operate_expected &&
+        !snapshot->ready_idle_bias_allowed &&
         hw->measured_laser_current_a > config->thresholds.off_current_threshold_a &&
         !decision->request_nir) {
         laser_controller_set_fault(
@@ -332,11 +333,8 @@ void laser_controller_safety_evaluate(
 
     if (!snapshot->boot_complete ||
         (snapshot->fault_latched && !interlocks_disabled) ||
-        !snapshot->deployment_active ||
         snapshot->service_mode_requested ||
-        snapshot->service_mode_active ||
-        (snapshot->deployment_active && !snapshot->deployment_ready) ||
-        snapshot->deployment_running) {
+        snapshot->service_mode_active) {
         decision->allow_alignment = false;
         decision->allow_nir = false;
         decision->alignment_output_enable = false;
@@ -351,6 +349,10 @@ void laser_controller_safety_evaluate(
          (decision->fault_class == LASER_CONTROLLER_FAULT_CLASS_INTERLOCK_AUTO_CLEAR));
 
     decision->allow_nir =
+        snapshot->deployment_active &&
+        snapshot->deployment_ready &&
+        snapshot->deployment_ready_idle &&
+        !snapshot->deployment_running &&
         snapshot->power_tier == LASER_CONTROLLER_POWER_TIER_FULL &&
         !decision->fault_present &&
         (interlocks_disabled ||

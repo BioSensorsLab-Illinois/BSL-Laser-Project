@@ -6,6 +6,21 @@ This is the minimum validation structure needed before any real optical output t
 
 The current repository does not include measured bench data. The “measured result” fields below are placeholders that must be filled from instrumented bench runs.
 
+The active powered-ready rewrite is tracked in `.agent/runs/powered-ready-console/`. Validation for that initiative uses the new command family and requires a real powered-ready deployment bench; a USB-only safe-fail result is not enough.
+
+The repo validation harness is `host-console/scripts/live_controller_validation.py`. It now supports both:
+
+- `--transport serial --port /dev/...`
+- `--transport ws --ws-url ws://192.168.4.1/ws`
+
+The required powered-bench validation passes are:
+
+1. `aux-control-pass`
+2. `ready-runtime-pass`
+3. `fault-edge-pass`
+
+Those three passes are the minimum automated gate for the powered-ready recovery path.
+
 ## Bench Rules
 
 1. First power-up must be with the NIR path physically disconnected or optically terminated.
@@ -24,7 +39,7 @@ The current repository does not include measured bench data. The “measured res
 | --- | --- | --- |
 | Boot with no PD source | MCU up, no LD VIN, no TEC VIN, no beam | pending |
 | Boot with 5 V host only | `PROGRAMMING_ONLY`, no beam | pending |
-| Boot with valid >35 W source | no beam until config + sensors + TEC readiness pass | pending |
+| Boot with valid >35 W source | no beam until config + sensors + TEC readiness pass, then powered-ready deployment may complete | pending |
 | Invalid config on boot | `FAULT_LATCHED`, no beam | implemented in scaffold |
 | Mock IMU stale | fault logged, no beam | pending bench |
 | Mock ToF stale | fault logged, no beam | pending bench |
@@ -64,6 +79,13 @@ The current repository does not include measured bench data. The “measured res
 | Distance too near / too far during NIR active | NIR disabled immediately | TBD |
 | LD overtemp | major fault, rails disabled | TBD |
 | TEC no-settle timeout | no `READY_NIR`, fault or timeout logged | TBD |
+| Deployment ready posture mismatch | deployment terminal state must fail, not report ready | TBD |
+| Ready-idle low-current bias below 0.2 A | no `unexpected_current` fault; ready-idle remains valid | TBD |
+| Integrate safety apply + reboot | thresholds persist across reboot and deployment uses them automatically | TBD |
+| TEC loss after ready | ready clears immediately, LD rail drops safe, failure recorded | TBD |
+| Contradictory TEC telemetry (`PWR_TEC_GOOD` low while `TEMPGD` stays high and analog telemetry looks plausible) | record contradiction or secondary effect; do not report terminal `tec_rail_bad` from a single contradictory sample | TBD |
+| Deployment entry GPIO6 | GPIO6 stays low until the operator explicitly re-enables the LED | TBD |
+| Passive PD only during deployment | deployment may consume passive PD reads, but must not trigger explicit refresh/write ownership (`pd.source` must never flip to `integrate_refresh` or `boot_reconcile` while deployment is active) | TBD |
 | Rail enable asserted but no PGOOD | no beam, fault logged | TBD |
 | Current mismatch | no beam or fault per final policy | TBD |
 | Button stage transitions | exact state transitions with no race leakage | TBD |
@@ -98,4 +120,3 @@ The current repository does not include measured bench data. The “measured res
 4. Calibration write/read/CRC path verified.
 5. Fault recovery policy reviewed and documented.
 6. Independent safety-path audit completed.
-

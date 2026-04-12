@@ -104,12 +104,20 @@ typedef struct {
         pins[LASER_CONTROLLER_BOARD_GPIO_INSPECTOR_PIN_COUNT];
 } laser_controller_board_gpio_inspector_t;
 
+typedef enum {
+    LASER_CONTROLLER_PD_SNAPSHOT_SOURCE_NONE = 0,
+    LASER_CONTROLLER_PD_SNAPSHOT_SOURCE_BOOT_RECONCILE,
+    LASER_CONTROLLER_PD_SNAPSHOT_SOURCE_INTEGRATE_REFRESH,
+    LASER_CONTROLLER_PD_SNAPSHOT_SOURCE_CACHED,
+} laser_controller_pd_snapshot_source_t;
+
 typedef struct {
     bool ld_rail_pgood;
     bool tec_rail_pgood;
     bool ld_telemetry_valid;
     bool tec_telemetry_valid;
     bool pd_contract_valid;
+    bool pd_snapshot_fresh;
     bool pd_source_is_host_only;
     float pd_negotiated_power_w;
     float pd_source_voltage_v;
@@ -117,6 +125,8 @@ typedef struct {
     float pd_operating_current_a;
     uint8_t pd_contract_object_position;
     uint8_t pd_sink_profile_count;
+    laser_controller_time_ms_t pd_last_updated_ms;
+    laser_controller_pd_snapshot_source_t pd_source;
     laser_controller_service_pd_profile_t
         pd_sink_profiles[LASER_CONTROLLER_SERVICE_PD_PROFILE_COUNT];
     bool imu_data_valid;
@@ -177,6 +187,8 @@ esp_err_t laser_controller_board_burn_pd_nvm(
     const laser_controller_service_pd_profile_t *profiles,
     size_t profile_count);
 void laser_controller_board_force_pd_refresh(void);
+void laser_controller_board_force_pd_refresh_with_source(
+    laser_controller_pd_snapshot_source_t source);
 bool laser_controller_board_gpio_inspector_has_pin(uint32_t gpio_num);
 void laser_controller_board_reset_gpio_debug_state(void);
 void laser_controller_board_apply_debug_gpio_state_now(void);
@@ -210,6 +222,10 @@ esp_err_t laser_controller_board_configure_haptic_debug(
     laser_controller_service_haptic_actuator_t actuator,
     uint32_t rtp_level);
 esp_err_t laser_controller_board_set_tof_illumination(
+    bool enabled,
+    uint32_t duty_cycle_pct,
+    uint32_t frequency_hz);
+esp_err_t laser_controller_board_set_runtime_tof_illumination(
     bool enabled,
     uint32_t duty_cycle_pct,
     uint32_t frequency_hz);

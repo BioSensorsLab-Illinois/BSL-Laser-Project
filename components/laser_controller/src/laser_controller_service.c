@@ -996,6 +996,7 @@ static bool laser_controller_service_load_profile_locked(void)
     laser_controller_service_apply_persisted_locked(&profile);
     s_service.status.persistence_dirty = false;
     s_service.status.last_save_ok = true;
+    s_service.status.last_save_at_ms = 0U;
     s_service.status.profile_revision = 1U;
     laser_controller_service_write_action_locked(
         "Stored bring-up profile loaded from NVS.",
@@ -1023,6 +1024,7 @@ static void laser_controller_service_apply_core_preset_locked(const char *profil
     s_service.status.persistence_available = false;
     s_service.status.persistence_dirty = false;
     s_service.status.last_save_ok = false;
+    s_service.status.last_save_at_ms = 0U;
     s_service.status.profile_revision = 1U;
     laser_controller_service_copy_text(
         s_service.status.profile_name,
@@ -2401,6 +2403,7 @@ void laser_controller_service_save_profile(laser_controller_time_ms_t now_ms)
     s_service.status.persistence_available = (err == ESP_OK);
     s_service.status.last_save_ok = (err == ESP_OK);
     s_service.status.persistence_dirty = (err != ESP_OK);
+    s_service.status.last_save_at_ms = err == ESP_OK ? now_ms : 0U;
     laser_controller_service_write_action_locked(
         err == ESP_OK ?
             "Bring-up profile saved to NVS." :

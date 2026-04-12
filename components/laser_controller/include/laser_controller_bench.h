@@ -16,6 +16,9 @@ typedef struct {
     laser_controller_runtime_mode_t runtime_mode;
     bool requested_alignment;
     bool requested_nir;
+    bool illumination_enabled;
+    uint32_t illumination_duty_cycle_pct;
+    uint32_t illumination_frequency_hz;
     bool modulation_enabled;
     uint32_t modulation_frequency_hz;
     uint32_t modulation_duty_cycle_pct;
@@ -33,6 +36,11 @@ void laser_controller_bench_set_alignment_requested(
     laser_controller_time_ms_t now_ms);
 void laser_controller_bench_set_nir_requested(
     bool enable,
+    laser_controller_time_ms_t now_ms);
+void laser_controller_bench_set_illumination(
+    bool enable,
+    uint32_t duty_cycle_pct,
+    uint32_t frequency_hz,
     laser_controller_time_ms_t now_ms);
 void laser_controller_bench_set_laser_current_a(
     const laser_controller_config_t *config,

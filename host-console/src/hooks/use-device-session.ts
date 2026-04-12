@@ -345,11 +345,13 @@ type PendingCommandAck = {
 
 function readStoredTransportKind(): TransportKind {
   if (typeof window === 'undefined') {
-    return 'mock'
+    return 'wifi'
   }
 
   const stored = window.localStorage.getItem(HOST_TRANSPORT_KIND_STORAGE_KEY)
-  return stored === 'serial' || stored === 'wifi' ? stored : 'mock'
+  return stored === 'serial' || stored === 'wifi' || stored === 'mock'
+    ? stored
+    : 'wifi'
 }
 
 function readStoredSerialReconnect(): boolean {
@@ -441,6 +443,9 @@ function makeSeedSnapshot(): DeviceSnapshot {
       sinkProfileCount: 0,
       sinkProfiles: [],
       sourceIsHostOnly: false,
+      lastUpdatedMs: 0,
+      snapshotFresh: false,
+      source: 'none',
     },
     rails: {
       ld: { enabled: false, pgood: false },
@@ -581,6 +586,7 @@ function makeSeedSnapshot(): DeviceSnapshot {
       tecMaxCommandC: 35,
       tecReadyToleranceC: 0.25,
       maxLaserCurrentA: 5,
+      offCurrentThresholdA: 0.2,
       actualLambdaNm: 785,
       targetLambdaNm: 785,
       lambdaDriftNm: 0,
@@ -591,21 +597,46 @@ function makeSeedSnapshot(): DeviceSnapshot {
       active: false,
       running: false,
       ready: false,
+      readyIdle: false,
+      readyQualified: false,
+      readyInvalidated: false,
       failed: false,
+      phase: 'inactive',
+      sequenceId: 0,
       currentStep: 'none',
+      currentStepIndex: 0,
       lastCompletedStep: 'none',
+      lastCompletedStepKey: 'none',
       failureCode: 'none',
       failureReason: '',
+      primaryFailureCode: 'none',
+      primaryFailureReason: '',
+      secondaryEffects: [],
       targetMode: 'temp',
       targetTempC: 25,
       targetLambdaNm: 785,
       maxLaserCurrentA: 5,
       maxOpticalPowerW: 5,
+      readyTruth: {
+        tecRailPgoodRaw: false,
+        tecRailPgoodFiltered: false,
+        tecTempGood: false,
+        tecAnalogPlausible: false,
+        ldRailPgoodRaw: false,
+        ldRailPgoodFiltered: false,
+        driverLoopGood: false,
+        sbdnHigh: false,
+        pcnLow: false,
+        idleBiasCurrentA: 0,
+      },
       steps: [],
     },
     fault: {
       latched: false,
       activeCode: 'none',
+      activeClass: 'none',
+      latchedCode: 'none',
+      latchedClass: 'none',
       activeCount: 0,
       tripCounter: 0,
       lastFaultAtIso: null,

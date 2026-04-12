@@ -1037,7 +1037,7 @@ export function ControlWorkbench({
             </span>
             <span className={liveSnapshot.fault.latched ? 'status-badge is-critical' : 'status-badge is-on'}>
               <ShieldAlert size={14} />
-              Fault {liveSnapshot.fault.latched ? liveSnapshot.fault.activeCode : liveSnapshot.fault.activeCode === 'none' ? 'clear' : liveSnapshot.fault.activeCode}
+              Fault {liveSnapshot.fault.latched ? liveSnapshot.fault.latchedCode : liveSnapshot.fault.activeCode === 'none' ? 'clear' : liveSnapshot.fault.activeCode}
             </span>
           </div>
         </article>

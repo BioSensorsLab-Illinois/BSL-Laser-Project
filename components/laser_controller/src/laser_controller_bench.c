@@ -5,13 +5,14 @@
 
 #include "freertos/FreeRTOS.h"
 
-#define LASER_CONTROLLER_BENCH_MAX_CURRENT_A          5.0f
+#define LASER_CONTROLLER_BENCH_MAX_CURRENT_A          5.2f
 #define LASER_CONTROLLER_BENCH_MIN_TEMP_C             5.0f
 #define LASER_CONTROLLER_BENCH_MAX_TEMP_C             65.0f
 #define LASER_CONTROLLER_BENCH_MIN_LAMBDA_NM          771.2f
 #define LASER_CONTROLLER_BENCH_MAX_LAMBDA_NM          790.0f
 #define LASER_CONTROLLER_BENCH_DEFAULT_TARGET_TEMP_C  25.0f
 #define LASER_CONTROLLER_BENCH_DEFAULT_TARGET_LAMBDA  785.0f
+#define LASER_CONTROLLER_BENCH_DEFAULT_LED_PWM_HZ     20000U
 #define LASER_CONTROLLER_BENCH_DEFAULT_PWM_HZ         2000U
 #define LASER_CONTROLLER_BENCH_DEFAULT_PWM_DUTY       50U
 #define LASER_CONTROLLER_BENCH_MIN_PWM_HZ             0U
@@ -129,6 +130,8 @@ void laser_controller_bench_init_defaults(void)
     memset(&s_bench_status, 0, sizeof(s_bench_status));
     s_bench_status.target_mode = LASER_CONTROLLER_BENCH_TARGET_MODE_LAMBDA;
     s_bench_status.runtime_mode = LASER_CONTROLLER_RUNTIME_MODE_MODULATED_HOST;
+    s_bench_status.illumination_frequency_hz =
+        LASER_CONTROLLER_BENCH_DEFAULT_LED_PWM_HZ;
     s_bench_status.modulation_frequency_hz = LASER_CONTROLLER_BENCH_DEFAULT_PWM_HZ;
     s_bench_status.modulation_duty_cycle_pct = LASER_CONTROLLER_BENCH_DEFAULT_PWM_DUTY;
     s_bench_status.target_temp_c = LASER_CONTROLLER_BENCH_DEFAULT_TARGET_TEMP_C;
@@ -153,6 +156,8 @@ void laser_controller_bench_clear_requests(laser_controller_time_ms_t now_ms)
     portENTER_CRITICAL(&s_bench_lock);
     s_bench_status.requested_alignment = false;
     s_bench_status.requested_nir = false;
+    s_bench_status.illumination_enabled = false;
+    s_bench_status.illumination_duty_cycle_pct = 0U;
     portEXIT_CRITICAL(&s_bench_lock);
 }
 
@@ -179,6 +184,25 @@ void laser_controller_bench_set_nir_requested(
     if (enable) {
         s_bench_status.requested_alignment = false;
     }
+    portEXIT_CRITICAL(&s_bench_lock);
+}
+
+void laser_controller_bench_set_illumination(
+    bool enable,
+    uint32_t duty_cycle_pct,
+    uint32_t frequency_hz,
+    laser_controller_time_ms_t now_ms)
+{
+    (void)now_ms;
+    portENTER_CRITICAL(&s_bench_lock);
+    s_bench_status.illumination_enabled = enable && duty_cycle_pct > 0U;
+    s_bench_status.illumination_duty_cycle_pct = laser_controller_bench_clamp_u32(
+        duty_cycle_pct,
+        0U,
+        100U);
+    s_bench_status.illumination_frequency_hz =
+        frequency_hz > 0U ? frequency_hz :
+            LASER_CONTROLLER_BENCH_DEFAULT_LED_PWM_HZ;
     portEXIT_CRITICAL(&s_bench_lock);
 }
 

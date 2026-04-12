@@ -62,6 +62,9 @@ type MockState = {
   safety: DeviceSnapshot['safety']
   bringup: DeviceSnapshot['bringup']
   deployment: DeviceSnapshot['deployment']
+  deploymentStepIndex: number
+  deploymentStepElapsedS: number
+  deploymentPlannedFailure: 'none' | 'pd_insufficient'
   gpioInspector: DeviceSnapshot['gpioInspector']
   wireless: DeviceSnapshot['wireless']
 }
@@ -128,6 +131,8 @@ function makeDefaultDeploymentSteps(): DeviceSnapshot['deployment']['steps'] {
     key: `step_${index + 1}`,
     label,
     status: 'inactive',
+    startedAtMs: 0,
+    completedAtMs: 0,
   }))
 }
 
@@ -302,7 +307,8 @@ export class MockTransport implements DeviceTransport {
       tecMinCommandC: 15,
       tecMaxCommandC: 35,
       tecReadyToleranceC: 0.25,
-      maxLaserCurrentA: 5,
+      maxLaserCurrentA: 5.2,
+      offCurrentThresholdA: 0.2,
       actualLambdaNm: 786.1,
       targetLambdaNm: 786.1,
       lambdaDriftNm: 0,
@@ -313,18 +319,43 @@ export class MockTransport implements DeviceTransport {
       active: false,
       running: false,
       ready: false,
+      readyIdle: false,
+      readyQualified: false,
+      readyInvalidated: false,
       failed: false,
+      phase: 'inactive',
+      sequenceId: 0,
       currentStep: 'none',
+      currentStepIndex: 0,
       lastCompletedStep: 'none',
+      lastCompletedStepKey: 'none',
       failureCode: 'none',
       failureReason: '',
+      primaryFailureCode: 'none',
+      primaryFailureReason: '',
+      secondaryEffects: [],
       targetMode: 'temp',
       targetTempC: 25,
       targetLambdaNm: 785,
-      maxLaserCurrentA: 5,
+      maxLaserCurrentA: 5.2,
       maxOpticalPowerW: 5,
+      readyTruth: {
+        tecRailPgoodRaw: false,
+        tecRailPgoodFiltered: false,
+        tecTempGood: false,
+        tecAnalogPlausible: false,
+        ldRailPgoodRaw: false,
+        ldRailPgoodFiltered: false,
+        driverLoopGood: false,
+        sbdnHigh: false,
+        pcnLow: false,
+        idleBiasCurrentA: 0,
+      },
       steps: makeDefaultDeploymentSteps(),
     },
+    deploymentStepIndex: -1,
+    deploymentStepElapsedS: 0,
+    deploymentPlannedFailure: 'none',
     gpioInspector: makeDefaultGpioInspectorStatus(),
     wireless: {
       started: false,
@@ -416,9 +447,11 @@ export class MockTransport implements DeviceTransport {
 
     switch (command.cmd) {
       case 'get_status':
+      case 'status.get':
       case 'get_faults':
         break
       case 'enter_deployment_mode':
+      case 'deployment.enter':
         this.state.serviceMode = false
         this.state.bringup.serviceModeRequested = false
         this.state.bringup.serviceModeActive = false
@@ -443,8 +476,12 @@ export class MockTransport implements DeviceTransport {
           failureReason: '',
           steps: makeDefaultDeploymentSteps(),
         }
+        this.state.deploymentStepIndex = -1
+        this.state.deploymentStepElapsedS = 0
+        this.state.deploymentPlannedFailure = 'none'
         break
       case 'set_runtime_mode':
+      case 'operate.set_mode':
         if (
           command.args?.mode !== 'binary_trigger' &&
           command.args?.mode !== 'modulated_host'
@@ -473,6 +510,7 @@ export class MockTransport implements DeviceTransport {
         }
         break
       case 'exit_deployment_mode':
+      case 'deployment.exit':
         this.state.deployment = {
           ...this.state.deployment,
           active: false,
@@ -485,63 +523,37 @@ export class MockTransport implements DeviceTransport {
           failureReason: '',
           steps: makeDefaultDeploymentSteps(),
         }
+        this.state.deploymentStepIndex = -1
+        this.state.deploymentStepElapsedS = 0
+        this.state.deploymentPlannedFailure = 'none'
         break
-      case 'run_deployment_sequence': {
+      case 'run_deployment_sequence':
+      case 'deployment.run': {
         const hostOnly = this.state.powerTier === 'programming_only' && this.state.pdPowerW <= 5.1
-        const reserveBudgetW = this.state.pdPowerW - 20
-        const cappedCurrentA = Math.max(
-          0,
-          Math.min(this.state.safety.maxLaserCurrentA, (reserveBudgetW * 0.9) / 3),
-        )
-        const steps: DeviceSnapshot['deployment']['steps'] = makeDefaultDeploymentSteps().map((step) => ({
-          ...step,
-          status: 'passed',
-        }))
-        let failureCode = 'none'
-        let failureReason = ''
-        let ready = true
-
-        if (hostOnly) {
-          ready = false
-          failureCode = 'pd_lost'
-          failureReason = 'Valid PD source with at least 9 V was not present.'
-          steps[1].status = 'failed'
-          for (let index = 2; index < steps.length; index += 1) {
-            steps[index].status = 'pending'
-          }
-        } else if (this.state.pdPowerW < 40 && cappedCurrentA <= 0) {
-          ready = false
-          failureCode = 'pd_insufficient'
-          failureReason = 'Deployment PD budget left no laser operating headroom.'
-          steps[2].status = 'failed'
-          for (let index = 3; index < steps.length; index += 1) {
-            steps[index].status = 'pending'
-          }
-        }
-
         this.state.deployment = {
           ...this.state.deployment,
           active: true,
-          running: false,
-          ready,
-          failed: !ready,
-          currentStep: 'none',
-          lastCompletedStep: ready ? 'ready_posture' : hostOnly ? 'ownership_reclaim' : 'pd_inspect',
-          failureCode,
-          failureReason,
-          maxLaserCurrentA: ready
-            ? (this.state.pdPowerW < 40 ? cappedCurrentA : this.state.safety.maxLaserCurrentA)
-            : 0,
-          maxOpticalPowerW: ready
-            ? (this.state.pdPowerW < 40 ? cappedCurrentA : this.state.safety.maxLaserCurrentA)
-            : 0,
-          steps,
+          running: true,
+          ready: false,
+          failed: false,
+          currentStep: 'ownership_reclaim',
+          lastCompletedStep: 'none',
+          failureCode: 'none',
+          failureReason: '',
+          maxLaserCurrentA: 0,
+          maxOpticalPowerW: 0,
+          steps: makeDefaultDeploymentSteps().map((step, index) => ({
+            ...step,
+            status: index === 0 ? 'in_progress' : 'pending',
+          })),
         }
-        this.state.systemState = ready ? 'READY_NIR' : 'PROGRAMMING_ONLY'
-        this.state.tecSettlingTicks = ready ? 0 : this.state.tecSettlingTicks
+        this.state.deploymentStepIndex = 0
+        this.state.deploymentStepElapsedS = 0
+        this.state.deploymentPlannedFailure = hostOnly ? 'pd_insufficient' : 'none'
         break
       }
       case 'set_deployment_target':
+      case 'deployment.set_target':
         if (typeof command.args?.temp_c === 'number') {
           this.state.targetTempC = clampTecTempC(command.args.temp_c)
           this.state.targetLambdaNm = estimateWavelengthFromTempC(this.state.targetTempC)
@@ -631,10 +643,21 @@ export class MockTransport implements DeviceTransport {
         })
         break
       case 'enable_alignment':
+        if (this.state.deployment.ready) {
+          this.state.alignmentRequested = true
+          this.state.laserRequested = false
+        }
+        break
       case 'disable_alignment':
-        ackOk = false
-        ackNote =
-          'Host alignment requests are disabled in v2. The binary trigger path is reserved for the physical trigger hardware and remains blocked until that wiring is source-backed.'
+        this.state.alignmentRequested = false
+        break
+      case 'operate.set_alignment':
+        if (typeof command.args?.enabled === 'boolean') {
+          this.state.alignmentRequested = command.args.enabled && this.state.deployment.ready
+          if (this.state.alignmentRequested) {
+            this.state.laserRequested = false
+          }
+        }
         break
       case 'set_target_temp':
         if (typeof command.args?.temp_c === 'number' && this.state.deployment.ready) {
@@ -645,6 +668,31 @@ export class MockTransport implements DeviceTransport {
           this.state.deployment.targetTempC = this.state.targetTempC
           this.state.deployment.targetLambdaNm = this.state.targetLambdaNm
           this.state.tecSettlingTicks = 8
+        }
+        if (
+          typeof command.args?.temp_c === 'number' &&
+          this.state.deployment.ready
+        ) {
+          break
+        }
+        break
+      case 'operate.set_target':
+        if (typeof command.args?.temp_c === 'number' && this.state.deployment.ready) {
+          this.state.targetTempC = clampTecTempC(command.args.temp_c)
+          this.state.targetLambdaNm = estimateWavelengthFromTempC(this.state.targetTempC)
+          this.state.targetMode = 'temp'
+          this.state.deployment.targetMode = 'temp'
+          this.state.deployment.targetTempC = this.state.targetTempC
+          this.state.deployment.targetLambdaNm = this.state.targetLambdaNm
+          this.state.tecSettlingTicks = 8
+        } else if (typeof command.args?.lambda_nm === 'number' && this.state.deployment.ready) {
+          this.state.targetLambdaNm = clampTecWavelengthNm(command.args.lambda_nm)
+          this.state.targetTempC = estimateTempFromWavelengthNm(this.state.targetLambdaNm)
+          this.state.targetMode = 'lambda'
+          this.state.deployment.targetMode = 'lambda'
+          this.state.deployment.targetTempC = this.state.targetTempC
+          this.state.deployment.targetLambdaNm = this.state.targetLambdaNm
+          this.state.tecSettlingTicks = 10
         }
         break
       case 'set_target_lambda':
@@ -679,8 +727,47 @@ export class MockTransport implements DeviceTransport {
           )
         }
         break
+      case 'operate.set_output':
+        if (this.state.runtimeMode !== 'modulated_host') {
+          ackOk = false
+          ackNote =
+            'Host runtime output control is only available in modulated_host mode.'
+          break
+        }
+        if (typeof command.args?.current_a === 'number' && this.state.deployment.ready) {
+          this.state.laserHighCurrentA = clamp(
+            command.args.current_a,
+            0,
+            this.state.deployment.maxLaserCurrentA || this.state.safety.maxLaserCurrentA,
+          )
+        }
+        if (typeof command.args?.enabled === 'boolean') {
+          this.state.laserRequested = command.args.enabled && this.state.deployment.ready
+        }
+        break
+      case 'operate.set_led':
+        if (typeof command.args?.enabled === 'boolean') {
+          this.state.bringup.illumination.tof.enabled =
+            command.args.enabled && this.state.deployment.ready
+        }
+        if (typeof command.args?.duty_cycle_pct === 'number') {
+          this.state.bringup.illumination.tof.dutyCyclePct = clamp(
+            command.args.duty_cycle_pct,
+            0,
+            100,
+          )
+        }
+        if (typeof command.args?.frequency_hz === 'number') {
+          this.state.bringup.illumination.tof.frequencyHz = clamp(
+            command.args.frequency_hz,
+            5000,
+            100000,
+          )
+        }
+        break
       case 'set_runtime_safety':
       case 'set_deployment_safety':
+      case 'integrate.set_safety':
         if (typeof command.args?.horizon_threshold_deg === 'number') {
           this.state.safety.horizonThresholdDeg = command.args.horizon_threshold_deg
         }
@@ -754,6 +841,10 @@ export class MockTransport implements DeviceTransport {
             this.state.safety.maxLaserCurrentA,
           )
           this.state.deployment.maxOpticalPowerW = this.state.deployment.maxLaserCurrentA
+        }
+        if (command.cmd === 'integrate.set_safety') {
+          this.state.bringup.persistenceDirty = false
+          this.state.bringup.lastSaveOk = true
         }
         break
       case 'pd_debug_config':
@@ -916,6 +1007,7 @@ export class MockTransport implements DeviceTransport {
         this.state.laserRequested = false
         break
       case 'configure_modulation':
+      case 'operate.set_modulation':
         if (this.state.runtimeMode !== 'modulated_host') {
           ackOk = false
           ackNote =
@@ -1092,6 +1184,7 @@ export class MockTransport implements DeviceTransport {
           'All GPIO overrides cleared in the mock controller.'
         break
       case 'save_bringup_profile':
+      case 'integrate.save_profile':
         this.state.bringup.lastSaveOk = false
         this.state.bringup.persistenceDirty = true
         this.state.bringup.tools.lastAction =
@@ -1340,6 +1433,84 @@ export class MockTransport implements DeviceTransport {
   private tick(deltaSeconds: number): void {
     const previousUptimeSeconds = this.state.uptimeSeconds
     this.state.uptimeSeconds += deltaSeconds
+
+    if (this.state.deployment.active && this.state.deployment.running) {
+      this.state.deploymentStepElapsedS += deltaSeconds
+
+      if (this.state.deploymentStepElapsedS >= 0.8) {
+        const steps = this.state.deployment.steps.map((step) => ({ ...step }))
+        const currentIndex = this.state.deploymentStepIndex
+        const currentStep = steps[currentIndex]
+
+        this.state.deploymentStepElapsedS = 0
+
+        if (currentStep !== undefined) {
+          if (
+            this.state.deploymentPlannedFailure === 'pd_insufficient' &&
+            currentIndex === 1
+          ) {
+            currentStep.status = 'failed'
+            this.state.deployment = {
+              ...this.state.deployment,
+              running: false,
+              ready: false,
+              failed: true,
+              currentStep: 'none',
+              lastCompletedStep: 'ownership_reclaim',
+              failureCode: 'pd_insufficient',
+              failureReason: 'Valid PD source with at least 9 V was not present.',
+              maxLaserCurrentA: 0,
+              maxOpticalPowerW: 0,
+              steps,
+            }
+            this.state.deploymentStepIndex = -1
+            this.state.systemState = 'PROGRAMMING_ONLY'
+          } else {
+            currentStep.status = 'passed'
+            const nextIndex = currentIndex + 1
+
+            if (nextIndex >= steps.length) {
+              const reserveBudgetW = this.state.pdPowerW - 20
+              const cappedCurrentA = Math.max(
+                0,
+                Math.min(this.state.safety.maxLaserCurrentA, (reserveBudgetW * 0.9) / 3),
+              )
+
+              this.state.deployment = {
+                ...this.state.deployment,
+                running: false,
+                ready: true,
+                failed: false,
+                currentStep: 'none',
+                lastCompletedStep: 'ready_posture',
+                failureCode: 'none',
+                failureReason: '',
+                maxLaserCurrentA:
+                  this.state.pdPowerW < 40 ? cappedCurrentA : this.state.safety.maxLaserCurrentA,
+                maxOpticalPowerW:
+                  this.state.pdPowerW < 40 ? cappedCurrentA : this.state.safety.maxLaserCurrentA,
+                steps,
+              }
+              this.state.deploymentStepIndex = -1
+              this.state.tecSettlingTicks = 0
+              this.state.systemState = 'READY_NIR'
+            } else {
+              steps[nextIndex] = {
+                ...steps[nextIndex],
+                status: 'in_progress',
+              }
+              this.state.deployment = {
+                ...this.state.deployment,
+                currentStep: steps[nextIndex].key,
+                lastCompletedStep: currentStep.key,
+                steps,
+              }
+              this.state.deploymentStepIndex = nextIndex
+            }
+          }
+        }
+      }
+    }
 
     if (this.state.systemState === 'BOOT_INIT') {
       if (this.state.tecSettlingTicks > 0) {
@@ -1764,6 +1935,9 @@ export class MockTransport implements DeviceTransport {
         sinkProfileCount: pdContract.sinkProfileCount,
         sinkProfiles: pdContract.sinkProfiles,
         sourceIsHostOnly: hostOnly,
+        lastUpdatedMs: Math.round(this.state.uptimeSeconds * 1000),
+        snapshotFresh: !this.state.deployment.active,
+        source: this.state.deployment.active ? 'cached' : 'integrate_refresh',
       },
       rails: {
         ld: {
@@ -1908,6 +2082,10 @@ export class MockTransport implements DeviceTransport {
         runtimeModeLockReason: runtimeModeLock ?? '',
         requestedAlignmentEnabled: this.state.alignmentRequested,
         requestedNirEnabled: this.state.laserRequested,
+        requestedCurrentA: this.state.laserHighCurrentA,
+        illuminationEnabled: this.state.bringup.illumination.tof.enabled,
+        illuminationDutyCyclePct: this.state.bringup.illumination.tof.dutyCyclePct,
+        illuminationFrequencyHz: this.state.bringup.illumination.tof.frequencyHz,
         modulationEnabled: this.state.modulationEnabled,
         modulationFrequencyHz: this.state.modulationFrequencyHz,
         modulationDutyCyclePct: this.state.modulationDutyCyclePct,
@@ -1949,6 +2127,9 @@ export class MockTransport implements DeviceTransport {
       fault: {
         latched: this.state.faultLatched,
         activeCode: activeFaultCode,
+        activeClass: this.state.faultLatched ? 'system_major' : 'none',
+        latchedCode: this.state.faultLatched ? activeFaultCode : 'none',
+        latchedClass: this.state.faultLatched ? 'system_major' : 'none',
         activeCount: this.state.faultCount,
         tripCounter: this.state.tripCounter,
         lastFaultAtIso: this.state.lastFaultAtIso,

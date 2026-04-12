@@ -130,6 +130,7 @@ typedef struct {
     bool persistence_dirty;
     bool persistence_available;
     bool last_save_ok;
+    laser_controller_time_ms_t last_save_at_ms;
     uint32_t profile_revision;
     char profile_name[LASER_CONTROLLER_SERVICE_PROFILE_NAME_LEN];
     bool ld_rail_debug_enabled;

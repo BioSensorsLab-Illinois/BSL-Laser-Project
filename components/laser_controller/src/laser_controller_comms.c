@@ -123,6 +123,8 @@ laser_controller_comms_find_gpio_pin(
     uint32_t gpio_num);
 static bool laser_controller_comms_driver_standby_effective(
     const laser_controller_runtime_status_t *status);
+static const char *laser_controller_comms_runtime_mode_switch_block_reason(
+    const laser_controller_runtime_status_t *status);
 
 static void laser_controller_comms_output_lock(void)
 {
@@ -330,6 +332,22 @@ static laser_controller_nm_t laser_controller_comms_actual_lambda_nm(
         status->inputs.tec_temp_c);
 }
 
+static const char *laser_controller_comms_pd_snapshot_source_name(
+    laser_controller_pd_snapshot_source_t source)
+{
+    switch (source) {
+        case LASER_CONTROLLER_PD_SNAPSHOT_SOURCE_BOOT_RECONCILE:
+            return "boot_reconcile";
+        case LASER_CONTROLLER_PD_SNAPSHOT_SOURCE_INTEGRATE_REFRESH:
+            return "integrate_refresh";
+        case LASER_CONTROLLER_PD_SNAPSHOT_SOURCE_CACHED:
+            return "cached";
+        case LASER_CONTROLLER_PD_SNAPSHOT_SOURCE_NONE:
+        default:
+            return "none";
+    }
+}
+
 static float laser_controller_comms_lambda_drift_nm(
     const laser_controller_runtime_status_t *status)
 {
@@ -394,6 +412,46 @@ static const char *laser_controller_comms_power_tier_name(
         default:
             return "invalid";
     }
+}
+
+static const char *laser_controller_comms_led_owner_name(
+    const laser_controller_runtime_status_t *status)
+{
+    const laser_controller_board_gpio_pin_readback_t *pin = NULL;
+
+    if (status == NULL) {
+        return "none";
+    }
+
+    if (status->bringup.service_mode_requested &&
+        status->bringup.tof_illumination_enabled) {
+        return "integrate_service";
+    }
+
+    if (status->bench.illumination_enabled) {
+        return "operate_runtime";
+    }
+
+    pin = laser_controller_comms_find_gpio_pin(
+        status,
+        LASER_CONTROLLER_GPIO_TOF_LED_CTRL);
+    if (status->deployment.active &&
+        pin != NULL &&
+        !pin->level_high) {
+        return "deployment";
+    }
+
+    return "none";
+}
+
+static bool laser_controller_comms_gpio_pin_high(
+    const laser_controller_runtime_status_t *status,
+    uint32_t gpio_num)
+{
+    const laser_controller_board_gpio_pin_readback_t *pin =
+        laser_controller_comms_find_gpio_pin(status, gpio_num);
+
+    return pin != NULL && pin->level_high;
 }
 
 static const char *laser_controller_comms_reset_reason_name(esp_reset_reason_t reason)
@@ -604,6 +662,125 @@ static uint32_t laser_controller_comms_encode_button_flags(
     }
 
     return flags;
+}
+
+static void laser_controller_comms_write_button_state_json(
+    laser_controller_comms_buffer_t *buffer,
+    const laser_controller_runtime_status_t *status)
+{
+    if (buffer == NULL || status == NULL) {
+        return;
+    }
+
+    laser_controller_comms_buffer_append_fmt(
+        buffer,
+        "\"buttons\":{\"stage1Pressed\":%s,\"stage2Pressed\":%s,\"stage1Edge\":%s,\"stage2Edge\":%s},",
+        status->inputs.button.stage1_pressed ? "true" : "false",
+        status->inputs.button.stage2_pressed ? "true" : "false",
+        status->inputs.button.stage1_edge ? "true" : "false",
+        status->inputs.button.stage2_edge ? "true" : "false");
+}
+
+static void laser_controller_comms_write_bench_json(
+    laser_controller_comms_buffer_t *buffer,
+    const laser_controller_runtime_status_t *status)
+{
+    const char *runtime_mode_lock_reason =
+        laser_controller_comms_runtime_mode_switch_block_reason(status);
+
+    if (buffer == NULL || status == NULL) {
+        return;
+    }
+
+    laser_controller_comms_buffer_append_raw(buffer, "\"bench\":{");
+    laser_controller_comms_buffer_append_raw(buffer, "\"targetMode\":");
+    laser_controller_comms_write_escaped_string(
+        buffer,
+        laser_controller_bench_target_mode_name(status->bench.target_mode));
+    laser_controller_comms_buffer_append_fmt(buffer, ",\"runtimeMode\":");
+    laser_controller_comms_write_escaped_string(
+        buffer,
+        laser_controller_runtime_mode_name(status->bench.runtime_mode));
+    laser_controller_comms_buffer_append_fmt(
+        buffer,
+        ",\"runtimeModeSwitchAllowed\":%s,\"runtimeModeLockReason\":",
+        runtime_mode_lock_reason == NULL ? "true" : "false");
+    laser_controller_comms_write_escaped_string(
+        buffer,
+        runtime_mode_lock_reason != NULL ? runtime_mode_lock_reason : "");
+    laser_controller_comms_buffer_append_fmt(
+        buffer,
+        ",\"requestedAlignmentEnabled\":%s,\"appliedAlignmentEnabled\":%s,\"requestedNirEnabled\":%s,\"requestedCurrentA\":%.3f,\"requestedLedEnabled\":%s,\"requestedLedDutyCyclePct\":%lu,\"appliedLedOwner\":",
+        status->bench.requested_alignment ? "true" : "false",
+        status->outputs.enable_alignment_laser ? "true" : "false",
+        status->bench.requested_nir ? "true" : "false",
+        status->bench.high_state_current_a,
+        status->bench.illumination_enabled ? "true" : "false",
+        (unsigned long)status->bench.illumination_duty_cycle_pct);
+    laser_controller_comms_write_escaped_string(
+        buffer,
+        laser_controller_comms_led_owner_name(status));
+    laser_controller_comms_buffer_append_fmt(
+        buffer,
+        ",\"appliedLedPinHigh\":%s,\"illuminationEnabled\":%s,\"illuminationDutyCyclePct\":%lu,\"illuminationFrequencyHz\":%lu,\"modulationEnabled\":%s,\"modulationFrequencyHz\":%lu,\"modulationDutyCyclePct\":%lu,\"lowStateCurrentA\":%.3f}",
+        laser_controller_comms_gpio_pin_high(
+            status,
+            LASER_CONTROLLER_GPIO_TOF_LED_CTRL) ? "true" : "false",
+        status->bench.illumination_enabled ? "true" : "false",
+        (unsigned long)status->bench.illumination_duty_cycle_pct,
+        (unsigned long)status->bench.illumination_frequency_hz,
+        status->bench.modulation_enabled ? "true" : "false",
+        (unsigned long)status->bench.modulation_frequency_hz,
+        (unsigned long)status->bench.modulation_duty_cycle_pct,
+        status->bench.low_state_current_a);
+}
+
+static void laser_controller_comms_write_fault_json(
+    laser_controller_comms_buffer_t *buffer,
+    const laser_controller_runtime_status_t *status,
+    bool include_counters)
+{
+    if (buffer == NULL || status == NULL) {
+        return;
+    }
+
+    laser_controller_comms_buffer_append_fmt(
+        buffer,
+        "\"fault\":{\"latched\":%s,\"activeCode\":",
+        status->fault_latched ? "true" : "false");
+    laser_controller_comms_write_escaped_string(
+        buffer,
+        laser_controller_fault_code_name(status->active_fault_code));
+    laser_controller_comms_buffer_append_raw(buffer, ",\"activeClass\":");
+    laser_controller_comms_write_escaped_string(
+        buffer,
+        laser_controller_fault_class_name(status->active_fault_class));
+    laser_controller_comms_buffer_append_raw(buffer, ",\"latchedCode\":");
+    laser_controller_comms_write_escaped_string(
+        buffer,
+        laser_controller_fault_code_name(status->latched_fault_code));
+    laser_controller_comms_buffer_append_raw(buffer, ",\"latchedClass\":");
+    laser_controller_comms_write_escaped_string(
+        buffer,
+        laser_controller_fault_class_name(status->latched_fault_class));
+
+    if (!include_counters) {
+        laser_controller_comms_buffer_append_raw(buffer, "}");
+        return;
+    }
+
+    laser_controller_comms_buffer_append_fmt(
+        buffer,
+        ",\"activeCount\":%lu,\"tripCounter\":%lu,",
+        (unsigned long)status->active_fault_count,
+        (unsigned long)status->trip_counter);
+    if (status->last_fault_ms == 0U) {
+        laser_controller_comms_buffer_append_raw(buffer, "\"lastFaultAtIso\":null}");
+    } else {
+        laser_controller_comms_buffer_append_raw(
+            buffer,
+            "\"lastFaultAtIso\":\"1970-01-01T00:00:00Z\"}");
+    }
 }
 
 static void laser_controller_comms_write_module_json(
@@ -1426,11 +1603,21 @@ static bool laser_controller_comms_is_runtime_control_command(const char *comman
             strcmp(command, "set_max_current") == 0 ||
             strcmp(command, "set_target_temp") == 0 ||
             strcmp(command, "set_target_lambda") == 0 ||
-            strcmp(command, "enable_alignment") == 0 ||
-            strcmp(command, "disable_alignment") == 0 ||
+            strcmp(command, "operate.set_target") == 0 ||
+            strcmp(command, "operate.set_output") == 0 ||
+            strcmp(command, "operate.set_modulation") == 0 ||
             strcmp(command, "laser_output_enable") == 0 ||
             strcmp(command, "laser_output_disable") == 0 ||
             strcmp(command, "configure_modulation") == 0);
+}
+
+static bool laser_controller_comms_is_aux_control_command(const char *command)
+{
+    return command != NULL &&
+           (strcmp(command, "operate.set_alignment") == 0 ||
+            strcmp(command, "operate.set_led") == 0 ||
+            strcmp(command, "enable_alignment") == 0 ||
+            strcmp(command, "disable_alignment") == 0);
 }
 
 static bool laser_controller_comms_runtime_mode_is_modulated_host(
@@ -1703,7 +1890,46 @@ static void laser_controller_comms_write_deployment_steps_json(
             buffer,
             laser_controller_deployment_step_status_name(
                 status->deployment.step_status[index]));
+        laser_controller_comms_buffer_append_fmt(
+            buffer,
+            ",\"startedAtMs\":%lu,\"completedAtMs\":%lu",
+            (unsigned long)status->deployment.step_started_at_ms[index],
+            (unsigned long)status->deployment.step_completed_at_ms[index]);
         laser_controller_comms_buffer_append_raw(buffer, "}");
+    }
+    laser_controller_comms_buffer_append_raw(buffer, "]");
+}
+
+static void laser_controller_comms_write_deployment_secondary_effects_json(
+    laser_controller_comms_buffer_t *buffer,
+    const laser_controller_runtime_status_t *status)
+{
+    if (buffer == NULL || status == NULL) {
+        return;
+    }
+
+    laser_controller_comms_buffer_append_raw(buffer, "[");
+    for (uint32_t index = 0U;
+         index < status->deployment.secondary_effect_count;
+         ++index) {
+        const laser_controller_deployment_secondary_effect_t *effect =
+            &status->deployment.secondary_effects[index];
+
+        if (index > 0U) {
+            laser_controller_comms_buffer_append_raw(buffer, ",");
+        }
+
+        laser_controller_comms_buffer_append_raw(buffer, "{");
+        laser_controller_comms_buffer_append_raw(buffer, "\"code\":");
+        laser_controller_comms_write_escaped_string(
+            buffer,
+            laser_controller_fault_code_name(effect->code));
+        laser_controller_comms_buffer_append_raw(buffer, ",\"reason\":");
+        laser_controller_comms_write_escaped_string(buffer, effect->reason);
+        laser_controller_comms_buffer_append_fmt(
+            buffer,
+            ",\"atMs\":%lu}",
+            (unsigned long)effect->at_ms);
     }
     laser_controller_comms_buffer_append_raw(buffer, "]");
 }
@@ -1719,15 +1945,38 @@ static void laser_controller_comms_write_deployment_json(
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        "\"deployment\":{\"active\":%s,\"running\":%s,\"ready\":%s,\"failed\":%s,\"currentStep\":",
+        "\"deployment\":{\"active\":%s,\"running\":%s,\"ready\":%s,\"readyIdle\":%s,\"readyQualified\":%s,\"readyInvalidated\":%s,\"failed\":%s,\"phase\":",
         status->deployment.active ? "true" : "false",
         status->deployment.running ? "true" : "false",
         status->deployment.ready ? "true" : "false",
+        status->deployment.ready_idle ? "true" : "false",
+        status->deployment.ready_qualified ? "true" : "false",
+        status->deployment.ready_invalidated ? "true" : "false",
         status->deployment.failed ? "true" : "false");
     laser_controller_comms_write_escaped_string(
         buffer,
+        laser_controller_deployment_phase_name(status->deployment.phase));
+    laser_controller_comms_buffer_append_fmt(
+        buffer,
+        ",\"sequenceId\":%lu,\"currentStep\":",
+        (unsigned long)status->deployment.sequence_id);
+    laser_controller_comms_write_escaped_string(
+        buffer,
         laser_controller_deployment_step_name(status->deployment.current_step));
+    laser_controller_comms_buffer_append_raw(buffer, ",\"currentStepKey\":");
+    laser_controller_comms_write_escaped_string(
+        buffer,
+        laser_controller_deployment_step_name(status->deployment.current_step));
+    laser_controller_comms_buffer_append_fmt(
+        buffer,
+        ",\"currentStepIndex\":%lu",
+        (unsigned long)status->deployment.current_step);
     laser_controller_comms_buffer_append_raw(buffer, ",\"lastCompletedStep\":");
+    laser_controller_comms_write_escaped_string(
+        buffer,
+        laser_controller_deployment_step_name(
+            status->deployment.last_completed_step));
+    laser_controller_comms_buffer_append_raw(buffer, ",\"lastCompletedStepKey\":");
     laser_controller_comms_write_escaped_string(
         buffer,
         laser_controller_deployment_step_name(
@@ -1740,6 +1989,16 @@ static void laser_controller_comms_write_deployment_json(
     laser_controller_comms_write_escaped_string(
         buffer,
         status->deployment.failure_reason);
+    laser_controller_comms_buffer_append_raw(buffer, ",\"primaryFailureCode\":");
+    laser_controller_comms_write_escaped_string(
+        buffer,
+        laser_controller_fault_code_name(status->deployment.primary_failure_code));
+    laser_controller_comms_buffer_append_raw(buffer, ",\"primaryFailureReason\":");
+    laser_controller_comms_write_escaped_string(
+        buffer,
+        status->deployment.primary_failure_reason);
+    laser_controller_comms_buffer_append_raw(buffer, ",\"secondaryEffects\":");
+    laser_controller_comms_write_deployment_secondary_effects_json(buffer, status);
     laser_controller_comms_buffer_append_raw(buffer, ",\"targetMode\":");
     laser_controller_comms_write_escaped_string(
         buffer,
@@ -1752,6 +2011,19 @@ static void laser_controller_comms_write_deployment_json(
         status->deployment.target.target_lambda_nm,
         status->deployment.max_laser_current_a,
         status->deployment.max_optical_power_w);
+    laser_controller_comms_buffer_append_fmt(
+        buffer,
+        ",\"readyTruth\":{\"tecRailPgoodRaw\":%s,\"tecRailPgoodFiltered\":%s,\"tecTempGood\":%s,\"tecAnalogPlausible\":%s,\"ldRailPgoodRaw\":%s,\"ldRailPgoodFiltered\":%s,\"driverLoopGood\":%s,\"sbdnHigh\":%s,\"pcnLow\":%s,\"idleBiasCurrentA\":%.3f}",
+        status->deployment.ready_truth.tec_rail_pgood_raw ? "true" : "false",
+        status->deployment.ready_truth.tec_rail_pgood_filtered ? "true" : "false",
+        status->deployment.ready_truth.tec_temp_good ? "true" : "false",
+        status->deployment.ready_truth.tec_analog_plausible ? "true" : "false",
+        status->deployment.ready_truth.ld_rail_pgood_raw ? "true" : "false",
+        status->deployment.ready_truth.ld_rail_pgood_filtered ? "true" : "false",
+        status->deployment.ready_truth.driver_loop_good ? "true" : "false",
+        status->deployment.ready_truth.sbdn_high ? "true" : "false",
+        status->deployment.ready_truth.pcn_low ? "true" : "false",
+        status->deployment.ready_truth.idle_bias_current_a);
     if (include_steps) {
         laser_controller_comms_buffer_append_raw(buffer, ",\"steps\":");
         laser_controller_comms_write_deployment_steps_json(buffer, status);
@@ -1781,8 +2053,6 @@ static void laser_controller_comms_write_snapshot_json(
         laser_controller_comms_actual_lambda_nm(status);
     const float lambda_drift_nm =
         laser_controller_comms_lambda_drift_nm(status);
-    const char *runtime_mode_lock_reason =
-        laser_controller_comms_runtime_mode_switch_block_reason(status);
     laser_controller_wireless_status_t wireless = { 0 };
 
     laser_controller_wireless_copy_status(&wireless);
@@ -1863,8 +2133,15 @@ static void laser_controller_comms_write_snapshot_json(
     }
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        "],\"sourceIsHostOnly\":%s},",
-        status->inputs.pd_source_is_host_only ? "true" : "false");
+        "],\"sourceIsHostOnly\":%s,\"lastUpdatedMs\":%lu,\"snapshotFresh\":%s,\"source\":",
+        status->inputs.pd_source_is_host_only ? "true" : "false",
+        (unsigned long)status->inputs.pd_last_updated_ms,
+        status->inputs.pd_snapshot_fresh ? "true" : "false");
+    laser_controller_comms_write_escaped_string(
+        buffer,
+        laser_controller_comms_pd_snapshot_source_name(
+            status->inputs.pd_source));
+    laser_controller_comms_buffer_append_raw(buffer, "},");
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
@@ -1923,40 +2200,16 @@ static void laser_controller_comms_write_snapshot_json(
         status->inputs.tec_voltage_v,
         status->inputs.tec_temp_good ? 0U : 1U);
 
+    laser_controller_comms_write_button_state_json(buffer, status);
     laser_controller_comms_write_peripheral_readback_json(buffer, status);
     laser_controller_comms_write_gpio_inspector_json(buffer, status);
 
-    laser_controller_comms_buffer_append_raw(buffer, "\"bench\":{");
-    laser_controller_comms_buffer_append_raw(buffer, "\"targetMode\":");
-    laser_controller_comms_write_escaped_string(
-        buffer,
-        laser_controller_bench_target_mode_name(status->bench.target_mode));
-    laser_controller_comms_buffer_append_fmt(
-        buffer,
-        ",\"runtimeMode\":");
-    laser_controller_comms_write_escaped_string(
-        buffer,
-        laser_controller_runtime_mode_name(status->bench.runtime_mode));
-    laser_controller_comms_buffer_append_fmt(
-        buffer,
-        ",\"runtimeModeSwitchAllowed\":%s,\"runtimeModeLockReason\":",
-        runtime_mode_lock_reason == NULL ? "true" : "false");
-    laser_controller_comms_write_escaped_string(
-        buffer,
-        runtime_mode_lock_reason != NULL ? runtime_mode_lock_reason : "");
-    laser_controller_comms_buffer_append_fmt(
-        buffer,
-        ",\"requestedAlignmentEnabled\":%s,\"requestedNirEnabled\":%s,\"modulationEnabled\":%s,\"modulationFrequencyHz\":%lu,\"modulationDutyCyclePct\":%lu,\"lowStateCurrentA\":%.3f},",
-        status->bench.requested_alignment ? "true" : "false",
-        status->bench.requested_nir ? "true" : "false",
-        status->bench.modulation_enabled ? "true" : "false",
-        (unsigned long)status->bench.modulation_frequency_hz,
-        (unsigned long)status->bench.modulation_duty_cycle_pct,
-        status->bench.low_state_current_a);
+    laser_controller_comms_write_bench_json(buffer, status);
+    laser_controller_comms_buffer_append_raw(buffer, ",");
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        "\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"horizonThresholdDeg\":%.2f,\"horizonHysteresisDeg\":%.2f,\"tofMinRangeM\":%.3f,\"tofMaxRangeM\":%.3f,\"tofHysteresisM\":%.3f,\"imuStaleMs\":%lu,\"tofStaleMs\":%lu,\"railGoodTimeoutMs\":%lu,\"lambdaDriftLimitNm\":%.2f,\"lambdaDriftHysteresisNm\":%.2f,\"lambdaDriftHoldMs\":%lu,\"ldOvertempLimitC\":%.2f,\"tecTempAdcTripV\":%.3f,\"tecTempAdcHysteresisV\":%.3f,\"tecTempAdcHoldMs\":%lu,\"tecMinCommandC\":%.2f,\"tecMaxCommandC\":%.2f,\"tecReadyToleranceC\":%.2f,\"maxLaserCurrentA\":%.2f,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f},",
+        "\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"horizonThresholdDeg\":%.2f,\"horizonHysteresisDeg\":%.2f,\"tofMinRangeM\":%.3f,\"tofMaxRangeM\":%.3f,\"tofHysteresisM\":%.3f,\"imuStaleMs\":%lu,\"tofStaleMs\":%lu,\"railGoodTimeoutMs\":%lu,\"lambdaDriftLimitNm\":%.2f,\"lambdaDriftHysteresisNm\":%.2f,\"lambdaDriftHoldMs\":%lu,\"ldOvertempLimitC\":%.2f,\"tecTempAdcTripV\":%.3f,\"tecTempAdcHysteresisV\":%.3f,\"tecTempAdcHoldMs\":%lu,\"tecMinCommandC\":%.2f,\"tecMaxCommandC\":%.2f,\"tecReadyToleranceC\":%.2f,\"maxLaserCurrentA\":%.2f,\"offCurrentThresholdA\":%.2f,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f},",
         status->decision.allow_alignment ? "true" : "false",
         status->decision.allow_nir ? "true" : "false",
         status->decision.horizon_blocked ? "true" : "false",
@@ -1982,6 +2235,7 @@ static void laser_controller_comms_write_snapshot_json(
         status->config.thresholds.tec_max_command_c,
         status->config.thresholds.tec_ready_tolerance_c,
         status->config.thresholds.max_laser_current_a,
+        status->config.thresholds.off_current_threshold_a,
         actual_lambda_nm,
         status->bench.target_lambda_nm,
         lambda_drift_nm,
@@ -1989,13 +2243,14 @@ static void laser_controller_comms_write_snapshot_json(
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        "\"bringup\":{\"serviceModeRequested\":%s,\"serviceModeActive\":%s,\"interlocksDisabled\":%s,\"persistenceDirty\":%s,\"persistenceAvailable\":%s,\"lastSaveOk\":%s,\"profileRevision\":%lu,\"profileName\":",
+        "\"bringup\":{\"serviceModeRequested\":%s,\"serviceModeActive\":%s,\"interlocksDisabled\":%s,\"persistenceDirty\":%s,\"persistenceAvailable\":%s,\"lastSaveOk\":%s,\"lastSaveAtMs\":%lu,\"profileRevision\":%lu,\"profileName\":",
         status->bringup.service_mode_requested ? "true" : "false",
         status->state == LASER_CONTROLLER_STATE_SERVICE_MODE ? "true" : "false",
         status->bringup.interlocks_disabled ? "true" : "false",
         status->bringup.persistence_dirty ? "true" : "false",
         status->bringup.persistence_available ? "true" : "false",
         status->bringup.last_save_ok ? "true" : "false",
+        (unsigned long)status->bringup.last_save_at_ms,
         (unsigned long)status->bringup.profile_revision);
     laser_controller_comms_write_escaped_string(buffer, status->bringup.profile_name);
     laser_controller_comms_buffer_append_fmt(
@@ -2113,25 +2368,8 @@ static void laser_controller_comms_write_snapshot_json(
 
     laser_controller_comms_write_deployment_json(buffer, status, true);
 
-    laser_controller_comms_buffer_append_fmt(
-        buffer,
-        "\"fault\":{\"latched\":%s,\"activeCode\":",
-        status->fault_latched ? "true" : "false");
-    laser_controller_comms_write_escaped_string(
-        buffer,
-        laser_controller_fault_code_name(status->active_fault_code));
-    laser_controller_comms_buffer_append_fmt(
-        buffer,
-        ",\"activeCount\":%lu,\"tripCounter\":%lu,",
-        (unsigned long)status->active_fault_count,
-        (unsigned long)status->trip_counter);
-    if (status->last_fault_ms == 0U) {
-        laser_controller_comms_buffer_append_raw(buffer, "\"lastFaultAtIso\":null},");
-    } else {
-        laser_controller_comms_buffer_append_raw(
-            buffer,
-            "\"lastFaultAtIso\":\"1970-01-01T00:00:00Z\"},");
-    }
+    laser_controller_comms_write_fault_json(buffer, status, true);
+    laser_controller_comms_buffer_append_raw(buffer, ",");
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
@@ -2212,8 +2450,15 @@ static void laser_controller_comms_write_command_snapshot_json(
     }
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        "],\"sourceIsHostOnly\":%s},",
-        status->inputs.pd_source_is_host_only ? "true" : "false");
+        "],\"sourceIsHostOnly\":%s,\"lastUpdatedMs\":%lu,\"snapshotFresh\":%s,\"source\":",
+        status->inputs.pd_source_is_host_only ? "true" : "false",
+        (unsigned long)status->inputs.pd_last_updated_ms,
+        status->inputs.pd_snapshot_fresh ? "true" : "false");
+    laser_controller_comms_write_escaped_string(
+        buffer,
+        laser_controller_comms_pd_snapshot_source_name(
+            status->inputs.pd_source));
+    laser_controller_comms_buffer_append_raw(buffer, "},");
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
@@ -2279,9 +2524,24 @@ static void laser_controller_comms_write_command_snapshot_json(
         laser_controller_bench_target_mode_name(status->bench.target_mode));
     laser_controller_comms_buffer_append_fmt(
         buffer,
-            ",\"requestedAlignmentEnabled\":%s,\"requestedNirEnabled\":%s,\"modulationEnabled\":%s,\"modulationFrequencyHz\":%lu,\"modulationDutyCyclePct\":%lu,\"lowStateCurrentA\":%.3f},",
+            ",\"requestedAlignmentEnabled\":%s,\"appliedAlignmentEnabled\":%s,\"requestedNirEnabled\":%s,\"requestedLedEnabled\":%s,\"requestedLedDutyCyclePct\":%lu,\"appliedLedOwner\":",
             status->bench.requested_alignment ? "true" : "false",
+            status->outputs.enable_alignment_laser ? "true" : "false",
             status->bench.requested_nir ? "true" : "false",
+            status->bench.illumination_enabled ? "true" : "false",
+            (unsigned long)status->bench.illumination_duty_cycle_pct);
+    laser_controller_comms_write_escaped_string(
+        buffer,
+        laser_controller_comms_led_owner_name(status));
+    laser_controller_comms_buffer_append_fmt(
+        buffer,
+        ",\"appliedLedPinHigh\":%s,\"illuminationEnabled\":%s,\"illuminationDutyCyclePct\":%lu,\"illuminationFrequencyHz\":%lu,\"modulationEnabled\":%s,\"modulationFrequencyHz\":%lu,\"modulationDutyCyclePct\":%lu,\"lowStateCurrentA\":%.3f},",
+        laser_controller_comms_gpio_pin_high(
+            status,
+            LASER_CONTROLLER_GPIO_TOF_LED_CTRL) ? "true" : "false",
+            status->bench.illumination_enabled ? "true" : "false",
+            (unsigned long)status->bench.illumination_duty_cycle_pct,
+            (unsigned long)status->bench.illumination_frequency_hz,
             status->bench.modulation_enabled ? "true" : "false",
             (unsigned long)status->bench.modulation_frequency_hz,
             (unsigned long)status->bench.modulation_duty_cycle_pct,
@@ -2289,7 +2549,7 @@ static void laser_controller_comms_write_command_snapshot_json(
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        "\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"horizonThresholdDeg\":%.2f,\"horizonHysteresisDeg\":%.2f,\"tofMinRangeM\":%.3f,\"tofMaxRangeM\":%.3f,\"tofHysteresisM\":%.3f,\"imuStaleMs\":%lu,\"tofStaleMs\":%lu,\"railGoodTimeoutMs\":%lu,\"lambdaDriftLimitNm\":%.2f,\"lambdaDriftHysteresisNm\":%.2f,\"lambdaDriftHoldMs\":%lu,\"ldOvertempLimitC\":%.2f,\"tecTempAdcTripV\":%.3f,\"tecTempAdcHysteresisV\":%.3f,\"tecTempAdcHoldMs\":%lu,\"tecMinCommandC\":%.2f,\"tecMaxCommandC\":%.2f,\"tecReadyToleranceC\":%.2f,\"maxLaserCurrentA\":%.2f,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f},",
+        "\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"horizonThresholdDeg\":%.2f,\"horizonHysteresisDeg\":%.2f,\"tofMinRangeM\":%.3f,\"tofMaxRangeM\":%.3f,\"tofHysteresisM\":%.3f,\"imuStaleMs\":%lu,\"tofStaleMs\":%lu,\"railGoodTimeoutMs\":%lu,\"lambdaDriftLimitNm\":%.2f,\"lambdaDriftHysteresisNm\":%.2f,\"lambdaDriftHoldMs\":%lu,\"ldOvertempLimitC\":%.2f,\"tecTempAdcTripV\":%.3f,\"tecTempAdcHysteresisV\":%.3f,\"tecTempAdcHoldMs\":%lu,\"tecMinCommandC\":%.2f,\"tecMaxCommandC\":%.2f,\"tecReadyToleranceC\":%.2f,\"maxLaserCurrentA\":%.2f,\"offCurrentThresholdA\":%.2f,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f},",
         status->decision.allow_alignment ? "true" : "false",
         status->decision.allow_nir ? "true" : "false",
         status->decision.horizon_blocked ? "true" : "false",
@@ -2315,6 +2575,7 @@ static void laser_controller_comms_write_command_snapshot_json(
         status->config.thresholds.tec_max_command_c,
         status->config.thresholds.tec_ready_tolerance_c,
         status->config.thresholds.max_laser_current_a,
+        status->config.thresholds.off_current_threshold_a,
         actual_lambda_nm,
         status->bench.target_lambda_nm,
         lambda_drift_nm,
@@ -2322,13 +2583,14 @@ static void laser_controller_comms_write_command_snapshot_json(
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        "\"bringup\":{\"serviceModeRequested\":%s,\"serviceModeActive\":%s,\"interlocksDisabled\":%s,\"persistenceDirty\":%s,\"persistenceAvailable\":%s,\"lastSaveOk\":%s,\"profileRevision\":%lu,\"profileName\":",
+        "\"bringup\":{\"serviceModeRequested\":%s,\"serviceModeActive\":%s,\"interlocksDisabled\":%s,\"persistenceDirty\":%s,\"persistenceAvailable\":%s,\"lastSaveOk\":%s,\"lastSaveAtMs\":%lu,\"profileRevision\":%lu,\"profileName\":",
         status->bringup.service_mode_requested ? "true" : "false",
         status->state == LASER_CONTROLLER_STATE_SERVICE_MODE ? "true" : "false",
         status->bringup.interlocks_disabled ? "true" : "false",
         status->bringup.persistence_dirty ? "true" : "false",
         status->bringup.persistence_available ? "true" : "false",
         status->bringup.last_save_ok ? "true" : "false",
+        (unsigned long)status->bringup.last_save_at_ms,
         (unsigned long)status->bringup.profile_revision);
     laser_controller_comms_write_escaped_string(buffer, status->bringup.profile_name);
     laser_controller_comms_buffer_append_fmt(
@@ -2438,13 +2700,20 @@ static void laser_controller_comms_write_live_telemetry_json(
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        "\"pd\":{\"contractValid\":%s,\"negotiatedPowerW\":%.2f,\"sourceVoltageV\":%.2f,\"sourceCurrentA\":%.2f,\"operatingCurrentA\":%.2f,\"sourceIsHostOnly\":%s},",
+        "\"pd\":{\"contractValid\":%s,\"negotiatedPowerW\":%.2f,\"sourceVoltageV\":%.2f,\"sourceCurrentA\":%.2f,\"operatingCurrentA\":%.2f,\"sourceIsHostOnly\":%s,\"lastUpdatedMs\":%lu,\"snapshotFresh\":%s,\"source\":",
         status->inputs.pd_contract_valid ? "true" : "false",
         status->inputs.pd_negotiated_power_w,
         status->inputs.pd_source_voltage_v,
         status->inputs.pd_source_current_a,
         status->inputs.pd_operating_current_a,
-        status->inputs.pd_source_is_host_only ? "true" : "false");
+        status->inputs.pd_source_is_host_only ? "true" : "false",
+        (unsigned long)status->inputs.pd_last_updated_ms,
+        status->inputs.pd_snapshot_fresh ? "true" : "false");
+    laser_controller_comms_write_escaped_string(
+        buffer,
+        laser_controller_comms_pd_snapshot_source_name(
+            status->inputs.pd_source));
+    laser_controller_comms_buffer_append_raw(buffer, "},");
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
@@ -2477,6 +2746,10 @@ static void laser_controller_comms_write_live_telemetry_json(
         actual_lambda_nm,
         status->inputs.tec_telemetry_valid ? "true" : "false");
 
+    laser_controller_comms_write_button_state_json(buffer, status);
+    laser_controller_comms_write_bench_json(buffer, status);
+    laser_controller_comms_buffer_append_raw(buffer, ",");
+
     laser_controller_comms_buffer_append_fmt(
         buffer,
         "\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f},",
@@ -2501,14 +2774,8 @@ static void laser_controller_comms_write_live_telemetry_json(
 
     laser_controller_comms_write_deployment_json(buffer, status, true);
 
-    laser_controller_comms_buffer_append_fmt(
-        buffer,
-        "\"fault\":{\"latched\":%s,\"activeCode\":",
-        status->fault_latched ? "true" : "false");
-    laser_controller_comms_write_escaped_string(
-        buffer,
-        laser_controller_fault_code_name(status->active_fault_code));
-    laser_controller_comms_buffer_append_raw(buffer, "}}");
+    laser_controller_comms_write_fault_json(buffer, status, false);
+    laser_controller_comms_buffer_append_raw(buffer, "}");
 }
 
 static void laser_controller_comms_write_fast_telemetry_json(
@@ -2614,13 +2881,20 @@ static void laser_controller_comms_write_live_snapshot_json(
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        "\"pd\":{\"contractValid\":%s,\"negotiatedPowerW\":%.2f,\"sourceVoltageV\":%.2f,\"sourceCurrentA\":%.2f,\"operatingCurrentA\":%.2f,\"sourceIsHostOnly\":%s},",
+        "\"pd\":{\"contractValid\":%s,\"negotiatedPowerW\":%.2f,\"sourceVoltageV\":%.2f,\"sourceCurrentA\":%.2f,\"operatingCurrentA\":%.2f,\"sourceIsHostOnly\":%s,\"lastUpdatedMs\":%lu,\"snapshotFresh\":%s,\"source\":",
         status->inputs.pd_contract_valid ? "true" : "false",
         status->inputs.pd_negotiated_power_w,
         status->inputs.pd_source_voltage_v,
         status->inputs.pd_source_current_a,
         status->inputs.pd_operating_current_a,
-        status->inputs.pd_source_is_host_only ? "true" : "false");
+        status->inputs.pd_source_is_host_only ? "true" : "false",
+        (unsigned long)status->inputs.pd_last_updated_ms,
+        status->inputs.pd_snapshot_fresh ? "true" : "false");
+    laser_controller_comms_write_escaped_string(
+        buffer,
+        laser_controller_comms_pd_snapshot_source_name(
+            status->inputs.pd_source));
+    laser_controller_comms_buffer_append_raw(buffer, "},");
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
@@ -2651,7 +2925,7 @@ static void laser_controller_comms_write_live_snapshot_json(
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        "\"laser\":{\"alignmentEnabled\":%s,\"nirEnabled\":%s,\"driverStandby\":%s,\"telemetryValid\":%s,\"commandVoltageV\":%.3f,\"commandedCurrentA\":%.3f,\"currentMonitorVoltageV\":%.3f,\"measuredCurrentA\":%.3f,\"loopGood\":%s,\"driverTempVoltageV\":%.3f,\"driverTempC\":%.2f}",
+        "\"laser\":{\"alignmentEnabled\":%s,\"nirEnabled\":%s,\"driverStandby\":%s,\"telemetryValid\":%s,\"commandVoltageV\":%.3f,\"commandedCurrentA\":%.3f,\"currentMonitorVoltageV\":%.3f,\"measuredCurrentA\":%.3f,\"loopGood\":%s,\"driverTempVoltageV\":%.3f,\"driverTempC\":%.2f},",
         status->outputs.enable_alignment_laser ? "true" : "false",
         status->decision.nir_output_enable ? "true" : "false",
         laser_controller_comms_driver_standby_effective(status) ? "true" : "false",
@@ -2680,6 +2954,9 @@ static void laser_controller_comms_write_live_snapshot_json(
 
     laser_controller_comms_write_haptic_readback_json(buffer, status);
     laser_controller_comms_write_gpio_inspector_json(buffer, status);
+    laser_controller_comms_write_button_state_json(buffer, status);
+    laser_controller_comms_write_bench_json(buffer, status);
+    laser_controller_comms_buffer_append_raw(buffer, ",");
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
@@ -2709,25 +2986,8 @@ static void laser_controller_comms_write_live_snapshot_json(
 
     laser_controller_comms_write_deployment_json(buffer, status, true);
 
-    laser_controller_comms_buffer_append_fmt(
-        buffer,
-        "\"fault\":{\"latched\":%s,\"activeCode\":",
-        status->fault_latched ? "true" : "false");
-    laser_controller_comms_write_escaped_string(
-        buffer,
-        laser_controller_fault_code_name(status->active_fault_code));
-    laser_controller_comms_buffer_append_fmt(
-        buffer,
-        ",\"activeCount\":%lu,\"tripCounter\":%lu,",
-        (unsigned long)status->active_fault_count,
-        (unsigned long)status->trip_counter);
-    if (status->last_fault_ms == 0U) {
-        laser_controller_comms_buffer_append_raw(buffer, "\"lastFaultAtIso\":null}}");
-    } else {
-        laser_controller_comms_buffer_append_raw(
-            buffer,
-            "\"lastFaultAtIso\":\"1970-01-01T00:00:00Z\"}}");
-    }
+    laser_controller_comms_write_fault_json(buffer, status, true);
+    laser_controller_comms_buffer_append_raw(buffer, "}");
 }
 
 static void laser_controller_comms_emit_log_event(
@@ -3135,13 +3395,20 @@ static void laser_controller_comms_emit_tool_status_response(
     if (include_pd) {
         laser_controller_comms_buffer_append_fmt(
             &buffer,
-            ",\"pd\":{\"contractValid\":%s,\"negotiatedPowerW\":%.2f,\"sourceVoltageV\":%.2f,\"sourceCurrentA\":%.2f,\"operatingCurrentA\":%.2f,\"sourceIsHostOnly\":%s}",
+            ",\"pd\":{\"contractValid\":%s,\"negotiatedPowerW\":%.2f,\"sourceVoltageV\":%.2f,\"sourceCurrentA\":%.2f,\"operatingCurrentA\":%.2f,\"sourceIsHostOnly\":%s,\"lastUpdatedMs\":%lu,\"snapshotFresh\":%s,\"source\":",
             status->inputs.pd_contract_valid ? "true" : "false",
             status->inputs.pd_negotiated_power_w,
             status->inputs.pd_source_voltage_v,
             status->inputs.pd_source_current_a,
             status->inputs.pd_operating_current_a,
-            status->inputs.pd_source_is_host_only ? "true" : "false");
+            status->inputs.pd_source_is_host_only ? "true" : "false",
+            (unsigned long)status->inputs.pd_last_updated_ms,
+            status->inputs.pd_snapshot_fresh ? "true" : "false");
+        laser_controller_comms_write_escaped_string(
+            &buffer,
+            laser_controller_comms_pd_snapshot_source_name(
+                status->inputs.pd_source));
+        laser_controller_comms_buffer_append_raw(&buffer, "}");
     }
 
     if (peripheral_mask != LASER_CONTROLLER_COMMS_PERIPHERAL_NONE) {
@@ -3221,29 +3488,21 @@ static void laser_controller_comms_emit_profile_status_response(
         laser_controller_comms_power_tier_name(status->power_tier));
     laser_controller_comms_buffer_append_fmt(
         &buffer,
-        "},\"bringup\":{\"serviceModeRequested\":%s,\"serviceModeActive\":%s,\"interlocksDisabled\":%s,\"persistenceDirty\":%s,\"persistenceAvailable\":%s,\"lastSaveOk\":%s,\"profileRevision\":%lu,\"profileName\":",
+        "},\"bringup\":{\"serviceModeRequested\":%s,\"serviceModeActive\":%s,\"interlocksDisabled\":%s,\"persistenceDirty\":%s,\"persistenceAvailable\":%s,\"lastSaveOk\":%s,\"lastSaveAtMs\":%lu,\"profileRevision\":%lu,\"profileName\":",
         status->bringup.service_mode_requested ? "true" : "false",
         status->state == LASER_CONTROLLER_STATE_SERVICE_MODE ? "true" : "false",
         status->bringup.interlocks_disabled ? "true" : "false",
         status->bringup.persistence_dirty ? "true" : "false",
         status->bringup.persistence_available ? "true" : "false",
         status->bringup.last_save_ok ? "true" : "false",
+        (unsigned long)status->bringup.last_save_at_ms,
         (unsigned long)status->bringup.profile_revision);
     laser_controller_comms_write_escaped_string(
         &buffer,
         status->bringup.profile_name);
-    laser_controller_comms_buffer_append_fmt(
-        &buffer,
-        "},\"fault\":{\"latched\":%s,\"activeCode\":",
-        status->fault_latched ? "true" : "false");
-    laser_controller_comms_write_escaped_string(
-        &buffer,
-        laser_controller_fault_code_name(status->active_fault_code));
-    laser_controller_comms_buffer_append_fmt(
-        &buffer,
-        ",\"activeCount\":%lu,\"tripCounter\":%lu}}}\n",
-        (unsigned long)status->active_fault_count,
-        (unsigned long)status->trip_counter);
+    laser_controller_comms_buffer_append_raw(&buffer, "},");
+    laser_controller_comms_write_fault_json(&buffer, status, true);
+    laser_controller_comms_buffer_append_raw(&buffer, "}}\n");
     laser_controller_comms_emit_buffer_locked(&buffer, "profile_status_response");
     laser_controller_comms_output_unlock();
 }
@@ -3264,8 +3523,6 @@ static void laser_controller_comms_emit_bench_status_response(
         laser_controller_comms_actual_lambda_nm(status);
     const float lambda_drift_nm =
         laser_controller_comms_lambda_drift_nm(status);
-    const char *runtime_mode_lock_reason =
-        laser_controller_comms_runtime_mode_switch_block_reason(status);
 
     laser_controller_comms_output_lock();
     laser_controller_comms_buffer_reset(
@@ -3321,38 +3578,14 @@ static void laser_controller_comms_emit_bench_status_response(
     }
 
     if (include_bench) {
-        laser_controller_comms_buffer_append_raw(&buffer, ",\"bench\":{\"targetMode\":");
-        laser_controller_comms_write_escaped_string(
-            &buffer,
-            laser_controller_bench_target_mode_name(status->bench.target_mode));
-        laser_controller_comms_buffer_append_fmt(
-            &buffer,
-            ",\"runtimeMode\":");
-        laser_controller_comms_write_escaped_string(
-            &buffer,
-            laser_controller_runtime_mode_name(status->bench.runtime_mode));
-        laser_controller_comms_buffer_append_fmt(
-            &buffer,
-            ",\"runtimeModeSwitchAllowed\":%s,\"runtimeModeLockReason\":",
-            runtime_mode_lock_reason == NULL ? "true" : "false");
-        laser_controller_comms_write_escaped_string(
-            &buffer,
-            runtime_mode_lock_reason != NULL ? runtime_mode_lock_reason : "");
-        laser_controller_comms_buffer_append_fmt(
-            &buffer,
-            ",\"requestedAlignmentEnabled\":%s,\"requestedNirEnabled\":%s,\"modulationEnabled\":%s,\"modulationFrequencyHz\":%lu,\"modulationDutyCyclePct\":%lu,\"lowStateCurrentA\":%.3f}",
-            status->bench.requested_alignment ? "true" : "false",
-            status->bench.requested_nir ? "true" : "false",
-            status->bench.modulation_enabled ? "true" : "false",
-            (unsigned long)status->bench.modulation_frequency_hz,
-            (unsigned long)status->bench.modulation_duty_cycle_pct,
-            status->bench.low_state_current_a);
+        laser_controller_comms_buffer_append_raw(&buffer, ",");
+        laser_controller_comms_write_bench_json(&buffer, status);
     }
 
     if (include_safety) {
         laser_controller_comms_buffer_append_fmt(
             &buffer,
-            ",\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"horizonThresholdDeg\":%.2f,\"horizonHysteresisDeg\":%.2f,\"tofMinRangeM\":%.3f,\"tofMaxRangeM\":%.3f,\"tofHysteresisM\":%.3f,\"imuStaleMs\":%lu,\"tofStaleMs\":%lu,\"railGoodTimeoutMs\":%lu,\"lambdaDriftLimitNm\":%.2f,\"lambdaDriftHysteresisNm\":%.2f,\"lambdaDriftHoldMs\":%lu,\"ldOvertempLimitC\":%.2f,\"tecTempAdcTripV\":%.3f,\"tecTempAdcHysteresisV\":%.3f,\"tecTempAdcHoldMs\":%lu,\"tecMinCommandC\":%.2f,\"tecMaxCommandC\":%.2f,\"tecReadyToleranceC\":%.2f,\"maxLaserCurrentA\":%.2f,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f}",
+            ",\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"horizonThresholdDeg\":%.2f,\"horizonHysteresisDeg\":%.2f,\"tofMinRangeM\":%.3f,\"tofMaxRangeM\":%.3f,\"tofHysteresisM\":%.3f,\"imuStaleMs\":%lu,\"tofStaleMs\":%lu,\"railGoodTimeoutMs\":%lu,\"lambdaDriftLimitNm\":%.2f,\"lambdaDriftHysteresisNm\":%.2f,\"lambdaDriftHoldMs\":%lu,\"ldOvertempLimitC\":%.2f,\"tecTempAdcTripV\":%.3f,\"tecTempAdcHysteresisV\":%.3f,\"tecTempAdcHoldMs\":%lu,\"tecMinCommandC\":%.2f,\"tecMaxCommandC\":%.2f,\"tecReadyToleranceC\":%.2f,\"maxLaserCurrentA\":%.2f,\"offCurrentThresholdA\":%.2f,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f}",
             status->decision.allow_alignment ? "true" : "false",
             status->decision.allow_nir ? "true" : "false",
             status->decision.horizon_blocked ? "true" : "false",
@@ -3378,6 +3611,7 @@ static void laser_controller_comms_emit_bench_status_response(
             status->config.thresholds.tec_max_command_c,
             status->config.thresholds.tec_ready_tolerance_c,
             status->config.thresholds.max_laser_current_a,
+            status->config.thresholds.off_current_threshold_a,
             actual_lambda_nm,
             status->bench.target_lambda_nm,
             lambda_drift_nm,
@@ -3804,7 +4038,8 @@ static void laser_controller_comms_handle_command_line(const char *line)
         return;
     }
 
-    if (strcmp(command, "get_status") == 0) {
+    if (strcmp(command, "get_status") == 0 ||
+        strcmp(command, "status.get") == 0) {
         laser_controller_comms_emit_full_status_response(id, &status);
         return;
     }
@@ -3814,7 +4049,14 @@ static void laser_controller_comms_handle_command_line(const char *line)
         return;
     }
 
-    if (strcmp(command, "enter_deployment_mode") == 0) {
+    if (strcmp(command, "enter_deployment_mode") == 0 ||
+        strcmp(command, "deployment.enter") == 0) {
+        if (status.fault_latched) {
+            laser_controller_comms_emit_error_response(
+                id,
+                "Clear the blocking latched fault before entering deployment mode.");
+            return;
+        }
         if (laser_controller_app_enter_deployment_mode() != ESP_OK) {
             laser_controller_comms_emit_error_response(
                 id,
@@ -3833,7 +4075,8 @@ static void laser_controller_comms_handle_command_line(const char *line)
         return;
     }
 
-    if (strcmp(command, "exit_deployment_mode") == 0) {
+    if (strcmp(command, "exit_deployment_mode") == 0 ||
+        strcmp(command, "deployment.exit") == 0) {
         if (laser_controller_app_exit_deployment_mode() != ESP_OK) {
             laser_controller_comms_emit_error_response(
                 id,
@@ -3852,11 +4095,23 @@ static void laser_controller_comms_handle_command_line(const char *line)
         return;
     }
 
-    if (strcmp(command, "run_deployment_sequence") == 0) {
+    if (strcmp(command, "run_deployment_sequence") == 0 ||
+        strcmp(command, "deployment.run") == 0) {
+        if (status.fault_latched) {
+            laser_controller_comms_emit_error_response(
+                id,
+                "Clear the blocking latched fault before running the deployment checklist.");
+            return;
+        }
         if (laser_controller_app_run_deployment_sequence() != ESP_OK) {
             laser_controller_comms_emit_error_response(
                 id,
                 "Deployment sequence could not start from the current controller state.");
+            return;
+        }
+        if (strcmp(command, "deployment.run") == 0) {
+            laser_controller_comms_refresh_status_after_mutation(&status, 25U);
+            laser_controller_comms_emit_status_response(id, &status);
             return;
         }
         if (!laser_controller_comms_wait_for_deployment_result(&status)) {
@@ -3869,7 +4124,8 @@ static void laser_controller_comms_handle_command_line(const char *line)
         return;
     }
 
-    if (strcmp(command, "set_deployment_target") == 0) {
+    if (strcmp(command, "set_deployment_target") == 0 ||
+        strcmp(command, "deployment.set_target") == 0) {
         laser_controller_deployment_target_t target = {
             .target_mode = LASER_CONTROLLER_DEPLOYMENT_TARGET_MODE_TEMP,
             .target_temp_c = status.deployment.target.target_temp_c,
@@ -4011,7 +4267,14 @@ static void laser_controller_comms_handle_command_line(const char *line)
     }
 
     if (strcmp(command, "refresh_pd_status") == 0) {
-        laser_controller_board_force_pd_refresh();
+        if (status.deployment.active) {
+            laser_controller_comms_emit_error_response(
+                id,
+                "PD refresh is locked while deployment mode is active. Only boot-time firmware PDO reconcile or explicit integrate-page PD actions may touch the STUSB4500.");
+            return;
+        }
+        laser_controller_board_force_pd_refresh_with_source(
+            LASER_CONTROLLER_PD_SNAPSHOT_SOURCE_INTEGRATE_REFRESH);
         vTaskDelay(pdMS_TO_TICKS(LASER_CONTROLLER_PD_REFRESH_WAIT_MS));
         (void)laser_controller_app_copy_status(&status);
         laser_controller_comms_emit_tool_status_response(
@@ -4112,6 +4375,22 @@ static void laser_controller_comms_handle_command_line(const char *line)
         return;
     }
 
+    if (laser_controller_comms_is_aux_control_command(command) &&
+        !status.deployment.active) {
+        laser_controller_comms_emit_error_response(
+            id,
+            "Enter deployment mode before using Operate aux controls.");
+        return;
+    }
+
+    if (laser_controller_comms_is_aux_control_command(command) &&
+        status.deployment.running) {
+        laser_controller_comms_emit_error_response(
+            id,
+            "Wait for the deployment checklist to stop before changing green or GPIO6 LED requests.");
+        return;
+    }
+
     if (laser_controller_comms_is_runtime_control_command(command) &&
         (!status.deployment.active || !status.deployment.ready)) {
         laser_controller_comms_emit_error_response(
@@ -4120,7 +4399,8 @@ static void laser_controller_comms_handle_command_line(const char *line)
         return;
     }
 
-    if (strcmp(command, "set_runtime_mode") == 0) {
+    if (strcmp(command, "set_runtime_mode") == 0 ||
+        strcmp(command, "operate.set_mode") == 0) {
         laser_controller_runtime_mode_t runtime_mode =
             status.bench.runtime_mode;
         const char *mode_error =
@@ -4172,21 +4452,15 @@ static void laser_controller_comms_handle_command_line(const char *line)
 
     if ((strcmp(command, "set_laser_power") == 0 ||
          strcmp(command, "set_max_current") == 0 ||
+         strcmp(command, "operate.set_output") == 0 ||
          strcmp(command, "laser_output_enable") == 0 ||
          strcmp(command, "laser_output_disable") == 0 ||
-         strcmp(command, "configure_modulation") == 0) &&
+         strcmp(command, "configure_modulation") == 0 ||
+         strcmp(command, "operate.set_modulation") == 0) &&
         !laser_controller_comms_runtime_mode_is_modulated_host(&status)) {
         laser_controller_comms_emit_error_response(
             id,
             "Host runtime output control is only available in modulated_host mode.");
-        return;
-    }
-
-    if (strcmp(command, "enable_alignment") == 0 ||
-        strcmp(command, "disable_alignment") == 0) {
-        laser_controller_comms_emit_error_response(
-            id,
-            "Host alignment requests are disabled in v2. The binary trigger path is reserved for the physical trigger hardware and remains blocked until that wiring is source-backed.");
         return;
     }
 
@@ -4204,6 +4478,92 @@ static void laser_controller_comms_handle_command_line(const char *line)
             now_ms,
             "bench",
             "bench laser current staged -> %.3f A",
+            current_a);
+        laser_controller_comms_refresh_status_after_mutation(&status, 25U);
+        laser_controller_comms_emit_bench_status_response(
+            id,
+            &status,
+            false,
+            true,
+            true);
+        return;
+    }
+
+    if (strcmp(command, "operate.set_alignment") == 0) {
+        bool enabled = false;
+
+        if (!laser_controller_comms_extract_bool(line, "\"enabled\":", &enabled)) {
+            laser_controller_comms_emit_error_response(id, "Missing enabled.");
+            return;
+        }
+
+        laser_controller_bench_set_alignment_requested(enabled, now_ms);
+        laser_controller_logger_logf(
+            now_ms,
+            "bench",
+            "operate alignment -> enabled=%d",
+            enabled);
+        laser_controller_comms_refresh_status_after_mutation(&status, 25U);
+        laser_controller_comms_emit_bench_status_response(
+            id,
+            &status,
+            false,
+            false,
+            true);
+        return;
+    }
+
+    if (strcmp(command, "operate.set_led") == 0) {
+        bool enabled = false;
+        uint32_t duty_cycle_pct = 0U;
+        uint32_t frequency_hz = 20000U;
+
+        (void)laser_controller_comms_extract_bool(line, "\"enabled\":", &enabled);
+        (void)laser_controller_comms_extract_uint(
+            line,
+            "\"duty_cycle_pct\":",
+            &duty_cycle_pct);
+        (void)laser_controller_comms_extract_uint(
+            line,
+            "\"frequency_hz\":",
+            &frequency_hz);
+
+        laser_controller_bench_set_illumination(
+            enabled,
+            duty_cycle_pct,
+            frequency_hz,
+            now_ms);
+        laser_controller_logger_logf(
+            now_ms,
+            "bench",
+            "operate led -> enabled=%d duty=%lu freq=%lu",
+            enabled,
+            (unsigned long)duty_cycle_pct,
+            (unsigned long)frequency_hz);
+        laser_controller_comms_refresh_status_after_mutation(&status, 25U);
+        laser_controller_comms_emit_bench_status_response(
+            id,
+            &status,
+            false,
+            false,
+            true);
+        return;
+    }
+
+    if (strcmp(command, "operate.set_output") == 0) {
+        bool enabled = status.bench.requested_nir;
+        float current_a = status.bench.high_state_current_a;
+
+        (void)laser_controller_comms_extract_bool(line, "\"enabled\":", &enabled);
+        (void)laser_controller_comms_extract_float(line, "\"current_a\":", &current_a);
+
+        laser_controller_bench_set_laser_current_a(&status.config, current_a, now_ms);
+        laser_controller_bench_set_nir_requested(enabled, now_ms);
+        laser_controller_logger_logf(
+            now_ms,
+            "bench",
+            "operate output -> enabled=%d current=%.3f A",
+            enabled,
             current_a);
         laser_controller_comms_refresh_status_after_mutation(&status, 25U);
         laser_controller_comms_emit_bench_status_response(
@@ -4277,7 +4637,8 @@ static void laser_controller_comms_handle_command_line(const char *line)
             profiles[1].current_a,
             profiles[2].voltage_v,
             profiles[2].current_a);
-        laser_controller_board_force_pd_refresh();
+        laser_controller_board_force_pd_refresh_with_source(
+            LASER_CONTROLLER_PD_SNAPSHOT_SOURCE_INTEGRATE_REFRESH);
         vTaskDelay(pdMS_TO_TICKS(LASER_CONTROLLER_PD_RENEGOTIATE_WAIT_MS));
         (void)laser_controller_app_copy_status(&status);
         if (!laser_controller_comms_pd_profiles_match(
@@ -4335,7 +4696,8 @@ static void laser_controller_comms_handle_command_line(const char *line)
             return;
         }
 
-        laser_controller_board_force_pd_refresh();
+        laser_controller_board_force_pd_refresh_with_source(
+            LASER_CONTROLLER_PD_SNAPSHOT_SOURCE_INTEGRATE_REFRESH);
         vTaskDelay(pdMS_TO_TICKS(LASER_CONTROLLER_PD_RENEGOTIATE_WAIT_MS));
         (void)laser_controller_app_copy_status(&status);
         if (!laser_controller_comms_pd_profiles_match(
@@ -4414,7 +4776,8 @@ static void laser_controller_comms_handle_command_line(const char *line)
             return;
         }
 
-        laser_controller_board_force_pd_refresh();
+        laser_controller_board_force_pd_refresh_with_source(
+            LASER_CONTROLLER_PD_SNAPSHOT_SOURCE_INTEGRATE_REFRESH);
         vTaskDelay(pdMS_TO_TICKS(LASER_CONTROLLER_PD_RENEGOTIATE_WAIT_MS));
         (void)laser_controller_app_copy_status(&status);
         if (!laser_controller_comms_pd_profiles_match(
@@ -4454,7 +4817,8 @@ static void laser_controller_comms_handle_command_line(const char *line)
     }
 
     if (strcmp(command, "set_runtime_safety") == 0 ||
-        strcmp(command, "set_deployment_safety") == 0) {
+        strcmp(command, "set_deployment_safety") == 0 ||
+        strcmp(command, "integrate.set_safety") == 0) {
         laser_controller_runtime_safety_policy_t policy = {
             .thresholds = status.config.thresholds,
             .timeouts = status.config.timeouts,
@@ -4527,6 +4891,9 @@ static void laser_controller_comms_handle_command_line(const char *line)
         if (laser_controller_comms_extract_float(line, "\"max_laser_current_a\":", &value_f)) {
             policy.thresholds.max_laser_current_a = value_f;
         }
+        if (laser_controller_comms_extract_float(line, "\"off_current_threshold_a\":", &value_f)) {
+            policy.thresholds.off_current_threshold_a = value_f;
+        }
 
         if (laser_controller_app_set_runtime_safety_policy(&policy) != ESP_OK) {
             laser_controller_comms_emit_error_response(
@@ -4541,8 +4908,12 @@ static void laser_controller_comms_handle_command_line(const char *line)
             strcmp(command, "set_deployment_safety") == 0 ?
                 "deployment safety policy updated from host" :
                 "runtime safety policy updated from host");
+        if (strcmp(command, "integrate.set_safety") == 0) {
+            laser_controller_service_save_profile(now_ms);
+        }
         laser_controller_comms_refresh_status_after_mutation(&status, 25U);
-        if (strcmp(command, "set_deployment_safety") == 0) {
+        if (strcmp(command, "set_deployment_safety") == 0 ||
+            strcmp(command, "integrate.set_safety") == 0) {
             laser_controller_comms_emit_status_response(id, &status);
         } else {
             laser_controller_comms_emit_bench_status_response(
@@ -4555,8 +4926,24 @@ static void laser_controller_comms_handle_command_line(const char *line)
         return;
     }
 
-    if (strcmp(command, "set_target_temp") == 0) {
+    if (strcmp(command, "set_target_temp") == 0 ||
+        strcmp(command, "operate.set_target") == 0) {
         float target_temp_c = 0.0f;
+        bool use_temp = strcmp(command, "set_target_temp") == 0;
+
+        if (strcmp(command, "operate.set_target") == 0) {
+            if (laser_controller_comms_extract_string(
+                    line,
+                    "\"target_mode\":\"",
+                    text_arg,
+                    sizeof(text_arg))) {
+                use_temp = strcmp(text_arg, "lambda") != 0;
+            }
+        }
+
+        if (!use_temp) {
+            goto handle_operate_target_lambda;
+        }
 
         if (!laser_controller_comms_extract_float(line, "\"temp_c\":", &target_temp_c)) {
             laser_controller_comms_emit_error_response(id, "Missing temp_c.");
@@ -4592,7 +4979,13 @@ static void laser_controller_comms_handle_command_line(const char *line)
         return;
     }
 
-    if (strcmp(command, "set_target_lambda") == 0) {
+handle_operate_target_lambda:
+    if (strcmp(command, "set_target_lambda") == 0 ||
+        (strcmp(command, "operate.set_target") == 0 &&
+         laser_controller_comms_find_value_start(line, "\"lambda_nm\":", false) != NULL) ||
+        (strcmp(command, "operate.set_target") == 0 &&
+         laser_controller_comms_find_value_start(line, "\"target_mode\":\"", true) != NULL &&
+         strstr(line, "\"target_mode\":\"lambda\"") != NULL)) {
         float target_lambda_nm = 0.0f;
         laser_controller_bench_status_t bench_status_after = status.bench;
 
@@ -4683,7 +5076,8 @@ static void laser_controller_comms_handle_command_line(const char *line)
         return;
     }
 
-    if (strcmp(command, "configure_modulation") == 0) {
+    if (strcmp(command, "configure_modulation") == 0 ||
+        strcmp(command, "operate.set_modulation") == 0) {
         bool enabled = false;
         uint32_t frequency_hz = 0U;
         uint32_t duty_cycle_pct = 0U;
@@ -5002,7 +5396,8 @@ static void laser_controller_comms_handle_command_line(const char *line)
         return;
     }
 
-    if (strcmp(command, "save_bringup_profile") == 0) {
+    if (strcmp(command, "save_bringup_profile") == 0 ||
+        strcmp(command, "integrate.save_profile") == 0) {
         laser_controller_service_save_profile(now_ms);
         laser_controller_logger_log(
             now_ms,

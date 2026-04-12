@@ -10,11 +10,20 @@
 #include "laser_controller_types.h"
 
 #define LASER_CONTROLLER_DEPLOYMENT_FAILURE_REASON_LEN 96U
+#define LASER_CONTROLLER_DEPLOYMENT_SECONDARY_EFFECT_COUNT 4U
 
 typedef enum {
     LASER_CONTROLLER_DEPLOYMENT_TARGET_MODE_TEMP = 0,
     LASER_CONTROLLER_DEPLOYMENT_TARGET_MODE_LAMBDA,
 } laser_controller_deployment_target_mode_t;
+
+typedef enum {
+    LASER_CONTROLLER_DEPLOYMENT_PHASE_INACTIVE = 0,
+    LASER_CONTROLLER_DEPLOYMENT_PHASE_ENTRY,
+    LASER_CONTROLLER_DEPLOYMENT_PHASE_CHECKLIST,
+    LASER_CONTROLLER_DEPLOYMENT_PHASE_READY_IDLE,
+    LASER_CONTROLLER_DEPLOYMENT_PHASE_FAILED,
+} laser_controller_deployment_phase_t;
 
 typedef enum {
     LASER_CONTROLLER_DEPLOYMENT_STEP_NONE = 0,
@@ -46,23 +55,59 @@ typedef struct {
 } laser_controller_deployment_target_t;
 
 typedef struct {
+    bool tec_rail_pgood_raw;
+    bool tec_rail_pgood_filtered;
+    bool tec_temp_good;
+    bool tec_analog_plausible;
+    bool ld_rail_pgood_raw;
+    bool ld_rail_pgood_filtered;
+    bool driver_loop_good;
+    bool sbdn_high;
+    bool pcn_low;
+    laser_controller_amps_t idle_bias_current_a;
+} laser_controller_deployment_ready_truth_t;
+
+typedef struct {
+    laser_controller_fault_code_t code;
+    char reason[LASER_CONTROLLER_DEPLOYMENT_FAILURE_REASON_LEN];
+    laser_controller_time_ms_t at_ms;
+} laser_controller_deployment_secondary_effect_t;
+
+typedef struct {
     bool active;
     bool running;
     bool ready;
+    bool ready_idle;
+    bool ready_qualified;
+    bool ready_invalidated;
     bool failed;
+    uint32_t sequence_id;
+    laser_controller_deployment_phase_t phase;
     laser_controller_deployment_step_t current_step;
     laser_controller_deployment_step_t last_completed_step;
     laser_controller_fault_code_t failure_code;
     char failure_reason[LASER_CONTROLLER_DEPLOYMENT_FAILURE_REASON_LEN];
+    laser_controller_fault_code_t primary_failure_code;
+    char primary_failure_reason[LASER_CONTROLLER_DEPLOYMENT_FAILURE_REASON_LEN];
+    uint32_t secondary_effect_count;
+    laser_controller_deployment_secondary_effect_t
+        secondary_effects[LASER_CONTROLLER_DEPLOYMENT_SECONDARY_EFFECT_COUNT];
+    laser_controller_deployment_ready_truth_t ready_truth;
     laser_controller_deployment_target_t target;
     laser_controller_amps_t max_laser_current_a;
     float max_optical_power_w;
+    laser_controller_time_ms_t
+        step_started_at_ms[LASER_CONTROLLER_DEPLOYMENT_STEP_COUNT];
+    laser_controller_time_ms_t
+        step_completed_at_ms[LASER_CONTROLLER_DEPLOYMENT_STEP_COUNT];
     laser_controller_deployment_step_status_t
         step_status[LASER_CONTROLLER_DEPLOYMENT_STEP_COUNT];
 } laser_controller_deployment_status_t;
 
 const char *laser_controller_deployment_target_mode_name(
     laser_controller_deployment_target_mode_t target_mode);
+const char *laser_controller_deployment_phase_name(
+    laser_controller_deployment_phase_t phase);
 const char *laser_controller_deployment_step_name(
     laser_controller_deployment_step_t step);
 const char *laser_controller_deployment_step_label(

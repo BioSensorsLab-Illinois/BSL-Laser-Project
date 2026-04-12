@@ -13,6 +13,25 @@ const char *laser_controller_deployment_target_mode_name(
     }
 }
 
+const char *laser_controller_deployment_phase_name(
+    laser_controller_deployment_phase_t phase)
+{
+    switch (phase) {
+        case LASER_CONTROLLER_DEPLOYMENT_PHASE_INACTIVE:
+            return "inactive";
+        case LASER_CONTROLLER_DEPLOYMENT_PHASE_ENTRY:
+            return "entry";
+        case LASER_CONTROLLER_DEPLOYMENT_PHASE_CHECKLIST:
+            return "checklist";
+        case LASER_CONTROLLER_DEPLOYMENT_PHASE_READY_IDLE:
+            return "ready_idle";
+        case LASER_CONTROLLER_DEPLOYMENT_PHASE_FAILED:
+            return "failed";
+        default:
+            return "inactive";
+    }
+}
+
 const char *laser_controller_deployment_step_name(
     laser_controller_deployment_step_t step)
 {

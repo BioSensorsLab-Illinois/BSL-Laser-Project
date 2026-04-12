@@ -152,6 +152,7 @@ static void laser_controller_board_release_tof_sideband_if_needed(uint32_t gpio_
 #define LASER_CONTROLLER_STUSB_NVM_ALL_BANKS_MASK 0x1FU
 #define LASER_CONTROLLER_STUSB_NVM_COMMAND_TIMEOUT_MS 20U
 #define LASER_CONTROLLER_STUSB_NVM_RESET_DELAY_US 10U
+#define LASER_CONTROLLER_PD_SNAPSHOT_FRESH_MS   5000U
 #define LASER_CONTROLLER_TWO_PI_RAD            6.28318530717958647692f
 #define LASER_CONTROLLER_PI_RAD                3.14159265358979323846f
 #define LASER_CONTROLLER_RAD_PER_DEG           0.01745329251994329577f
@@ -169,6 +170,7 @@ typedef struct {
     laser_controller_service_pd_profile_t
         sink_profiles[LASER_CONTROLLER_SERVICE_PD_PROFILE_COUNT];
     laser_controller_time_ms_t updated_ms;
+    laser_controller_pd_snapshot_source_t source;
 } laser_controller_pd_snapshot_t;
 
 typedef struct {
@@ -317,10 +319,13 @@ static laser_controller_time_ms_t s_dac_last_attempt_ms;
 static bool s_gpio_ready;
 static bool s_pwm_active;
 static bool s_tof_illumination_pwm_active;
+static bool s_tof_runtime_owns_sideband;
 static laser_controller_board_tof_sideband_mode_t s_tof_sideband_mode;
 static uint32_t s_tof_sideband_applied_duty_cycle_pct;
 static uint32_t s_tof_sideband_applied_frequency_hz;
 static laser_controller_pd_snapshot_t s_pd_snapshot;
+static bool s_pd_refresh_allowed;
+static laser_controller_pd_snapshot_source_t s_pd_refresh_requested_source;
 static float s_last_ld_voltage_v = -1.0f;
 static float s_last_tec_voltage_v = -1.0f;
 static laser_controller_board_imu_runtime_t s_imu_runtime;
@@ -685,6 +690,12 @@ static bool laser_controller_board_service_owns_tof_sideband(void)
     return laser_controller_service_mode_requested() &&
            laser_controller_service_module_write_enabled(
                LASER_CONTROLLER_MODULE_TOF);
+}
+
+static bool laser_controller_board_any_owns_tof_sideband(void)
+{
+    return laser_controller_board_service_owns_tof_sideband() ||
+           s_tof_runtime_owns_sideband;
 }
 
 static void laser_controller_board_release_tof_sideband_if_needed(
@@ -3141,13 +3152,24 @@ static void laser_controller_board_refresh_pd_snapshot(laser_controller_time_ms_
     float cc_current_a = 0.0f;
     esp_err_t err;
 
-    if ((now_ms - s_pd_snapshot.updated_ms) < LASER_CONTROLLER_PD_POLL_MS) {
+    if (!s_pd_refresh_allowed &&
+        s_pd_snapshot.updated_ms > 0U &&
+        (now_ms - s_pd_snapshot.updated_ms) < LASER_CONTROLLER_PD_POLL_MS) {
         return;
     }
 
+    const bool forced_refresh = s_pd_refresh_allowed;
+    const laser_controller_pd_snapshot_source_t source =
+        forced_refresh ?
+            s_pd_refresh_requested_source :
+            LASER_CONTROLLER_PD_SNAPSHOT_SOURCE_CACHED;
+
+    s_pd_refresh_allowed = false;
+    s_pd_refresh_requested_source = LASER_CONTROLLER_PD_SNAPSHOT_SOURCE_NONE;
     memset(&s_pd_snapshot, 0, sizeof(s_pd_snapshot));
     laser_controller_board_clear_pd_readback();
     s_pd_snapshot.updated_ms = now_ms;
+    s_pd_snapshot.source = source;
 
     if (!laser_controller_service_module_expected(LASER_CONTROLLER_MODULE_PD)) {
         return;
@@ -3832,6 +3854,10 @@ void laser_controller_board_init_safe_defaults(void)
     (void)memset(&s_imu_runtime, 0, sizeof(s_imu_runtime));
     s_last_outputs = kSafeOutputs;
     s_pd_snapshot.updated_ms = 0U;
+    s_pd_snapshot.source = LASER_CONTROLLER_PD_SNAPSHOT_SOURCE_NONE;
+    s_pd_refresh_allowed = false;
+    s_pd_refresh_requested_source = LASER_CONTROLLER_PD_SNAPSHOT_SOURCE_NONE;
+    s_tof_runtime_owns_sideband = false;
     s_last_ld_voltage_v = -1.0f;
     s_last_tec_voltage_v = -1.0f;
     s_tof_last_poll_ms = 0U;
@@ -3862,6 +3888,7 @@ void laser_controller_board_init_safe_defaults(void)
     (void)laser_controller_board_ensure_adc_ready();
     (void)laser_controller_board_ensure_i2c_ready();
     (void)laser_controller_board_ensure_spi_ready();
+    laser_controller_board_apply_tof_sideband_state(false);
     laser_controller_board_disable_pcn_pwm_and_drive(true);
 }
 
@@ -3969,6 +3996,9 @@ void laser_controller_board_read_inputs(
     laser_controller_board_capture_haptic_readback();
     laser_controller_board_refresh_pd_snapshot(now_ms);
     inputs->pd_contract_valid = s_pd_snapshot.contract_valid;
+    inputs->pd_snapshot_fresh =
+        s_pd_snapshot.updated_ms > 0U &&
+        (now_ms - s_pd_snapshot.updated_ms) <= LASER_CONTROLLER_PD_SNAPSHOT_FRESH_MS;
     inputs->pd_source_is_host_only = s_pd_snapshot.host_only;
     inputs->pd_negotiated_power_w = s_pd_snapshot.negotiated_power_w;
     inputs->pd_source_voltage_v = s_pd_snapshot.source_voltage_v;
@@ -3976,6 +4006,13 @@ void laser_controller_board_read_inputs(
     inputs->pd_operating_current_a = s_pd_snapshot.operating_current_a;
     inputs->pd_contract_object_position = s_pd_snapshot.contract_object_position;
     inputs->pd_sink_profile_count = s_pd_snapshot.sink_profile_count;
+    inputs->pd_last_updated_ms = s_pd_snapshot.updated_ms;
+    inputs->pd_source =
+        inputs->pd_snapshot_fresh ?
+            s_pd_snapshot.source :
+        s_pd_snapshot.updated_ms > 0U ?
+            LASER_CONTROLLER_PD_SNAPSHOT_SOURCE_CACHED :
+            LASER_CONTROLLER_PD_SNAPSHOT_SOURCE_NONE;
     memcpy(
         inputs->pd_sink_profiles,
         s_pd_snapshot.sink_profiles,
@@ -3998,6 +4035,8 @@ void laser_controller_board_apply_outputs(const laser_controller_board_outputs_t
     s_last_outputs = *outputs;
     laser_controller_board_drive_safe_gpio_levels(outputs);
     laser_controller_board_apply_gpio_overrides();
+    laser_controller_board_apply_tof_sideband_state(
+        laser_controller_board_any_owns_tof_sideband());
 }
 
 void laser_controller_board_apply_debug_gpio_state_now(void)
@@ -4008,6 +4047,8 @@ void laser_controller_board_apply_debug_gpio_state_now(void)
 
     laser_controller_board_drive_safe_gpio_levels(&s_last_outputs);
     laser_controller_board_apply_gpio_overrides();
+    laser_controller_board_apply_tof_sideband_state(
+        laser_controller_board_any_owns_tof_sideband());
     laser_controller_board_refresh_haptic_gpio_levels();
     laser_controller_board_capture_gpio_inspector();
 }
@@ -4308,6 +4349,15 @@ esp_err_t laser_controller_board_burn_pd_nvm(
 
 void laser_controller_board_force_pd_refresh(void)
 {
+    laser_controller_board_force_pd_refresh_with_source(
+        LASER_CONTROLLER_PD_SNAPSHOT_SOURCE_INTEGRATE_REFRESH);
+}
+
+void laser_controller_board_force_pd_refresh_with_source(
+    laser_controller_pd_snapshot_source_t source)
+{
+    s_pd_refresh_allowed = true;
+    s_pd_refresh_requested_source = source;
     s_pd_snapshot.updated_ms = 0U;
 }
 
@@ -4381,7 +4431,7 @@ void laser_controller_board_reset_gpio_debug_state(void)
     laser_controller_board_drive_safe_gpio_levels(&s_last_outputs);
     laser_controller_board_apply_gpio_overrides();
     laser_controller_board_apply_tof_sideband_state(
-        laser_controller_board_service_owns_tof_sideband());
+        laser_controller_board_any_owns_tof_sideband());
     laser_controller_board_capture_gpio_inspector();
 }
 
@@ -4632,9 +4682,28 @@ esp_err_t laser_controller_board_set_tof_illumination(
         frequency_hz > 0U ? frequency_hz : LASER_CONTROLLER_TOF_LED_PWM_DEFAULT_FREQ_HZ,
         LASER_CONTROLLER_TOF_LED_PWM_MIN_FREQ_HZ,
         LASER_CONTROLLER_TOF_LED_PWM_MAX_FREQ_HZ);
+    s_tof_runtime_owns_sideband = false;
 
     return laser_controller_board_apply_tof_sideband_state_locked(
         laser_controller_board_service_owns_tof_sideband());
+}
+
+esp_err_t laser_controller_board_set_runtime_tof_illumination(
+    bool enabled,
+    uint32_t duty_cycle_pct,
+    uint32_t frequency_hz)
+{
+    s_tof_illumination.enabled = enabled && duty_cycle_pct > 0U;
+    s_tof_illumination.duty_cycle_pct =
+        laser_controller_board_clamp_u32(duty_cycle_pct, 0U, 100U);
+    s_tof_illumination.frequency_hz = laser_controller_board_clamp_u32(
+        frequency_hz > 0U ? frequency_hz : LASER_CONTROLLER_TOF_LED_PWM_DEFAULT_FREQ_HZ,
+        LASER_CONTROLLER_TOF_LED_PWM_MIN_FREQ_HZ,
+        LASER_CONTROLLER_TOF_LED_PWM_MAX_FREQ_HZ);
+    s_tof_runtime_owns_sideband = s_tof_illumination.enabled;
+
+    return laser_controller_board_apply_tof_sideband_state_locked(
+        laser_controller_board_any_owns_tof_sideband());
 }
 
 esp_err_t laser_controller_board_fire_haptic_test(void)

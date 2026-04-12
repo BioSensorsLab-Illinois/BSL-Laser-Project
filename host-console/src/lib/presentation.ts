@@ -343,7 +343,7 @@ export function buildSafetyChecks(snapshot: DeviceSnapshot): SafetyCheck[] {
     {
       label: 'No latched fault',
       pass: !snapshot.fault.latched,
-      detail: snapshot.fault.latched ? snapshot.fault.activeCode : 'Clean',
+      detail: snapshot.fault.latched ? snapshot.fault.latchedCode : 'Clean',
       progress: snapshot.fault.latched ? 0 : 100,
       tone: snapshot.fault.latched ? 'critical' : 'steady',
     },

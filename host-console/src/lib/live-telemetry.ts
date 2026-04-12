@@ -26,7 +26,50 @@ function normalizeDeploymentSteps(
     key: step?.key ?? fallback[index]?.key ?? `step_${index + 1}`,
     label: step?.label ?? fallback[index]?.label ?? `Step ${index + 1}`,
     status: step?.status ?? fallback[index]?.status ?? 'inactive',
+    startedAtMs: step?.startedAtMs ?? fallback[index]?.startedAtMs ?? 0,
+    completedAtMs: step?.completedAtMs ?? fallback[index]?.completedAtMs ?? 0,
   }))
+}
+
+function normalizeSecondaryEffects(
+  effects:
+    | Array<Partial<RealtimeTelemetry['deployment']['secondaryEffects'][number]> | undefined>
+    | RealtimeTelemetry['deployment']['secondaryEffects'],
+  fallback: RealtimeTelemetry['deployment']['secondaryEffects'],
+) {
+  const normalized: RealtimeTelemetry['deployment']['secondaryEffects'] = []
+
+  effects.forEach((effect, index) => {
+    if (effect === undefined) {
+      return
+    }
+
+    normalized.push({
+      code: effect.code ?? fallback[index]?.code ?? 'none',
+      reason: effect.reason ?? fallback[index]?.reason ?? '',
+      atMs: effect.atMs ?? fallback[index]?.atMs ?? 0,
+    })
+  })
+
+  return normalized
+}
+
+function normalizeReadyTruth(
+  readyTruth: Partial<RealtimeTelemetry['deployment']['readyTruth']> | undefined,
+  fallback: RealtimeTelemetry['deployment']['readyTruth'],
+) {
+  return {
+    tecRailPgoodRaw: readyTruth?.tecRailPgoodRaw ?? fallback.tecRailPgoodRaw,
+    tecRailPgoodFiltered: readyTruth?.tecRailPgoodFiltered ?? fallback.tecRailPgoodFiltered,
+    tecTempGood: readyTruth?.tecTempGood ?? fallback.tecTempGood,
+    tecAnalogPlausible: readyTruth?.tecAnalogPlausible ?? fallback.tecAnalogPlausible,
+    ldRailPgoodRaw: readyTruth?.ldRailPgoodRaw ?? fallback.ldRailPgoodRaw,
+    ldRailPgoodFiltered: readyTruth?.ldRailPgoodFiltered ?? fallback.ldRailPgoodFiltered,
+    driverLoopGood: readyTruth?.driverLoopGood ?? fallback.driverLoopGood,
+    sbdnHigh: readyTruth?.sbdnHigh ?? fallback.sbdnHigh,
+    pcnLow: readyTruth?.pcnLow ?? fallback.pcnLow,
+    idleBiasCurrentA: readyTruth?.idleBiasCurrentA ?? fallback.idleBiasCurrentA,
+  }
 }
 
 export function makeRealtimeTelemetryFromSnapshot(
@@ -45,7 +88,11 @@ export function makeRealtimeTelemetryFromSnapshot(
       sourceCurrentA: snapshot.pd.sourceCurrentA,
       operatingCurrentA: snapshot.pd.operatingCurrentA,
       sourceIsHostOnly: snapshot.pd.sourceIsHostOnly,
+      lastUpdatedMs: snapshot.pd.lastUpdatedMs,
+      snapshotFresh: snapshot.pd.snapshotFresh,
+      source: snapshot.pd.source,
     },
+    bench: { ...snapshot.bench },
     rails: {
       ld: { ...snapshot.rails.ld },
       tec: { ...snapshot.rails.tec },
@@ -82,6 +129,9 @@ export function makeRealtimeTelemetryFromSnapshot(
     fault: {
       latched: snapshot.fault.latched,
       activeCode: snapshot.fault.activeCode,
+      activeClass: snapshot.fault.activeClass,
+      latchedCode: snapshot.fault.latchedCode,
+      latchedClass: snapshot.fault.latchedClass,
       activeCount: snapshot.fault.activeCount,
       tripCounter: snapshot.fault.tripCounter,
     },
@@ -108,7 +158,11 @@ export function mergeRealtimeTelemetryIntoSnapshot(
       sourceCurrentA: telemetry.pd.sourceCurrentA,
       operatingCurrentA: telemetry.pd.operatingCurrentA,
       sourceIsHostOnly: telemetry.pd.sourceIsHostOnly,
+      lastUpdatedMs: telemetry.pd.lastUpdatedMs,
+      snapshotFresh: telemetry.pd.snapshotFresh,
+      source: telemetry.pd.source,
     },
+    bench: { ...snapshot.bench, ...telemetry.bench },
     rails: {
       ld: { ...snapshot.rails.ld, ...telemetry.rails.ld },
       tec: { ...snapshot.rails.tec, ...telemetry.rails.tec },
@@ -138,6 +192,11 @@ export function mergeRealtimeTelemetryIntoSnapshot(
     deployment: {
       ...snapshot.deployment,
       ...telemetry.deployment,
+      readyTruth: normalizeReadyTruth(telemetry.deployment?.readyTruth, snapshot.deployment.readyTruth),
+      secondaryEffects:
+        telemetry.deployment?.secondaryEffects !== undefined
+          ? normalizeSecondaryEffects(telemetry.deployment.secondaryEffects, snapshot.deployment.secondaryEffects)
+          : snapshot.deployment.secondaryEffects,
       steps:
         telemetry.deployment?.steps !== undefined
           ? normalizeDeploymentSteps(telemetry.deployment.steps, snapshot.deployment.steps)
@@ -162,6 +221,10 @@ function mergeRealtimeTelemetry(
     pd: {
       ...current.pd,
       ...(patch.pd ?? {}),
+    },
+    bench: {
+      ...current.bench,
+      ...(patch.bench ?? {}),
     },
     rails: {
       ld: {
@@ -212,6 +275,11 @@ function mergeRealtimeTelemetry(
     deployment: {
       ...current.deployment,
       ...(patch.deployment ?? {}),
+      readyTruth: normalizeReadyTruth(patch.deployment?.readyTruth, current.deployment.readyTruth),
+      secondaryEffects:
+        patch.deployment?.secondaryEffects !== undefined
+          ? normalizeSecondaryEffects(patch.deployment.secondaryEffects, current.deployment.secondaryEffects)
+          : current.deployment.secondaryEffects,
       steps:
         patch.deployment?.steps !== undefined
           ? normalizeDeploymentSteps(patch.deployment.steps, current.deployment.steps)

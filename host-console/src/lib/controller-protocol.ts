@@ -112,6 +112,8 @@ function decodeFastTelemetryPayload(payload: unknown): RealtimeTelemetryPatch {
     buttons: {
       stage1Pressed: hasBit(buttonFlags, 0),
       stage2Pressed: hasBit(buttonFlags, 1),
+      stage1Edge: false,
+      stage2Edge: false,
     },
   }
 }

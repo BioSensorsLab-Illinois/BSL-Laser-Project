@@ -339,8 +339,8 @@ export function InspectorRail({
             <dd>{snapshot.fault.activeCode}</dd>
           </div>
           <div>
-            <dt>Latched</dt>
-            <dd>{snapshot.fault.latched ? 'yes' : 'no'}</dd>
+            <dt>Latched blocker</dt>
+            <dd>{snapshot.fault.latched ? snapshot.fault.latchedCode : 'none'}</dd>
           </div>
           <div>
             <dt>Total trips</dt>

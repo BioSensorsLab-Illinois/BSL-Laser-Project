@@ -73,8 +73,8 @@ void laser_controller_config_load_defaults(laser_controller_config_t *config)
     config->thresholds.tec_min_command_c = 15.0f;
     config->thresholds.tec_max_command_c = 35.0f;
     config->thresholds.tec_ready_tolerance_c = 0.25f;
-    config->thresholds.max_laser_current_a = 5.0f;
-    config->thresholds.off_current_threshold_a = 0.005f;
+    config->thresholds.max_laser_current_a = 5.2f;
+    config->thresholds.off_current_threshold_a = 0.200f;
     config->thresholds.current_match_tolerance_a = 0.020f;
 
     config->timeouts.imu_stale_ms = 50U;

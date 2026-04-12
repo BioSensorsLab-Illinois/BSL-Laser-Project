@@ -6,6 +6,18 @@ Every prompt, every agent, and every operation in this repo must treat this file
 
 This project controls a life-critical surgical laser controller. Stability is the top priority. If a workflow mistake, permission conflict, stale assumption, or hidden control path could plausibly create unsafe behavior, stop and resolve it before continuing.
 
+## Most Important Rule
+
+Do not stop after implementation alone.
+
+Every powered-ready recovery pass must end with:
+
+- 3 independent UI/UX review agents
+- 3 independent code/hardware review agents
+- 1 independent on-device validation agent running the required powered-bench passes
+
+If any one of those 7 review or validation passes says no, the work is not done. Restart the polish / repair / validation loop and keep going until every pass clears or an explicit written blocker is recorded.
+
 ## Canonical Rule
 
 - Read this file first for every session.
@@ -135,6 +147,9 @@ Rules:
   - what docs/files must be consulted
   - what validations are mandatory
   - what must be written back into `Status.md` or `.agent/AGENT.md`
+- Every firmware logic change requires both:
+  - a full firmware logic audit covering state-machine effects, output ownership, rail behavior, GPIO ownership, PD ownership, and fault/invalidation behavior
+  - a full GUI logic audit covering operator-visible control paths, disabled-state reasons, page ownership boundaries, and any UI path that could trigger forbidden hardware communication
 
 ## Validation Requirements
 
@@ -224,10 +239,12 @@ If anything hardware-facing is uncertain, check these first:
 
 ## Future Implementation Requirements To Preserve
 
-This workflow-only refactor does not implement these behaviors yet, but future rewrite work must preserve them as tracked product requirements:
+The active host rewrite now lives under `.agent/runs/powered-ready-console/`. Treat `.agent/runs/v2-rewrite-seed/` as legacy USB-only context only.
 
-- the GUI Deployment page is removed and replaced with an inline pre-enable checklist on Control
-- deployment mode remains firmware-owned, but its user-facing controls live on Control instead of a separate page
+Future rewrite work must preserve these tracked product requirements:
+
+- the runtime workspace is `Operate`, with an inline pre-enable checklist instead of a standalone Deployment page
+- deployment mode remains firmware-owned, but its user-facing controls live in the operator runtime workspace instead of a separate page
 - checklist success must mean the laser can actually turn on once the required hardware is available
 - TEC power must come on before LD power
 - if TEC power is lost, LD power must stop immediately and `PCN` / `SBDN` must be pulled low
@@ -242,9 +259,7 @@ This workflow-only refactor does not implement these behaviors yet, but future r
     Host/runtime-controlled mode and the only mode allowed to use host-issued output enable and `PCN` modulation
 - only one runtime mode may be active at a time
 - `binary_trigger` is blocked from completion until the real trigger-button wiring is source-backed in this repo
-- the current USB-only bench is Phase 1 only:
-  - it can validate protocol, GPIO ownership, shared-bus stability, IMU, DAC, ToF, DRV2605 register access, GUI rendering, and safe pin-level behavior
-  - it cannot claim PD, TEC rail, LD rail, deployment-ready completion, or actual laser-enable validation
+- powered-ready validation must use a real powered bench and must not claim success from a USB-only safe-fail path
 
 ## Repo Orientation
 

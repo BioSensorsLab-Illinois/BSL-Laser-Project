@@ -1175,7 +1175,7 @@ export function CommandDeck({
                   </div>
                   <div className="metric-card">
                     <span>Fault latch</span>
-                    <strong>{snapshot.fault.latched ? snapshot.fault.activeCode : 'clear'}</strong>
+                    <strong>{snapshot.fault.latched ? snapshot.fault.latchedCode : 'clear'}</strong>
                     <small>{snapshot.fault.tripCounter} historical trips</small>
                   </div>
                   <div className="metric-card">

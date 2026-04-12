@@ -23,6 +23,8 @@ typedef struct {
     laser_controller_power_tier_t power_tier;
     laser_controller_fault_code_t active_fault_code;
     laser_controller_fault_class_t active_fault_class;
+    laser_controller_fault_code_t latched_fault_code;
+    laser_controller_fault_class_t latched_fault_class;
     uint32_t active_fault_count;
     uint32_t trip_counter;
     laser_controller_time_ms_t last_fault_ms;

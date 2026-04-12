@@ -33,7 +33,13 @@ The host app lives in [host-console](/Users/zz4/BSL/BSL-Laser/host-console) and 
 - Framer Motion
 - `lucide-react`
 
-The visual direction is a light clinical instrument console rather than a generic dark dashboard.
+The visual direction is now a restrained light instrument console with five normal workspaces:
+
+- `System`
+- `Operate`
+- `Integrate`
+- `Update`
+- `History`
 
 ## File Map
 
@@ -55,8 +61,8 @@ The visual direction is a light clinical instrument console rather than a generi
   Searchable and severity-filtered event view.
 - [host-console/src/components/CommandDeck.tsx](/Users/zz4/BSL/BSL-Laser/host-console/src/components/CommandDeck.tsx)
   Guarded read, write, service, and mock-injection command panels.
-- [host-console/src/components/ControlWorkbench.tsx](/Users/zz4/BSL/BSL-Laser/host-console/src/components/ControlWorkbench.tsx)
-  Control workspace for the inline pre-enable checklist, runtime-mode selection, staged laser requests, TEC targets, and modulation requests.
+- [host-console/src/components/OperateConsole.tsx](/Users/zz4/BSL/BSL-Laser/host-console/src/components/OperateConsole.tsx)
+  Operate workspace for compact deployment control, runtime-mode selection, staged output, TEC targets, and the bottom-mounted deployment log.
 - [host-console/src/components/BringupWorkbench.tsx](/Users/zz4/BSL/BSL-Laser/host-console/src/components/BringupWorkbench.tsx)
   Service-mode bring-up workspace for module expectations, bus diagnostics, and tuning.
 - [host-console/src/components/FirmwareWorkbench.tsx](/Users/zz4/BSL/BSL-Laser/host-console/src/components/FirmwareWorkbench.tsx)
@@ -64,9 +70,9 @@ The visual direction is a light clinical instrument console rather than a generi
 - [host-console/src/components/InspectorRail.tsx](/Users/zz4/BSL/BSL-Laser/host-console/src/components/InspectorRail.tsx)
   Device identity, transport state, fault summary, command history, and session export.
 
-## Views
+## Workspaces
 
-### Overview
+### System
 
 Shows:
 
@@ -74,16 +80,38 @@ Shows:
 - live power, rails, laser, TEC, IMU, and ToF telemetry
 - beam-permission matrix
 - recent event timeline
+- transport and Wi-Fi workflow
 
-### Events
+### Operate
 
 Shows:
 
-- full event and fault history
-- search by title, detail, or category
-- severity filtering
+- deployment entry and exit
+- a wizard-style deployment workspace with:
+  - narrow checklist rail
+  - single active-step panel
+  - compact runtime support cards
+- fixed 25 C deployment context instead of a deployment target editor
+- runtime-mode selection
+- runtime output and modulation controls
+- independent green-laser and GPIO6 LED controls
+- passive PD state only, with any explicit PD refresh or PDO write owned by `Integrate`
+- read-only safety summary
+- deployment-causal log at the bottom of the page with primary fault and secondary effects split
 
-### Firmware
+Checklist success is only meaningful when the controller reaches true idle-ready posture with TEC and LD held up correctly.
+
+### Integrate
+
+Shows:
+
+- protected service-mode entry and exit
+- persistent runtime safety editor
+- bring-up module expectations, bus diagnostics, and tuning
+- direct command workspace for low-level tool access
+- the only UI surface allowed to trigger STUSB4500 refreshes, runtime PDO writes, firmware PDO-plan saves, or STUSB NVM burns
+
+### Update
 
 Shows:
 
@@ -93,34 +121,18 @@ Shows:
 - safe-state preflight checklist
 - staged transfer progress
 
+### History
+
+Shows:
+
+- full event and fault history
+- search by title, detail, or category
+- severity filtering
+
 Current limitation:
 
 - direct flashing is only simulated in mock mode
 - Web Serial transport does not yet implement an ESP32 ROM flashing pipeline
-
-### Control
-
-Shows:
-
-- inline deployment entry, checklist progress, failure reason, and safety/target edits
-- runtime-mode selection between `binary_trigger` and `modulated_host`
-- staged laser power, TEC target, and modulation requests
-- live power and efficiency estimates
-- visual status feedback for NIR, alignment, TEC settling, faults, and OFF / INVALID telemetry
-
-This is the runtime workspace. The controller firmware still decides whether anything may actually turn on. On the USB-only Phase 1 bench, the inline checklist must explicitly explain that PD, TEC rail, LD rail, and final ready posture remain blocked.
-
-### Bring-up
-
-Shows:
-
-- protected service-mode entry and exit
-- module expected-present and debug-enabled toggles
-- I2C and SPI diagnostics
-- staged DAC, IMU, ToF, and DRV2605 tuning
-- host-local draft save and restore for partially populated bench builds
-
-When deployment mode is active, Bring-up stays readable for monitoring, but write paths are locked and modules should not appear disconnected just because deployment owns them.
 
 ## Transport Model
 
@@ -165,7 +177,7 @@ This is production-shaped, but not yet production-complete, because actual seria
 
 ## Next Work
 
-1. Replace the firmware mock board/service backends with real peripheral drivers while preserving the existing JSON contract.
+1. Finish moving the active host contract toward `status.*`, `deployment.*`, `operate.*`, and `integrate.*`.
 2. Add structured snapshot schemas and stricter protocol validation.
 3. Add signed-manifest verification and board-revision compatibility checks.
 4. Decide whether production flashing should be done through:

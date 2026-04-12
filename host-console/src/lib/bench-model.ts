@@ -5,7 +5,7 @@ import {
   estimateWavelengthFromTempC,
 } from './tec-calibration'
 
-export const LASER_FULL_CURRENT_A = 5
+export const LASER_FULL_CURRENT_A = 5.2
 export const LASER_FORWARD_VOLTAGE_V = 3
 export const LASER_FULL_OPTICAL_POWER_W = 5
 export const DRIVER_EFFICIENCY = 0.9
@@ -45,7 +45,16 @@ export function makeDefaultBenchControlStatus(): BenchControlStatus {
     runtimeModeSwitchAllowed: false,
     runtimeModeLockReason: 'Enter deployment mode before changing runtime mode.',
     requestedAlignmentEnabled: false,
+    appliedAlignmentEnabled: false,
     requestedNirEnabled: false,
+    requestedCurrentA: 0,
+    requestedLedEnabled: false,
+    requestedLedDutyCyclePct: 0,
+    appliedLedOwner: 'none',
+    appliedLedPinHigh: false,
+    illuminationEnabled: false,
+    illuminationDutyCyclePct: 0,
+    illuminationFrequencyHz: 20000,
     modulationEnabled: false,
     modulationFrequencyHz: 2000,
     modulationDutyCyclePct: 50,

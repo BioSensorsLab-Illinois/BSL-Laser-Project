@@ -149,6 +149,7 @@ type BringupFormState = {
   safetyTecMaxCommandC: string
   safetyTecReadyToleranceC: string
   safetyMaxLaserCurrentA: string
+  safetyOffCurrentThresholdA: string
 }
 
 type BringupDraft = BringupFormState
@@ -480,6 +481,7 @@ function makeFormState(snapshot: DeviceSnapshot): BringupFormState {
     safetyTecMaxCommandC: formatNumber(snapshot.safety.tecMaxCommandC, 1),
     safetyTecReadyToleranceC: formatNumber(snapshot.safety.tecReadyToleranceC, 2),
     safetyMaxLaserCurrentA: formatNumber(snapshot.safety.maxLaserCurrentA, 2),
+    safetyOffCurrentThresholdA: formatNumber(snapshot.safety.offCurrentThresholdA, 2),
   }
 }
 
@@ -2150,9 +2152,9 @@ export function BringupWorkbench({
       [
         {
           detail: 'Applying runtime safety thresholds and hold windows...',
-          cmd: 'set_runtime_safety',
+          cmd: 'integrate.set_safety',
           risk: 'service',
-          note: 'Update runtime safety thresholds, hysteresis, and timeout policy from the bring-up service page.',
+          note: 'Update and persist runtime safety thresholds, hysteresis, and timeout policy from the integrate workspace.',
           requireService: true,
           args: safetyArgs,
         },
@@ -2241,6 +2243,10 @@ export function BringupWorkbench({
       max_laser_current_a: parseNumber(
         form.safetyMaxLaserCurrentA,
         snapshot.safety.maxLaserCurrentA,
+      ),
+      off_current_threshold_a: parseNumber(
+        form.safetyOffCurrentThresholdA,
+        snapshot.safety.offCurrentThresholdA,
       ),
     }
   }
@@ -2687,9 +2693,9 @@ export function BringupWorkbench({
         })),
         {
           detail: 'Applying runtime safety policy...',
-          cmd: 'set_runtime_safety',
+          cmd: 'integrate.set_safety',
           risk: 'service' as const,
-          note: 'Push the shared Service-page safety policy as part of the full bring-up plan.',
+          note: 'Push and persist the shared integrate safety policy as part of the full bring-up plan.',
           requireService: true,
           args: buildSafetyPolicyArgs(),
         },
@@ -3683,11 +3689,11 @@ async function setLdSbdnMode(mode: LdSbdnMode) {
         <article className="panel-cutout">
           <div className="cutout-head">
             <ShieldAlert size={16} />
-            <strong>Runtime safety policy</strong>
+            <strong>Persistent runtime safety</strong>
           </div>
 
           <p className="panel-note">
-            Keep operational control in the Control page. Use this service page for all threshold, hysteresis, and timeout policy that changes how the firmware supervises the bench. Module pages may show those live values, but they should not own safety edits.
+            Keep operational control in Operate. Use this integrate page for threshold, hysteresis, and timeout policy that changes how firmware supervises the bench. Applying safety here now persists it to device storage automatically and deployment consumes the persisted values after reboot.
           </p>
 
           <div className="button-row">
@@ -3704,12 +3710,12 @@ async function setLdSbdnMode(mode: LdSbdnMode) {
               type="button"
               className="action-button is-inline is-accent"
               disabled={writesDisabled}
-              title="Apply the staged runtime safety policy. A write session will be requested automatically if needed."
+              title="Apply and persist the staged runtime safety policy. A write session will be requested automatically if needed."
               onClick={() => {
                 void applySafetyPolicy()
               }}
             >
-              Apply safety policy
+              Apply and persist safety
             </button>
           </div>
 
@@ -3961,6 +3967,19 @@ async function setLdSbdnMode(mode: LdSbdnMode) {
                 onChange={(event) => patchForm('safetyMaxLaserCurrentA', event.target.value)}
               />
             </label>
+            <label className="field">
+              <FieldLabel
+                label="Idle-bias threshold (A)"
+                help="Current below this threshold is treated as intentional ready-idle bias rather than unexpected current."
+              />
+              <input
+                type="number"
+                step="0.01"
+                value={form.safetyOffCurrentThresholdA}
+                title="Ready-idle bias current threshold."
+                onChange={(event) => patchForm('safetyOffCurrentThresholdA', event.target.value)}
+              />
+            </label>
           </div>
 
           <div className="status-badges">
@@ -4094,7 +4113,7 @@ async function setLdSbdnMode(mode: LdSbdnMode) {
               type="button"
               className="action-button is-inline"
               disabled={!commandReady || operation !== null}
-              title="Ask the current bench firmware to persist the active bring-up profile, including runtime safety thresholds and hold-time policy. Service mode is not required."
+              title="Ask the current bench firmware to persist the active bring-up profile. Runtime safety is already persisted when you apply it above."
               onClick={() =>
                 void runCommandSequence(
                   'Save bring-up profile',
@@ -4104,7 +4123,7 @@ async function setLdSbdnMode(mode: LdSbdnMode) {
                       detail: 'Requesting device-side profile save...',
                       cmd: 'save_bringup_profile',
                       risk: 'write',
-                      note: 'Request device-side persistence for the active bring-up profile, including runtime safety policy.',
+                      note: 'Request device-side persistence for the active bring-up profile.',
                     },
                   ],
                 )
