@@ -1,0 +1,129 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "env": {
+    "MAX_THINKING_TOKENS": "63999",
+    "BASH_DEFAULT_TIMEOUT_MS": "120000",
+    "BASH_MAX_TIMEOUT_MS": "600000",
+    "BSL_REPO_ROOT": "/Users/zz4/BSL/BSL-Laser"
+  },
+  "outputStyle": "bsl-safety-critical",
+  "statusLine": {
+    "type": "command",
+    "command": "$BSL_REPO_ROOT/.claude/hooks/statusline.sh"
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$BSL_REPO_ROOT/.claude/hooks/session-start-banner.sh"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $BSL_REPO_ROOT/.claude/hooks/pre-tool-use-firmware.py"
+          },
+          {
+            "type": "command",
+            "command": "python3 $BSL_REPO_ROOT/.claude/hooks/pre-tool-use-gui.py"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $BSL_REPO_ROOT/.claude/hooks/post-tool-use-track.py"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $BSL_REPO_ROOT/.claude/hooks/user-prompt-reminder.py"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $BSL_REPO_ROOT/.claude/hooks/stop-validation-check.py"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(idf.py build*)",
+      "Bash(idf.py fullclean*)",
+      "Bash(idf.py size*)",
+      "Bash(idf.py menuconfig)",
+      "Bash(. $IDF_PATH/export.sh*)",
+      "Bash(npm run build*)",
+      "Bash(npm run lint*)",
+      "Bash(npm run dev*)",
+      "Bash(npm ci*)",
+      "Bash(npm test*)",
+      "Bash(cd host-console && npm run build*)",
+      "Bash(cd host-console && npm run lint*)",
+      "Bash(cd host-console && npm run dev*)",
+      "Bash(cd host-console && npm ci*)",
+      "Bash(cd host-console && npm test*)",
+      "Bash(python3 host-console/scripts/live_controller_validation.py*)",
+      "Bash(python3 -m py_compile*)",
+      "Bash(python3 .claude/hooks/*)",
+      "Bash(.claude/hooks/*)",
+      "Bash(git status*)",
+      "Bash(git log*)",
+      "Bash(git diff*)",
+      "Bash(git show*)",
+      "Bash(git branch*)",
+      "Bash(git blame*)",
+      "Bash(git stash list*)",
+      "Bash(ls /dev/cu.*)",
+      "Bash(ls -la*)",
+      "Bash(pwd)",
+      "Bash(find /Users/zz4/BSL/BSL-Laser*)",
+      "Bash(chmod +x*)",
+      "Read(//Users/zz4/BSL/BSL-Laser/**)",
+      "Glob(//Users/zz4/BSL/BSL-Laser/**)",
+      "Grep(//Users/zz4/BSL/BSL-Laser/**)",
+      "Read(//Users/zz4/.claude/projects/-Users-zz4-BSL-BSL-Laser/**)",
+      "Read(//Users/zz4/.agents/skills/**)",
+      "Read(//Users/zz4/esp/**)"
+    ],
+    "deny": [
+      "Bash(git push*)",
+      "Bash(git push --force*)",
+      "Bash(git reset --hard*)",
+      "Bash(git commit --no-verify*)",
+      "Bash(git commit --amend*)",
+      "Bash(git rebase*)",
+      "Bash(idf.py *flash*)",
+      "Bash(./flash-firmware.command*)",
+      "Bash(rm -rf*)",
+      "Bash(rm -f*)",
+      "Bash(sudo*)"
+    ]
+  }
+}

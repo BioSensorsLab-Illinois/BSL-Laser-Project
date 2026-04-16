@@ -109,13 +109,22 @@ function decodeFastTelemetryPayload(payload: unknown): RealtimeTelemetryPatch {
       lambdaDriftBlocked: hasBit(safetyFlags, 4),
       tecTempAdcBlocked: hasBit(safetyFlags, 5),
     },
+    /*
+     * Fast-telemetry carries only the 4 press-state bits (no edges, no
+     * isrFireCount, no board_reachable). We emit a PARTIAL patch here —
+     * only the four pressed fields. The merger's {...current, ...patch}
+     * semantics preserve the other fields from live-telemetry and
+     * status_snapshot. Previously side1/2 + boardReachable + isrFireCount
+     * were emitted as `false/0` every 60 ms which clobbered the 1 s live
+     * telemetry values (2026-04-15 bugfix).
+     */
     buttons: {
       stage1Pressed: hasBit(buttonFlags, 0),
       stage2Pressed: hasBit(buttonFlags, 1),
-      stage1Edge: false,
-      stage2Edge: false,
+      side1Pressed: hasBit(buttonFlags, 2),
+      side2Pressed: hasBit(buttonFlags, 3),
     },
-  }
+  } as RealtimeTelemetryPatch
 }
 
 function nowIso(): string {

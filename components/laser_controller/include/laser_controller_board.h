@@ -6,18 +6,59 @@
 
 #include "esp_err.h"
 
+#include "laser_controller_buttons.h"
 #include "laser_controller_config.h"
 #include "laser_controller_pinmap.h"
+#include "laser_controller_rgb_led.h"
 #include "laser_controller_service.h"
 #include "laser_controller_types.h"
+
+/*
+ * ATLS6A214 SBDN pin (GPIO13) is a THREE-STATE input per datasheet Table 1
+ * (ATLS6A214D-3.pdf p.2-5):
+ *   - 0 V..0.4 V  → SHUTDOWN (laser driver fully off, fast <20us)
+ *   - 2.1 V..2.4 V → STANDBY  (driver idle, ~8mA, 20ms re-entry to operate)
+ *   - 2.6 V..14 V → OPERATE  (driver active)
+ *
+ * On the MainPCB, R27=13k7 (to DVDD_3V3) and R28=29k4 (to GND) form a
+ * divider that settles SBDN at ~2.25 V — in the STANDBY band — whenever the
+ * MCU leaves GPIO13 in input / Hi-Z mode. This is a hardware-sanctioned
+ * standby posture; see docs/hardware-recon.md and ATLS6A214D-3.pdf p.7
+ * Figure 6.
+ *
+ * FIRMWARE INVARIANTS (from hardware-safety audit 2026-04-14):
+ *  - Fault / fast beam-off MUST use SBDN_STATE_OFF (drive low). Standby is
+ *    NOT the safe posture on fault — it still draws 8 mA and keeps the
+ *    control loop armed.
+ *  - GPIO13 pulls MUST stay disabled in every state. Enabling an internal
+ *    pull would fight R27/R28 and shift the Hi-Z voltage out of the standby
+ *    band.
+ *  - In STANDBY, GPIO13 is reconfigured to GPIO_MODE_INPUT; in OFF and ON
+ *    it is GPIO_MODE_INPUT_OUTPUT with the level driven accordingly.
+ */
+typedef enum {
+    LASER_CONTROLLER_SBDN_STATE_OFF = 0,      /* drive LOW — fast shutdown */
+    LASER_CONTROLLER_SBDN_STATE_ON = 1,       /* drive HIGH — driver operate */
+    LASER_CONTROLLER_SBDN_STATE_STANDBY = 2,  /* INPUT/Hi-Z — ~2.25 V standby */
+} laser_controller_sbdn_state_t;
 
 typedef struct {
     bool enable_ld_vin;
     bool enable_tec_vin;
     bool enable_haptic_driver;
     bool enable_alignment_laser;
-    bool assert_driver_standby;
+    laser_controller_sbdn_state_t sbdn_state;
     bool select_driver_low_current;
+    /*
+     * RGB status LED target state (TLC59116). Written by the control task
+     * after safety evaluation, applied by the board layer on the output
+     * apply path. Dirty-compare is handled inside the driver so repeated
+     * identical applies incur zero I2C traffic. The GPIO6 front-LED
+     * brightness continues to flow through
+     * `laser_controller_board_set_runtime_tof_illumination` — the RGB
+     * status LED here is a SEPARATE physical LED on the button board.
+     */
+    laser_controller_rgb_led_state_t rgb_led;
 } laser_controller_board_outputs_t;
 
 typedef struct {
@@ -159,6 +200,16 @@ typedef struct {
     laser_controller_board_imu_readback_t imu_readback;
     laser_controller_board_haptic_readback_t haptic_readback;
     laser_controller_board_tof_readback_t tof_readback;
+    /*
+     * MCP23017 button-expander diagnostic readback. Published for the
+     * Integrate panel to surface reachability / last I2C error.
+     */
+    laser_controller_button_board_readback_t buttons_readback;
+    /*
+     * TLC59116 RGB-LED diagnostic readback. Mirrors the last-applied
+     * state so host UIs can render the current color/blink.
+     */
+    laser_controller_rgb_led_readback_t rgb_readback;
     laser_controller_board_gpio_inspector_t gpio_inspector;
 } laser_controller_board_inputs_t;
 
@@ -229,6 +280,27 @@ esp_err_t laser_controller_board_set_runtime_tof_illumination(
     bool enabled,
     uint32_t duty_cycle_pct,
     uint32_t frequency_hz);
+/*
+ * Set the hard maximum duty-cycle (percent, 0..100) for the GPIO6 ToF-board
+ * front LED. Applied at EVERY illumination entry point — both the service
+ * path (`laser_controller_board_set_tof_illumination`) and the runtime path
+ * (`laser_controller_board_set_runtime_tof_illumination`). If the caller
+ * requests a duty above this cap, the board layer silently clamps it down.
+ * Default is 100 (no cap). app.c pushes the value from
+ * `config.thresholds.max_tof_led_duty_cycle_pct` each control tick.
+ */
+void laser_controller_board_set_tof_led_max_duty_pct(uint32_t cap);
+uint32_t laser_controller_board_get_tof_led_max_duty_pct(void);
+/*
+ * Apply VL53L1X calibration at runtime. Stops ranging, writes distance
+ * mode / timing budget / ROI / offset / xtalk, then restarts ranging.
+ * Intended for operator-driven calibration updates from the Integrate
+ * panel. The full ToF init path also reads the current service-status
+ * calibration and performs the same writes at boot / after service
+ * exit. Added 2026-04-15.
+ */
+esp_err_t laser_controller_board_tof_apply_calibration(
+    const laser_controller_tof_calibration_t *cal);
 esp_err_t laser_controller_board_fire_haptic_test(void);
 void laser_controller_board_apply_actuator_targets(
     const laser_controller_config_t *config,

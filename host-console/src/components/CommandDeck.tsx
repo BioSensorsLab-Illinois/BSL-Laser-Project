@@ -1156,6 +1156,22 @@ export function CommandDeck({
                         )
                       },
                     })}
+                    {renderCommandActionRow({
+                      id: 'mock-ld-overtemp',
+                      label: 'Inject LD overtemp',
+                      description:
+                        'Latch a synthetic LD_OVERTEMP fault; verify the triggerDiag sub-card renders in Fault summary.',
+                      actionLabel: 'Inject',
+                      disabled: false,
+                      onActivate: () => {
+                        void runBusCommand(
+                          'Inject LD overtemp',
+                          'simulate_ld_overtemp_trip',
+                          'service',
+                          'Inject a simulated LD_OVERTEMP trip in the mock rig.',
+                        )
+                      },
+                    })}
                   </div>
                 </div>
               ) : null}

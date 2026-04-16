@@ -8,7 +8,7 @@ This document must be maintained in accordance with `.agent/PLANS.md`.
 
 After this rewrite, the host console is a clean powered-bench operator tool instead of a glossy dashboard glued onto the older bench model. Operators use five workspaces with a single runtime flow: `System`, `Operate`, `Integrate`, `Update`, and `History`. The `Operate` workspace owns deployment and runtime control. The deployment checklist updates live, stays compact, and only succeeds when the controller actually reaches ready posture with TEC and LD held in the correct post-checklist state.
 
-The firmware and host use one updated command family. Integrate safety changes become persistent device settings and deployment automatically uses them after reboot. The legacy `.agent/runs/v2-rewrite-seed/` material remains as historical USB-only context, but it is no longer the source of truth for the active rewrite.
+The firmware and host use one updated command family. Integrate safety changes become persistent device settings and deployment automatically uses them after reboot. The legacy `.agent/runs/_archive/v2-rewrite-seed/` material remains as historical USB-only context, but it is no longer the source of truth for the active rewrite.
 
 ## Progress
 
@@ -26,6 +26,19 @@ The firmware and host use one updated command family. Integrate safety changes b
 - [ ] Persist integrate safety updates immediately and expose save timestamps in the snapshot.
 - [x] (2026-04-06 18:40 America/Chicago) Updated protocol, architecture, validation, and active status docs for deployment-v2 and the idle-bias threshold ownership change.
 - [x] (2026-04-06 12:57 America/Chicago) Ran host build, rendered verification, and firmware build after the rewrite cutover.
+- [x] (2026-04-14) Fixed firmware LED flicker: `capture_tof_readback` now passes `any_owns_tof_sideband()` instead of `service_owns_tof_sideband`; `set_runtime_tof_illumination` bails out when service owns the sideband. Parameter renamed to `anyone_owns_sideband` to prevent recurrence.
+- [x] (2026-04-14) Implemented SBDN three-state driver on GPIO13 per ATLS6A214 datasheet (OFF=drive LOW, ON=drive HIGH, STANDBY=input/Hi-Z via R27/R28 2.25 V). Replaced `bool assert_driver_standby` / `bool driver_standby_asserted` with `laser_controller_sbdn_state_t sbdn_state` in board.h + safety.h. Every fault path forces OFF (fast 20 us shutdown).
+- [x] (2026-04-14) Fully ungated green alignment laser per user directive: `allow_alignment = true` unconditional in safety.c, LED-only gate in comms.c dispatcher, `enable_alignment_laser` honors request on every post-boot path in derive_outputs.
+- [x] (2026-04-14) Firmware now publishes `bench.hostControlReadiness` with `nirBlockedReason`, `alignmentBlockedReason`, `ledBlockedReason`, `sbdnState`. GUI renders precise pre-disabled tooltip reasons without re-implementing the firmware gate ordering.
+- [x] (2026-04-14) Host Operate page rewritten ground-up (`operate-v3` namespace): single cleaner file, debounced LED commit fixes the drag-time slider spam, green button is never software-disabled, SBDN state visible in the header and ready-truth grid.
+- [x] (2026-04-14) Firmware-wide logic audit (bsl-firmware-auditor) PASS; GPIO ownership audit (bsl-gpio-auditor) PASS; ATLS6A214 datasheet check (bsl-hardware-safety) PASS.
+- [x] (2026-04-14) Updated `docs/protocol-spec.md` to document alignment ungating, `hostControlReadiness`, and `sbdnState`.
+- [ ] (2026-04-14) BLOCKED: Powered Phase 2 (`aux-control-pass`, `ready-runtime-pass`, `fault-edge-pass`, new `sbdn-tri-state-pass`) — requires flashing the rebuilt image on the live bench; no `/dev/cu.usbmodem*` available this session.
+- [x] (2026-04-14, second round) Codified mandatory **Cross-Module Audit Fan-Out** policy in AGENT.md and added new skill `.agent/skills/cross-module-audit/SKILL.md`. Every firmware/host/protocol change now requires spawning the relevant subset of B1/B2/B3 + A1/A2/A3 + hardware-safety + docs-guardian and recording verdicts in Status.md before declaring done.
+- [x] (2026-04-14, second round) Added new firmware module `laser_controller_usb_debug_mock` for online testing on USB-only power. Hard-isolated: opt-in only, NEVER drives any GPIO, auto-disables on real PD or any non-auto-clear fault, latches new SYSTEM_MAJOR fault `usb_debug_mock_pd_conflict` on PD conflict.
+- [x] (2026-04-14, second round) New `derive_outputs` early-return for SYSTEM_MAJOR faults — closes a 1-tick hazard window where deployment-running READY_POSTURE could force `sbdn_state=ON` despite a fault.
+- [x] (2026-04-14, second round) Host: `UsbDebugMockPanel` in Integrate workspace, app-wide warning banner in App.tsx, full type / mock / spec sync.
+- [ ] Add `usb-debug-mock-pass` scenario to `host-console/scripts/live_controller_validation.py` so the enable gate hierarchy and PD-conflict latch can be regression-tested on real hardware.
 - [ ] Run the updated validation scenarios on live hardware.
 
 ## Surprises & Discoveries
@@ -52,10 +65,16 @@ The firmware and host use one updated command family. Integrate safety changes b
   Evidence: `/Users/zz4/Downloads/bsl-session-2026-04-06T18-44-38.008Z.json` and `/Users/zz4/Downloads/bsl-session-2026-04-06T18-50-22.549Z.json` differ materially in reported PD state despite the same nominal operator flow.
 - Observation: The lowest-risk way to satisfy the new control-page request was to promote green and GPIO6 LED control into explicit Operate runtime commands, because the firmware already had an alignment request seam and the board layer already modeled GPIO6 illumination state.
   Evidence: `laser_controller_bench_set_alignment_requested()` already existed, while `BringupWorkbench.tsx` already contained service-only green and GPIO6 light controls.
+- (2026-04-14) Observation: The LED flicker on Operate and the "flash-then-off" on Integrate were a single root cause, not two bugs. `capture_tof_readback` in board.c passed `service_owns_tof_sideband` (NOT `any_owns_tof_sideband()`) to `apply_tof_sideband_state`. Inside the locked function a FALSE parameter forces the sideband LOW. Every TOF poll (every few ms when the sensor is expected) stomped whatever the runtime setter had just written. The runtime setter was also missing the AGENT.md-required "bail out when service owns" guard, so in Integrate the control task's 5 ms tick was similarly stomping service writes.
+  Evidence: board.c:2593 (original), and the absence of `laser_controller_board_service_owns_tof_sideband()` early-return at the top of `laser_controller_board_set_runtime_tof_illumination`.
+- (2026-04-14) Observation: The ATLS6A214 SBDN pin is datasheet-documented as a three-state input (datasheet p.2 Table 1: 0..0.4 V shutdown, 2.1..2.4 V standby, 2.6..14 V operate). The MainPCB already has an R27=13k7 / R28=29k4 divider that produces 2.25 V on Hi-Z, squarely in the standby band. The previous firmware bool-only model was hardware-incorrect.
+  Evidence: `docs/Datasheets/ATLS6A214D-3.pdf` p.2-7 and `docs/Schematics/MainPCB.NET` lines 473-481.
+- (2026-04-14) Observation: `driver_operate_expected` (app.c) must be TRUE only when SBDN is ON — STANDBY is idle, not operate. Using `!assert_driver_standby` in the three-state world would incorrectly flag STANDBY as "operate expected" and could trigger the `FAULT_UNEXPECTED_CURRENT` heuristic in safety.c. Tightened to `sbdn_state == ON && !select_driver_low_current`.
+  Evidence: safety.c:300-312 (UNEXPECTED_CURRENT gate) and app.c:1965-1967 (snapshot population).
 
 ## Decision Log
 
-- Decision: Use `.agent/runs/powered-ready-console/` as the new active rewrite initiative and keep `.agent/runs/v2-rewrite-seed/` as legacy context.
+- Decision: Use `.agent/runs/powered-ready-console/` as the new active rewrite initiative and keep `.agent/runs/_archive/v2-rewrite-seed/` as legacy context.
   Rationale: The new target explicitly replaces the USB-only safe-fail rewrite assumptions with powered-ready deployment acceptance.
   Date/Author: 2026-04-06 / Codex
 - Decision: Keep existing low-level transport plumbing where it is already correct, but move the active host UI and parser/state surface onto the `domain/*` and `platform/*` path.
@@ -85,6 +104,39 @@ The firmware and host use one updated command family. Integrate safety changes b
 - Decision: Keep green laser and GPIO6 LED operator-visible in Operate regardless of deployment readiness, while forcing GPIO6 low on deployment entry before any checklist step begins.
   Rationale: The user wants both controls available at any time, but deployment entry itself must never spuriously turn the LED on.
   Date/Author: 2026-04-06 / Codex
+- Decision: Replace the `bool assert_driver_standby` / `bool driver_standby_asserted` fields with a three-state `laser_controller_sbdn_state_t { OFF, ON, STANDBY }` and teach the board layer to reconfigure GPIO13 between INPUT_OUTPUT and INPUT modes at runtime.
+  Rationale: User-confirmed (and datasheet-confirmed) semantics require three states. OFF (drive LOW) is the datasheet fast-shutdown path; STANDBY (Hi-Z) is the idle-armed posture used in ready-idle with no NIR; ON (drive HIGH) is the active operate posture.
+  Date/Author: 2026-04-14 / Claude (opus-4-6)
+- Decision: Every fault / safe-off / service-mode path forces `sbdn_state = OFF`, never STANDBY. Hi-Z still draws 8 mA idle current and takes 20 ms to resume operate; drive-LOW takes 20 us for full shutdown per datasheet. STANDBY is ONLY used in the deliberate ready-idle-no-NIR path.
+  Rationale: hardware-safety agent invariant from the ATLS6A214 datasheet audit. Flagged as PASS in the firmware-wide audit; treating STANDBY as the safe-on-fault posture would violate the datasheet fast-shutdown spec.
+  Date/Author: 2026-04-14 / Claude
+- Decision: Fully ungate green alignment laser at the software level per explicit user directive 2026-04-14 ("safe to activate at ALL TIME, no interlock for it at all"). `allow_alignment = true` unconditional in safety.c; `is_aux_control_command` renamed to `is_led_control_command` so only LED retains the deployment gate; every `derive_outputs` path after `boot_complete` honors `alignment_output_enable`.
+  Rationale: Green is inherently eye-safe at this product's power levels. The user accepted the residual GPIO37 shared-net hazard (ERM_TRIG + GN_LD_EN); the bsl-gpio-auditor confirmed this is bounded by existing `enable_haptic_driver` service-mode gating and `ERM_EN=LOW` outside service mode keeps DRV2605 quiescent.
+  Date/Author: 2026-04-14 / Claude
+- Decision: Publish `bench.hostControlReadiness` ({nir,alignment,led}BlockedReason + sbdnState) from firmware instead of having the GUI re-compute gate ordering client-side.
+  Rationale: Avoids mock-vs-firmware drift. Single source of truth for "why is this button disabled right now." Host reads the token and maps to a display string via a small label helper.
+  Date/Author: 2026-04-14 / Claude
+- Decision: Debounce the LED brightness commit 200 ms trailing on the GUI side, instead of firing `operate.set_led` on every slider mouseup/touchend/blur.
+  Rationale: Dragging previously spammed 5-10 commands per second, and the `enabled` field of each intermediate commit was recomputed from the live snapshot before the firmware had acknowledged the prior write — causing visible LED flicker independent from the firmware-side flicker that the sideband fix resolves.
+  Date/Author: 2026-04-14 / Claude
+- Decision: Transfer GPIO7 ownership from the VL53L1X data-ready interrupt to the MCP23017 INTA (open-drain, active-low). Move ToF data freshness to polling-only via the `RANGE_STATUS` register on the existing 75 ms intermeasurement cadence.
+  Rationale: The button board physically shares the J2 connector with the ToF daughterboard; the connector exports a single GPIO7 pin, so only one source can own the line. Per the user directive 2026-04-15, the button board is the new owner. Polling-only ToF is acceptable because the distance interlock is a slow-moving safety check (no need for sub-100 ms latency).
+  Date/Author: 2026-04-15 / Claude
+- Decision: Gate button-driven NIR/alignment requests on `runtime_mode == BINARY_TRIGGER` and `inputs.button.board_reachable`. In `MODULATED_HOST` mode the buttons are advisory telemetry only — host requests are the truth. Resolves the prior inconsistency between the runtime gate (which silently honored buttons in any mode) and the published `nir_blocked_reason` (which said "not-modulated-host" when not in host mode).
+  Rationale: A clean dual-source model with explicit ownership prevents racy "two operators trying to drive NIR" failure modes and matches the documented gate-reason taxonomy. The user-facing semantics are: switch to "Trigger buttons" in Operate to use the physical switches; switch to "Host control" to drive NIR from the GUI.
+  Date/Author: 2026-04-15 / Claude
+- Decision: Implement a press-and-hold lockout (`button_nir_lockout`) that latches when an interlock fires while either trigger stage is held, and clears only when both stages release on the same control-task tick. While latched, NIR requests from buttons are forced false. Alignment is unaffected (green has no interlock).
+  Rationale: Per user directive 2026-04-15, an auto-clearing interlock should NOT cause NIR to immediately re-fire mid-press. The operator must physically release and re-engage. This adds one bit of state to the control task; no new fault code is needed because the underlying interlock fault remains the source-of-truth.
+  Date/Author: 2026-04-15 / Claude
+- Decision: Add a new deployment checklist step `LP_GOOD_CHECK` between `TEC_SETTLE` and `READY_POSTURE` that drives SBDN to ON with PCN low and waits up to 1 s for `LD_LPGD` to assert. Failure raises a new SYSTEM_MAJOR fault `LD_LP_GOOD_TIMEOUT` and aborts the deployment with that as the primary failure code.
+  Rationale: Per user directive 2026-04-15, READY_POSTURE could declare ready-idle on a driver that cannot actually lock its current loop. The new step is a "loop-lock at zero drive" verification before any current is requested. The 1 s timeout is fixed in firmware (not in `config->timeouts`) so an operator cannot inadvertently relax it.
+  Date/Author: 2026-04-15 / Claude
+- Decision: Compute the RGB status LED color in firmware (priority: integrate-test override > unrecoverable flash-red > recoverable flash-orange > pre-deployment off > NIR firing solid-red > stage1+rails+temp armed solid-green > ready solid-blue) and publish the resulting state via the snapshot. Host renders firmware-decided color without recomputing.
+  Rationale: Avoids host/firmware drift on the gate ordering. Matches the precedent set by `hostControlReadiness` on 2026-04-14. The integrate-test override path (`integrate.rgb_led.set` / `integrate.rgb_led.clear`) is service-mode-only with a watchdog window so the LED always returns to firmware control.
+  Date/Author: 2026-04-15 / Claude
+- Decision: Use TLC59116 hardware group-blink (GRPFREQ=23 → 1 Hz period, GRPPWM=128 → 50% duty, MODE2.DMBLNK=1) for the flashing states instead of toggling MODE2 from the 5 ms control tick. Keeps blink phase deterministic across reconnects and free of jitter from control-task scheduling.
+  Rationale: User preference 2026-04-15 + hardware capability already exists. Costs zero ongoing bus traffic — only a single MODE2 byte write at color-state transitions.
+  Date/Author: 2026-04-15 / Claude
 
 ## Outcomes & Retrospective
 

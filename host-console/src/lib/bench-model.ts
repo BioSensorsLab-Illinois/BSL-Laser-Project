@@ -59,6 +59,20 @@ export function makeDefaultBenchControlStatus(): BenchControlStatus {
     modulationFrequencyHz: 2000,
     modulationDutyCyclePct: 50,
     lowStateCurrentA: 0,
+    hostControlReadiness: {
+      nirBlockedReason: 'not-connected',
+      alignmentBlockedReason: 'none',
+      ledBlockedReason: 'not-connected',
+      sbdnState: 'off',
+    },
+    usbDebugMock: {
+      active: false,
+      pdConflictLatched: false,
+      enablePending: false,
+      activatedAtMs: 0,
+      deactivatedAtMs: 0,
+      lastDisableReason: '',
+    },
   }
 }
 

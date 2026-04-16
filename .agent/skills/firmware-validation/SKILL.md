@@ -1,3 +1,8 @@
+---
+name: firmware-validation
+description: Required when validating firmware behavior, logic, or protocol changes. Separates compile success from logic validation; assumes serial access via /dev/cu.usbmodem*; enforces bench-posture labeling (USB Phase 1 is NOT powered-rail evidence). Trigger on firmware validation requests, running live_controller_validation.py, scope/logic-analyzer checks on SBDN/PCN/PWR_TEC_EN/PWR_LD_EN, or interpreting firmware build/flash/run results. Write observed vs inferred separately to Status.md.
+---
+
 # firmware-validation
 
 Use this skill whenever firmware behavior, firmware logic, or firmware-facing protocol changes are being validated.

@@ -779,6 +779,191 @@ def scenario_fault_edge_pass(client: ControllerClient) -> None:
     print("fault-edge-pass: PASS")
 
 
+def scenario_button_trigger_pass(client: ControllerClient) -> None:
+    """
+    Powered-bench validation of the binary-trigger button-board path.
+
+    Requires the button board to be physically present and the operator
+    to physically press the buttons during the polling phase. The
+    validation harness verifies the firmware is reading the button state
+    and routing it through the safety decision correctly; it does NOT
+    synthesize button presses (the MCP23017 cannot be remotely triggered
+    from this script).
+    """
+    snapshot = get_status(client, 1601)
+    button_board = snapshot.get("buttonBoard", {})
+    require(
+        button_board.get("mcpReachable") is True,
+        "MCP23017 must be reachable @ 0x20 for button-trigger-pass",
+    )
+    require(
+        button_board.get("tlcReachable") is True,
+        "TLC59116 must be reachable @ 0x60 for button-trigger-pass",
+    )
+
+    # Run deployment to ready_idle so the trigger gate is active.
+    request_cmd(client, 1602, "deployment.enter", timeout_s=10.0)
+    request_cmd(client, 1603, "deployment.run", timeout_s=10.0)
+    ready_snapshot = wait_for_deployment_terminal(client, timeout_s=60.0, start_id=1604)
+    require(
+        ready_snapshot.get("deployment", {}).get("ready") is True,
+        "deployment must reach ready for button-trigger-pass",
+    )
+
+    # Switch to binary_trigger — should be allowed now that mcpReachable=true.
+    mode_resp = request_cmd(
+        client,
+        1620,
+        "operate.set_mode",
+        args={"mode": "binary_trigger"},
+        timeout_s=10.0,
+    )
+    require(
+        mode_resp.get("ok") is True,
+        "binary_trigger mode-switch must succeed when mcpReachable=true",
+    )
+
+    # Poll for ~30 s while the operator presses each of the four buttons.
+    # Verify that stage1, stage2, side1, side2 each show pressed at some
+    # point AND that the firmware-published triggerPhase advances past
+    # 'ready' at least once.
+    seen_stage1 = False
+    seen_stage2 = False
+    seen_side1 = False
+    seen_side2 = False
+    seen_armed = False
+    seen_firing = False
+    initial_isr = button_board.get("isrFireCount", 0)
+    deadline = time.time() + 30.0
+    cmd_id = 1640
+    while time.time() < deadline:
+        snap = get_status(client, cmd_id)
+        cmd_id += 1
+        bb = snap.get("buttonBoard", {})
+        btns = snap.get("buttons", {})
+        if btns.get("stage1Pressed"):
+            seen_stage1 = True
+        if btns.get("stage2Pressed"):
+            seen_stage2 = True
+        if btns.get("side1Pressed"):
+            seen_side1 = True
+        if btns.get("side2Pressed"):
+            seen_side2 = True
+        phase = bb.get("triggerPhase")
+        if phase == "armed":
+            seen_armed = True
+        if phase == "firing":
+            seen_firing = True
+        if seen_stage1 and seen_stage2 and seen_side1 and seen_side2 and seen_armed and seen_firing:
+            break
+        time.sleep(0.5)
+
+    require(seen_stage1, "stage1 press never observed during button-trigger-pass")
+    require(seen_stage2, "stage2 press never observed during button-trigger-pass")
+    require(seen_side1, "side1 press never observed during button-trigger-pass")
+    require(seen_side2, "side2 press never observed during button-trigger-pass")
+    require(seen_armed, "triggerPhase=armed never observed (stage1 + LD/TEC good)")
+    require(seen_firing, "triggerPhase=firing never observed (stage2 NIR fire)")
+
+    # Verify INTA fired (counter increased).
+    final_snap = get_status(client, cmd_id)
+    final_isr = final_snap.get("buttonBoard", {}).get("isrFireCount", 0)
+    require(
+        final_isr > initial_isr,
+        "MCP23017 INTA must fire at least once during the press sequence",
+    )
+
+    print("button-trigger-pass: PASS")
+
+
+def scenario_rgb_led_pass(client: ControllerClient) -> None:
+    """
+    Drive the TLC59116 through a color cycle via integrate.rgb_led.set
+    while in service mode + no deployment + no fault latch. Operator
+    must visually confirm each color and the 1 Hz / 50% blink rate.
+    """
+    # Enter service mode.
+    request_cmd(client, 1701, "enter_service_mode", timeout_s=5.0)
+    # Cycle through five test colors. Each call holds for 3 s; the
+    # operator should call out the color before the script advances.
+    test_colors = [
+        ("red solid", {"r": 255, "g": 0, "b": 0, "blink": False, "hold_ms": 3000}),
+        ("green solid", {"r": 0, "g": 255, "b": 0, "blink": False, "hold_ms": 3000}),
+        ("blue solid", {"r": 0, "g": 0, "b": 255, "blink": False, "hold_ms": 3000}),
+        ("orange flash", {"r": 255, "g": 80, "b": 0, "blink": True, "hold_ms": 3000}),
+        ("red flash", {"r": 255, "g": 0, "b": 0, "blink": True, "hold_ms": 3000}),
+    ]
+    cmd_id = 1710
+    for label, args in test_colors:
+        resp = request_cmd(client, cmd_id, "integrate.rgb_led.set", args=args, timeout_s=5.0)
+        cmd_id += 1
+        require(resp.get("ok") is True, f"integrate.rgb_led.set must succeed for {label}")
+        snap = unwrap_snapshot(resp)
+        rgb = snap.get("buttonBoard", {}).get("rgb", {})
+        require(
+            rgb.get("r") == args["r"]
+            and rgb.get("g") == args["g"]
+            and rgb.get("b") == args["b"]
+            and rgb.get("blink") is args["blink"]
+            and rgb.get("testActive") is True,
+            f"published RGB state must match the {label} request",
+        )
+        time.sleep(args["hold_ms"] / 1000)
+
+    # Clear and confirm reverts to firmware-computed state.
+    clear_resp = request_cmd(client, cmd_id, "integrate.rgb_led.clear", timeout_s=5.0)
+    require(clear_resp.get("ok") is True, "integrate.rgb_led.clear must succeed")
+    cleared = unwrap_snapshot(clear_resp)
+    require(
+        cleared.get("buttonBoard", {}).get("rgb", {}).get("testActive") is False,
+        "rgb.testActive must go false after clear",
+    )
+
+    # Exit service mode.
+    request_cmd(client, cmd_id + 1, "exit_service_mode", timeout_s=5.0)
+    print("rgb-led-pass: PASS")
+
+
+def scenario_sbdn_lp_good_pass(client: ControllerClient) -> None:
+    """
+    Force the new LD_LP_GOOD_TIMEOUT path. Requires the operator to
+    physically open LD_LPGD before invoking this scenario (e.g. unseat
+    a connector or drive the test point). The deployment LP_GOOD_CHECK
+    step should fail after ~1 s with primary failure code
+    `ld_lp_good_timeout` and the RGB LED should switch to flash-red.
+    """
+    request_cmd(client, 1801, "deployment.enter", timeout_s=10.0)
+    request_cmd(client, 1802, "deployment.run", timeout_s=10.0)
+    failed_snapshot = wait_for_deployment_terminal(client, timeout_s=60.0, start_id=1803)
+    deployment = failed_snapshot.get("deployment", {})
+    require(
+        deployment.get("failed") is True,
+        "deployment must fail when LD_LPGD is held low",
+    )
+    require(
+        deployment.get("primaryFailureCode") == "ld_lp_good_timeout",
+        f"primary failure code must be ld_lp_good_timeout, got "
+        f"{deployment.get('primaryFailureCode')!r}",
+    )
+    require(
+        deployment.get("currentStep") == "lp_good_check"
+        or deployment.get("lastCompletedStep") == "tec_settle",
+        "failure must be attributed to the lp_good_check step",
+    )
+
+    # Verify RGB went to flash-red (unrecoverable). May take a tick to apply.
+    time.sleep(0.5)
+    rgb_snapshot = get_status(client, 1830)
+    rgb = rgb_snapshot.get("buttonBoard", {}).get("rgb", {})
+    require(
+        rgb.get("r") == 255 and rgb.get("g") == 0 and rgb.get("blink") is True,
+        f"RGB must be flash-red after LD_LP_GOOD_TIMEOUT, got "
+        f"r={rgb.get('r')} g={rgb.get('g')} blink={rgb.get('blink')}",
+    )
+
+    print("sbdn-lp-good-pass: PASS")
+
+
 def make_client(args: argparse.Namespace) -> ControllerClient:
     if args.transport == "ws":
         return WebSocketControllerClient(args.ws_url, timeout_s=args.timeout_s)
@@ -807,6 +992,9 @@ def main() -> int:
             "aux-control-pass",
             "ready-runtime-pass",
             "fault-edge-pass",
+            "button-trigger-pass",
+            "rgb-led-pass",
+            "sbdn-lp-good-pass",
         ],
         required=True,
     )
@@ -835,6 +1023,12 @@ def main() -> int:
             scenario_ready_runtime_pass(client)
         elif args.scenario == "fault-edge-pass":
             scenario_fault_edge_pass(client)
+        elif args.scenario == "button-trigger-pass":
+            scenario_button_trigger_pass(client)
+        elif args.scenario == "rgb-led-pass":
+            scenario_rgb_led_pass(client)
+        elif args.scenario == "sbdn-lp-good-pass":
+            scenario_sbdn_lp_good_pass(client)
         else:
             scenario_deployment_runtime_flow(client)
     finally:

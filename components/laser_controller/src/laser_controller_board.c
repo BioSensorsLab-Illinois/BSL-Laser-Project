@@ -255,8 +255,15 @@ static const laser_controller_board_outputs_t kSafeOutputs = {
     .enable_tec_vin = false,
     .enable_haptic_driver = false,
     .enable_alignment_laser = false,
-    .assert_driver_standby = true,
+    .sbdn_state = LASER_CONTROLLER_SBDN_STATE_OFF,
     .select_driver_low_current = true,
+    .rgb_led = {
+        .r = 0U,
+        .g = 0U,
+        .b = 0U,
+        .blink = false,
+        .enabled = false,
+    },
 };
 
 static const struct {
@@ -304,7 +311,7 @@ static laser_controller_board_outputs_t s_last_outputs = {
     .enable_tec_vin = false,
     .enable_haptic_driver = false,
     .enable_alignment_laser = false,
-    .assert_driver_standby = true,
+    .sbdn_state = LASER_CONTROLLER_SBDN_STATE_OFF,
     .select_driver_low_current = true,
 };
 static adc_oneshot_unit_handle_t s_adc_handle;
@@ -341,6 +348,23 @@ static laser_controller_time_ms_t s_tof_last_poll_ms;
 static esp_err_t s_tof_last_error;
 static SemaphoreHandle_t s_bus_mutex;
 static StaticSemaphore_t s_bus_mutex_buffer;
+/*
+ * Button board + RGB LED state. All reads/writes are on the control task
+ * (same ownership as the other peripheral readbacks) so no additional
+ * lock is required. The ISR increments an atomic counter inside
+ * laser_controller_buttons.c; the control task drains it via
+ * laser_controller_buttons_get_isr_fire_count().
+ */
+static laser_controller_button_board_readback_t s_button_readback;
+static laser_controller_rgb_led_readback_t s_rgb_readback;
+static laser_controller_button_state_t s_last_button_state;
+/*
+ * Hard safety cap on GPIO6 ToF LED duty-cycle. Default 100 (no cap) until
+ * app.c pushes the configured value from `safety.max_tof_led_duty_cycle_pct`.
+ * Written by control task; read by set_tof_illumination + set_runtime_*.
+ * A cap of 0 disables the LED entirely.
+ */
+static uint32_t s_tof_led_max_duty_pct = 100U;
 
 static void laser_controller_board_lock_bus(void)
 {
@@ -409,6 +433,29 @@ static bool laser_controller_board_is_transport_or_strap_gpio(uint32_t gpio_num)
            gpio_num == LASER_CONTROLLER_GPIO_BOOT_OPTION ||
            gpio_num == LASER_CONTROLLER_GPIO_JTAG_STRAP_OPEN ||
            gpio_num == LASER_CONTROLLER_GPIO_VDD_SPI_STRAP_OPEN;
+}
+
+/*
+ * ADC1-bound analog input pins used for telemetry (LD TMO, LD LIO,
+ * TEC TMO, TEC ITEC, TEC VTEC). These are configured ONCE at boot via
+ * `adc_oneshot_config_channel` inside `ensure_adc_ready`, and the
+ * configuration is never re-applied. Any path that calls
+ * `gpio_reset_pin` on these pins clobbers the ADC analog configuration:
+ * IOMUX goes back to `PIN_FUNC_GPIO`, the digital input buffer state
+ * flips, and the default pull state is reapplied — all of which can
+ * shift the analog readback or add noise. The GPIO-override sweep in
+ * `laser_controller_board_reset_gpio_debug_state` previously hit these
+ * pins on every service-mode exit / deployment entry / overrides-clear
+ * transition. Excluding them here preserves the ADC pin state across
+ * those transitions. User directive 2026-04-15 (late).
+ */
+static bool laser_controller_board_is_adc_input_gpio(uint32_t gpio_num)
+{
+    return gpio_num == LASER_CONTROLLER_GPIO_LD_DRIVER_TEMP_MONITOR ||
+           gpio_num == LASER_CONTROLLER_GPIO_LD_CURRENT_MONITOR ||
+           gpio_num == LASER_CONTROLLER_GPIO_TEC_TMO ||
+           gpio_num == LASER_CONTROLLER_GPIO_TEC_ITEC ||
+           gpio_num == LASER_CONTROLLER_GPIO_TEC_VTEC;
 }
 
 static bool laser_controller_board_gpio_override_active(uint32_t gpio_num)
@@ -712,8 +759,18 @@ static void laser_controller_board_release_tof_sideband_if_needed(
 }
 
 static esp_err_t laser_controller_board_apply_tof_sideband_state_locked(
-    bool service_owns_sideband)
+    bool anyone_owns_sideband)
 {
+    /*
+     * NOTE ON PARAMETER SEMANTICS:
+     * The caller must pass `laser_controller_board_any_owns_tof_sideband()`
+     * — i.e. TRUE whenever SERVICE OR RUNTIME owns GPIO6. A FALSE parameter
+     * forces the sideband LOW. A previous bug at capture_tof_readback passed
+     * `service_owns_tof_sideband` only, which overwrote runtime ownership
+     * every TOF poll and caused GPIO6 to flicker on Operate and flash-then-off
+     * on Integrate. The parameter was renamed from `service_owns_sideband` to
+     * `anyone_owns_sideband` to make this contract obvious at every call site.
+     */
     gpio_config_t config = { 0 };
     esp_err_t err = ESP_OK;
     laser_controller_board_tof_sideband_mode_t desired_mode =
@@ -742,7 +799,7 @@ static esp_err_t laser_controller_board_apply_tof_sideband_state_locked(
     config.pull_up_en = GPIO_PULLUP_DISABLE;
     config.intr_type = GPIO_INTR_DISABLE;
 
-    if (!service_owns_sideband) {
+    if (!anyone_owns_sideband) {
         desired_mode = LASER_CONTROLLER_TOF_SIDEBAND_MODE_LOW;
     } else if (!s_tof_illumination.enabled || desired_duty_cycle_pct == 0U) {
         desired_mode = LASER_CONTROLLER_TOF_SIDEBAND_MODE_LOW;
@@ -828,9 +885,9 @@ static esp_err_t laser_controller_board_apply_tof_sideband_state_locked(
     return err;
 }
 
-static void laser_controller_board_apply_tof_sideband_state(bool service_owns_sideband)
+static void laser_controller_board_apply_tof_sideband_state(bool anyone_owns_sideband)
 {
-    (void)laser_controller_board_apply_tof_sideband_state_locked(service_owns_sideband);
+    (void)laser_controller_board_apply_tof_sideband_state_locked(anyone_owns_sideband);
 }
 
 static void laser_controller_board_drive_safe_gpio_levels(
@@ -853,9 +910,45 @@ static void laser_controller_board_drive_safe_gpio_levels(
     }
     if (!laser_controller_board_gpio_override_active(
             LASER_CONTROLLER_GPIO_LD_SBDN)) {
-        (void)gpio_set_level(
-            LASER_CONTROLLER_GPIO_LD_SBDN,
-            effective.assert_driver_standby ? 0 : 1);
+        /*
+         * Three-state SBDN drive (ATLS6A214 datasheet Table 1; MainPCB
+         * R27=13k7 to DVDD_3V3, R28=29k4 to GND → Hi-Z settles at 2.25 V
+         * in the documented 2.1..2.4 V standby band).
+         *
+         * Pulls stay disabled at all times — internal pull-up/down would
+         * fight the R27/R28 divider and shift the Hi-Z voltage out of the
+         * standby band. This was enforced at ensure_gpio_ready init-time
+         * and is NOT altered per state transition here.
+         */
+        switch (effective.sbdn_state) {
+            case LASER_CONTROLLER_SBDN_STATE_ON:
+                (void)gpio_set_direction(
+                    LASER_CONTROLLER_GPIO_LD_SBDN,
+                    GPIO_MODE_INPUT_OUTPUT);
+                (void)gpio_set_level(
+                    LASER_CONTROLLER_GPIO_LD_SBDN,
+                    1);
+                break;
+            case LASER_CONTROLLER_SBDN_STATE_STANDBY:
+                /*
+                 * Reconfigure to input-only so the external R27/R28
+                 * divider, not the MCU driver, owns the pin. Level reads
+                 * become meaningful only as the observed idle voltage.
+                 */
+                (void)gpio_set_direction(
+                    LASER_CONTROLLER_GPIO_LD_SBDN,
+                    GPIO_MODE_INPUT);
+                break;
+            case LASER_CONTROLLER_SBDN_STATE_OFF:
+            default:
+                (void)gpio_set_direction(
+                    LASER_CONTROLLER_GPIO_LD_SBDN,
+                    GPIO_MODE_INPUT_OUTPUT);
+                (void)gpio_set_level(
+                    LASER_CONTROLLER_GPIO_LD_SBDN,
+                    0);
+                break;
+        }
     }
     if (!laser_controller_board_gpio_override_active(
             LASER_CONTROLLER_GPIO_LD_PCN)) {
@@ -877,6 +970,24 @@ static void laser_controller_board_drive_safe_gpio_levels(
     }
 }
 
+/*
+ * GPIO7 / BUTTON_INTA is wired to the MCP23017 INTA pin, which is
+ * configured open-drain active-low (IOCON.ODR=1). ESP side therefore
+ * requires an internal pull-up to hold the line high when the expander
+ * is quiescent. The ISR fires on falling edge. The service routine is
+ * installed in `laser_controller_board_ensure_gpio_ready` below.
+ *
+ * NOTE: This pin was previously allocated as LASER_CONTROLLER_GPIO_TOF_GPIO1_INT
+ * (VL53L1X data-ready). The ToF daughterboard now runs in polling-only
+ * mode because the button board shares the same physical J2 connector —
+ * see docs/firmware-pinmap.md and the 2026-04-15 hardware-recon update.
+ */
+static void IRAM_ATTR laser_controller_board_button_inta_isr(void *arg)
+{
+    (void)arg;
+    laser_controller_buttons_on_isr_fired();
+}
+
 static esp_err_t laser_controller_board_ensure_gpio_ready(void)
 {
     const uint64_t output_mask =
@@ -886,13 +997,19 @@ static esp_err_t laser_controller_board_ensure_gpio_ready(void)
         (1ULL << LASER_CONTROLLER_GPIO_LD_PCN) |
         (1ULL << LASER_CONTROLLER_GPIO_ERM_EN) |
         (1ULL << LASER_CONTROLLER_GPIO_ERM_TRIG_GN_LD_EN);
+    /*
+     * Input pins that must stay pull-up / pull-down DISABLED — these are
+     * analog-adjacent or comparator-driven safety inputs where an internal
+     * pull would fight the board network. GPIO7 (BUTTON_INTA) is NOT in
+     * this mask because it needs the internal pull-up; it is configured
+     * separately below.
+     */
     const uint64_t input_mask =
         (1ULL << LASER_CONTROLLER_GPIO_PWR_TEC_PGOOD) |
         (1ULL << LASER_CONTROLLER_GPIO_PWR_LD_PGOOD) |
         (1ULL << LASER_CONTROLLER_GPIO_LD_LPGD) |
         (1ULL << LASER_CONTROLLER_GPIO_TEC_TEMPGD) |
-        (1ULL << LASER_CONTROLLER_GPIO_IMU_INT2) |
-        (1ULL << LASER_CONTROLLER_GPIO_TOF_GPIO1_INT);
+        (1ULL << LASER_CONTROLLER_GPIO_IMU_INT2);
     gpio_config_t config = { 0 };
     esp_err_t err;
 
@@ -916,6 +1033,38 @@ static esp_err_t laser_controller_board_ensure_gpio_ready(void)
     config.pull_up_en = GPIO_PULLUP_DISABLE;
     config.intr_type = GPIO_INTR_DISABLE;
     err = gpio_config(&config);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    /*
+     * Button board INTA — separate config because (a) pull-up is required
+     * for the open-drain input, (b) it is the only GPIO that gets an ISR
+     * hooked in this project. Installing the ISR service is idempotent
+     * per ESP-IDF.
+     */
+    config.pin_bit_mask = (1ULL << LASER_CONTROLLER_GPIO_BUTTON_INTA);
+    config.mode = GPIO_MODE_INPUT;
+    config.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    config.pull_up_en = GPIO_PULLUP_ENABLE;
+    config.intr_type = GPIO_INTR_NEGEDGE;
+    err = gpio_config(&config);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    /*
+     * ESP_ERR_INVALID_STATE here just means the ISR service is already
+     * installed (another module got there first). That is acceptable.
+     */
+    err = gpio_install_isr_service(ESP_INTR_FLAG_LEVEL1);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        return err;
+    }
+    err = gpio_isr_handler_add(
+        LASER_CONTROLLER_GPIO_BUTTON_INTA,
+        laser_controller_board_button_inta_isr,
+        NULL);
     if (err != ESP_OK) {
         return err;
     }
@@ -2310,6 +2459,167 @@ static esp_err_t laser_controller_board_tof_set_timing_budget_ms(uint16_t timing
     }
 }
 
+/*
+ * VL53L1X distance-mode helpers — VCSEL periods + valid-phase + WOI per
+ * ST ULD driver reference (VL53L1X_API/STSW-IMG009). Distance mode changes
+ * the signal-rate-over-ambient-rate filter and the pulse timing; it must
+ * be written BEFORE setting timing budget because timing-budget registers
+ * depend on the pulse period.
+ *   short  : ≤ 1.3 m, best ambient immunity
+ *   medium : ≤ 3.0 m
+ *   long   : ≤ 4.0 m (factory default)
+ * Shared register list comes from VL53L1X datasheet §5.11 and AN5191.
+ */
+static esp_err_t laser_controller_board_tof_set_distance_mode_short(void)
+{
+    if (laser_controller_board_i2c_write_reg16_u8(
+            LASER_CONTROLLER_VL53L1X_ADDR,
+            LASER_CONTROLLER_VL53L1X_PHASECAL_TIMEOUT_REG,
+            0x14U) != ESP_OK ||
+        laser_controller_board_i2c_write_reg16_u8(
+            LASER_CONTROLLER_VL53L1X_ADDR,
+            LASER_CONTROLLER_VL53L1X_VCSEL_PERIOD_A_REG,
+            0x07U) != ESP_OK ||
+        laser_controller_board_i2c_write_reg16_u8(
+            LASER_CONTROLLER_VL53L1X_ADDR,
+            LASER_CONTROLLER_VL53L1X_VCSEL_PERIOD_B_REG,
+            0x05U) != ESP_OK ||
+        laser_controller_board_i2c_write_reg16_u8(
+            LASER_CONTROLLER_VL53L1X_ADDR,
+            LASER_CONTROLLER_VL53L1X_VALID_PHASE_HIGH_REG,
+            0x38U) != ESP_OK ||
+        laser_controller_board_i2c_write_reg16_u16(
+            LASER_CONTROLLER_VL53L1X_ADDR,
+            LASER_CONTROLLER_VL53L1X_WOI_SD0_REG,
+            0x0705U) != ESP_OK ||
+        laser_controller_board_i2c_write_reg16_u16(
+            LASER_CONTROLLER_VL53L1X_ADDR,
+            LASER_CONTROLLER_VL53L1X_INITIAL_PHASE_SD0_REG,
+            0x0606U) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t laser_controller_board_tof_set_distance_mode_medium(void)
+{
+    if (laser_controller_board_i2c_write_reg16_u8(
+            LASER_CONTROLLER_VL53L1X_ADDR,
+            LASER_CONTROLLER_VL53L1X_PHASECAL_TIMEOUT_REG,
+            0x0AU) != ESP_OK ||
+        laser_controller_board_i2c_write_reg16_u8(
+            LASER_CONTROLLER_VL53L1X_ADDR,
+            LASER_CONTROLLER_VL53L1X_VCSEL_PERIOD_A_REG,
+            0x0BU) != ESP_OK ||
+        laser_controller_board_i2c_write_reg16_u8(
+            LASER_CONTROLLER_VL53L1X_ADDR,
+            LASER_CONTROLLER_VL53L1X_VCSEL_PERIOD_B_REG,
+            0x09U) != ESP_OK ||
+        laser_controller_board_i2c_write_reg16_u8(
+            LASER_CONTROLLER_VL53L1X_ADDR,
+            LASER_CONTROLLER_VL53L1X_VALID_PHASE_HIGH_REG,
+            0x78U) != ESP_OK ||
+        laser_controller_board_i2c_write_reg16_u16(
+            LASER_CONTROLLER_VL53L1X_ADDR,
+            LASER_CONTROLLER_VL53L1X_WOI_SD0_REG,
+            0x0B09U) != ESP_OK ||
+        laser_controller_board_i2c_write_reg16_u16(
+            LASER_CONTROLLER_VL53L1X_ADDR,
+            LASER_CONTROLLER_VL53L1X_INITIAL_PHASE_SD0_REG,
+            0x0A0AU) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t laser_controller_board_tof_set_distance_mode_long(void);
+
+static esp_err_t laser_controller_board_tof_set_distance_mode(
+    laser_controller_tof_distance_mode_t mode)
+{
+    switch (mode) {
+        case LASER_CONTROLLER_TOF_DISTANCE_MODE_SHORT:
+            return laser_controller_board_tof_set_distance_mode_short();
+        case LASER_CONTROLLER_TOF_DISTANCE_MODE_MEDIUM:
+            return laser_controller_board_tof_set_distance_mode_medium();
+        case LASER_CONTROLLER_TOF_DISTANCE_MODE_LONG:
+        default:
+            return laser_controller_board_tof_set_distance_mode_long();
+    }
+}
+
+/*
+ * VL53L1X ROI (cone size). w/h in SPADs, clamped 4..16. Center spad is a
+ * packed byte index on the 16x16 SPAD grid per VL53L1X datasheet §6.8
+ * (default 199 = centre). Setting a smaller ROI narrows the effective
+ * field-of-view — 4x4 ≈ 7.5° cone vs 16x16 ≈ 27° at full grid.
+ *
+ * ROI_CONFIG__USER_ROI_REQUESTED_GLOBAL_XY_SIZE = ((h-1)<<4) | (w-1)
+ * ROI_CONFIG__USER_ROI_CENTRE_SPAD = center_spad (0..255)
+ */
+static esp_err_t laser_controller_board_tof_set_roi(
+    uint8_t width_spads,
+    uint8_t height_spads,
+    uint8_t center_spad)
+{
+    if (width_spads < 4U) width_spads = 4U;
+    if (width_spads > 16U) width_spads = 16U;
+    if (height_spads < 4U) height_spads = 4U;
+    if (height_spads > 16U) height_spads = 16U;
+
+    const uint8_t xy = (uint8_t)(((height_spads - 1U) << 4) | (width_spads - 1U));
+
+    if (laser_controller_board_i2c_write_reg16_u8(
+            LASER_CONTROLLER_VL53L1X_ADDR,
+            0x007FU /* ROI_CONFIG__USER_ROI_CENTRE_SPAD */,
+            center_spad) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    if (laser_controller_board_i2c_write_reg16_u8(
+            LASER_CONTROLLER_VL53L1X_ADDR,
+            0x0080U /* ROI_CONFIG__USER_ROI_REQUESTED_GLOBAL_XY_SIZE */,
+            xy) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+/*
+ * Offset correction — signed mm added to the raw range reading. VL53L1X
+ * register 0x001E (ALGO__PART_TO_PART_RANGE_OFFSET_MM) is a signed 13-bit
+ * value expressed as `(offset_mm * 4)` (i.e. stored in 1/4-mm units per
+ * the ULD driver). Clamp input to ±511 mm so the ×4 shift fits.
+ */
+static esp_err_t laser_controller_board_tof_set_offset_mm(int32_t offset_mm)
+{
+    if (offset_mm > 511) offset_mm = 511;
+    if (offset_mm < -512) offset_mm = -512;
+    const int16_t raw = (int16_t)(offset_mm * 4);
+    return laser_controller_board_i2c_write_reg16_u16(
+        LASER_CONTROLLER_VL53L1X_ADDR,
+        0x001EU /* ALGO__PART_TO_PART_RANGE_OFFSET_MM */,
+        (uint16_t)raw);
+}
+
+/*
+ * Crosstalk compensation — writes kcps to register 0x0016. When xtalk is
+ * disabled, writes 0 to effectively remove compensation. The STM ULD
+ * driver applies a `<< 9` scaling when writing 0x0016 but our variant
+ * stores raw kcps because the host value is already a measured kcps
+ * scalar; for precise cover-glass calibration the `<< 9` ULD form can
+ * be restored later with a measured target.
+ */
+static esp_err_t laser_controller_board_tof_set_xtalk(
+    uint32_t xtalk_cps,
+    bool enabled)
+{
+    const uint16_t value = enabled ? (uint16_t)(xtalk_cps & 0xFFFFU) : 0U;
+    return laser_controller_board_i2c_write_reg16_u16(
+        LASER_CONTROLLER_VL53L1X_ADDR,
+        0x0016U /* ALGO__CROSSTALK_COMPENSATION_PLANE_OFFSET_KCPS */,
+        value);
+}
+
 static esp_err_t laser_controller_board_tof_set_distance_mode_long(void)
 {
     if (laser_controller_board_i2c_write_reg16_u8(
@@ -2417,13 +2727,52 @@ static esp_err_t laser_controller_board_tof_configure_sensor(void)
         return ESP_FAIL;
     }
 
-    err = laser_controller_board_tof_set_distance_mode_long();
+    /*
+     * Apply operator-configured calibration from service NVS. Distance
+     * mode must be written BEFORE timing budget (timing budget registers
+     * depend on VCSEL period). ROI + offset + xtalk can be written in any
+     * order but are done after timing budget for consistency with the ST
+     * ULD driver sequence. Falls back to safe defaults (long, 50 ms,
+     * 16x16, zero offset, xtalk off) if the service module is missing.
+     */
+    laser_controller_tof_calibration_t cal;
+    laser_controller_service_get_tof_calibration(&cal);
+    if (cal.timing_budget_ms == 0U ||
+        cal.roi_width_spads == 0U ||
+        cal.roi_height_spads == 0U) {
+        cal.distance_mode = LASER_CONTROLLER_TOF_DISTANCE_MODE_LONG;
+        cal.timing_budget_ms = 50U;
+        cal.roi_width_spads = 16U;
+        cal.roi_height_spads = 16U;
+        cal.roi_center_spad = 199U;
+        cal.offset_mm = 0;
+        cal.xtalk_cps = 0U;
+        cal.xtalk_enabled = false;
+    }
+
+    err = laser_controller_board_tof_set_distance_mode(cal.distance_mode);
     if (err != ESP_OK) {
         return err;
     }
-
     err = laser_controller_board_tof_set_timing_budget_ms(
-        LASER_CONTROLLER_TOF_TIMING_BUDGET_MS);
+        (uint16_t)cal.timing_budget_ms);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = laser_controller_board_tof_set_roi(
+        cal.roi_width_spads,
+        cal.roi_height_spads,
+        cal.roi_center_spad);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = laser_controller_board_tof_set_offset_mm(cal.offset_mm);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = laser_controller_board_tof_set_xtalk(
+        cal.xtalk_cps,
+        cal.xtalk_enabled);
     if (err != ESP_OK) {
         return err;
     }
@@ -2431,6 +2780,61 @@ static esp_err_t laser_controller_board_tof_configure_sensor(void)
     err = laser_controller_board_tof_set_intermeasurement_ms(
         LASER_CONTROLLER_TOF_INTERMEASUREMENT_MS);
     if (err != ESP_OK) {
+        return err;
+    }
+
+    return laser_controller_board_tof_start_ranging();
+}
+
+/*
+ * Re-apply ToF calibration without tearing down ranging. Writes
+ * distance-mode / timing-budget / ROI / offset / xtalk. Intended for
+ * runtime calibration updates where a full init cycle would be overkill.
+ * Callers should stop ranging first if they intend to change
+ * distance-mode or timing-budget (register-level changes the VL53L1X
+ * handles in-flight are narrow); the ST ULD notes a stop → change →
+ * start sequence as safest.
+ */
+esp_err_t laser_controller_board_tof_apply_calibration(
+    const laser_controller_tof_calibration_t *cal)
+{
+    if (cal == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t err;
+
+    (void)laser_controller_board_tof_stop_ranging();
+
+    err = laser_controller_board_tof_set_distance_mode(cal->distance_mode);
+    if (err != ESP_OK) {
+        (void)laser_controller_board_tof_start_ranging();
+        return err;
+    }
+    err = laser_controller_board_tof_set_timing_budget_ms(
+        (uint16_t)cal->timing_budget_ms);
+    if (err != ESP_OK) {
+        (void)laser_controller_board_tof_start_ranging();
+        return err;
+    }
+    err = laser_controller_board_tof_set_roi(
+        cal->roi_width_spads,
+        cal->roi_height_spads,
+        cal->roi_center_spad);
+    if (err != ESP_OK) {
+        (void)laser_controller_board_tof_start_ranging();
+        return err;
+    }
+    err = laser_controller_board_tof_set_offset_mm(cal->offset_mm);
+    if (err != ESP_OK) {
+        (void)laser_controller_board_tof_start_ranging();
+        return err;
+    }
+    err = laser_controller_board_tof_set_xtalk(
+        cal->xtalk_cps,
+        cal->xtalk_enabled);
+    if (err != ESP_OK) {
+        (void)laser_controller_board_tof_start_ranging();
         return err;
     }
 
@@ -2581,8 +2985,15 @@ static void laser_controller_board_capture_tof_readback(
     const bool tof_expected =
         laser_controller_service_module_write_enabled(
             LASER_CONTROLLER_MODULE_TOF);
-    const bool service_owns_tof_sideband =
-        laser_controller_board_service_owns_tof_sideband();
+    /*
+     * BUGFIX: previously passed `service_owns_tof_sideband` alone, which
+     * ignored runtime ownership and forced GPIO6 LOW on every TOF poll.
+     * Pass `any_owns_...` so the runtime illumination request (Operate LED
+     * slider, or the ToF daughterboard illumination during deployment)
+     * survives each TOF readback cycle.
+     */
+    const bool anyone_owns_tof_sideband =
+        laser_controller_board_any_owns_tof_sideband();
     bool data_ready = false;
     uint8_t boot_state = 0U;
     uint16_t sensor_id = 0U;
@@ -2590,7 +3001,7 @@ static void laser_controller_board_capture_tof_readback(
     uint16_t distance_mm = 0U;
     esp_err_t err;
 
-    laser_controller_board_apply_tof_sideband_state(service_owns_tof_sideband);
+    laser_controller_board_apply_tof_sideband_state(anyone_owns_tof_sideband);
 
     if (!tof_expected) {
         if (s_tof_runtime.ranging) {
@@ -2615,8 +3026,16 @@ static void laser_controller_board_capture_tof_readback(
 
     s_tof_last_poll_ms = now_ms;
     laser_controller_board_clear_tof_readback();
-    s_tof_readback.interrupt_line_high =
-        gpio_get_level(LASER_CONTROLLER_GPIO_TOF_GPIO1_INT) != 0;
+    /*
+     * ToF GPIO1 is no longer wired to an ESP32 GPIO — GPIO7 was reassigned
+     * to MCP23017 INTA on 2026-04-15 because the button board and ToF
+     * daughterboard share the same J2 connector. The ToF now runs in
+     * polling-only mode via the RANGE_STATUS register read further below,
+     * so `interrupt_line_high` is simply not observable and we report
+     * false. Range freshness flows through `tof_readback.data_ready`
+     * (set from the RANGE_STATUS low bit) instead.
+     */
+    s_tof_readback.interrupt_line_high = false;
     s_tof_readback.led_ctrl_asserted =
         s_tof_illumination.enabled ||
         (gpio_get_level(LASER_CONTROLLER_GPIO_TOF_LED_CTRL) != 0);
@@ -2949,12 +3368,23 @@ static uint16_t laser_controller_board_voltage_to_dac_code(float voltage_v)
                           code);
 }
 
+/*
+ * Oversample count for ADC reads — 8 samples averaged in one call at
+ * ~3-5 us per `adc_oneshot_read`, so total cost per channel is ~25-40 us.
+ * Combined with the single-pole IIR in `read_inputs` call sites, this
+ * gives dead-stable TMO / LIO / TEC telemetry even over the noisy ESP32
+ * internal ADC. See user directive 2026-04-15 (late).
+ */
+#define LASER_CONTROLLER_ADC_OVERSAMPLE_COUNT 8U
+
 static esp_err_t laser_controller_board_read_adc_voltage(
     adc_channel_t channel,
     float *voltage_v)
 {
     int raw = 0;
     esp_err_t err;
+    uint32_t raw_sum = 0U;
+    uint32_t sample_count = 0U;
 
     if (voltage_v == NULL) {
         return ESP_ERR_INVALID_ARG;
@@ -2965,14 +3395,68 @@ static esp_err_t laser_controller_board_read_adc_voltage(
         return err;
     }
 
-    err = adc_oneshot_read(s_adc_handle, channel, &raw);
-    if (err != ESP_OK) {
-        return err;
+    for (uint32_t i = 0U; i < LASER_CONTROLLER_ADC_OVERSAMPLE_COUNT; ++i) {
+        err = adc_oneshot_read(s_adc_handle, channel, &raw);
+        if (err != ESP_OK) {
+            /*
+             * If any sample fails mid-oversample, return the error so the
+             * caller can skip the filter update on this tick. The IIR
+             * then holds its previous state — this is the correct
+             * behavior for a transient ADC read glitch.
+             */
+            return err;
+        }
+        raw_sum += (uint32_t)(raw < 0 ? 0 : raw);
+        sample_count++;
     }
 
-    raw = raw < 0 ? 0 : raw;
-    *voltage_v = ((float)raw / 4095.0f) * 3.3f;
+    const uint32_t raw_avg = raw_sum / sample_count;
+    *voltage_v = ((float)raw_avg / 4095.0f) * 3.3f;
     return ESP_OK;
+}
+
+/*
+ * Per-channel IIR low-pass filter state. Alpha = 0.25 balances smoothing
+ * against response time: with a 5 ms control tick, an IIR step from 0 to
+ * V_target reaches 99 % in ~70 ms. Much faster than operator perception
+ * but heavy enough to kill visible jitter on the host readout.
+ *
+ * `primed` flags so the first valid sample after a rail-invalid window
+ * initializes the filter to the raw value rather than interpolating
+ * from a stale zero.
+ */
+#define LASER_CONTROLLER_ADC_IIR_ALPHA 0.25f
+
+typedef struct {
+    float value;
+    bool primed;
+} laser_controller_adc_filter_t;
+
+static laser_controller_adc_filter_t s_adc_filter_ld_temp_v;
+static laser_controller_adc_filter_t s_adc_filter_ld_current_v;
+static laser_controller_adc_filter_t s_adc_filter_tec_temp_v;
+static laser_controller_adc_filter_t s_adc_filter_tec_current;
+static laser_controller_adc_filter_t s_adc_filter_tec_voltage;
+
+static float laser_controller_adc_filter_update(
+    laser_controller_adc_filter_t *filter,
+    float sample)
+{
+    if (!filter->primed) {
+        filter->value = sample;
+        filter->primed = true;
+    } else {
+        filter->value +=
+            LASER_CONTROLLER_ADC_IIR_ALPHA * (sample - filter->value);
+    }
+    return filter->value;
+}
+
+static void laser_controller_adc_filter_reset(
+    laser_controller_adc_filter_t *filter)
+{
+    filter->value = 0.0f;
+    filter->primed = false;
 }
 
 static float laser_controller_board_lookup_tec_temp_c(float voltage_v)
@@ -3890,6 +4374,19 @@ void laser_controller_board_init_safe_defaults(void)
     (void)laser_controller_board_ensure_spi_ready();
     laser_controller_board_apply_tof_sideband_state(false);
     laser_controller_board_disable_pcn_pwm_and_drive(true);
+
+    /*
+     * Button-board init must run AFTER I2C is ready and BEFORE the
+     * control task starts. Failures here are non-fatal — the rest of
+     * the system boots with `board_reachable=false` and the safety
+     * decision falls back to host-only request routing.
+     */
+    memset(&s_button_readback, 0, sizeof(s_button_readback));
+    memset(&s_rgb_readback, 0, sizeof(s_rgb_readback));
+    memset(&s_last_button_state, 0, sizeof(s_last_button_state));
+    (void)laser_controller_buttons_init(&s_button_readback);
+    (void)laser_controller_rgb_led_init(&s_rgb_readback);
+    (void)laser_controller_rgb_led_force_off(&s_rgb_readback);
 }
 
 void laser_controller_board_read_inputs(
@@ -3932,14 +4429,31 @@ void laser_controller_board_read_inputs(
         inputs->driver_loop_good =
             gpio_get_level(LASER_CONTROLLER_GPIO_LD_LPGD) != 0;
 
+        /*
+         * LD TMO (driver temperature monitor) — ADC0. 8x oversampled
+         * inside `read_adc_voltage`, plus single-pole IIR (alpha=0.25)
+         * here. TMO previously jumped several °C tick-to-tick from raw
+         * ADC noise; this stack is dead-stable for operator display.
+         * User directive 2026-04-15 (late).
+         */
         if (laser_controller_board_read_adc_voltage(ADC_CHANNEL_0, &voltage_v) == ESP_OK) {
-            inputs->laser_driver_temp_voltage_v = voltage_v;
-            inputs->laser_driver_temp_c = 192.5576f - (90.1040f * voltage_v);
+            const float filtered_v = laser_controller_adc_filter_update(
+                &s_adc_filter_ld_temp_v, voltage_v);
+            inputs->laser_driver_temp_voltage_v = filtered_v;
+            inputs->laser_driver_temp_c = 192.5576f - (90.1040f * filtered_v);
         }
 
+        /*
+         * LD LIO (laser current monitor) — ADC1. Same oversample + IIR
+         * stack as TMO. This feeds the `unexpected current` safety
+         * interlock; a jittery reading used to hover near the
+         * `off_current_threshold_a` boundary and briefly trip when idle.
+         */
         if (laser_controller_board_read_adc_voltage(ADC_CHANNEL_1, &voltage_v) == ESP_OK) {
-            inputs->laser_current_monitor_voltage_v = voltage_v;
-            inputs->measured_laser_current_a = 2.4f * voltage_v;
+            const float filtered_v = laser_controller_adc_filter_update(
+                &s_adc_filter_ld_current_v, voltage_v);
+            inputs->laser_current_monitor_voltage_v = filtered_v;
+            inputs->measured_laser_current_a = 2.4f * filtered_v;
         }
     } else {
         inputs->driver_loop_good = false;
@@ -3947,6 +4461,13 @@ void laser_controller_board_read_inputs(
         inputs->laser_driver_temp_c = 0.0f;
         inputs->laser_current_monitor_voltage_v = 0.0f;
         inputs->measured_laser_current_a = 0.0f;
+        /*
+         * Reset the LD filters when telemetry becomes invalid (rail off
+         * or SBDN OFF). The next valid sample re-primes the filter to
+         * the raw value rather than interpolating from a stale frame.
+         */
+        laser_controller_adc_filter_reset(&s_adc_filter_ld_temp_v);
+        laser_controller_adc_filter_reset(&s_adc_filter_ld_current_v);
     }
 
     if (laser_controller_service_module_expected(LASER_CONTROLLER_MODULE_DAC)) {
@@ -3957,16 +4478,22 @@ void laser_controller_board_read_inputs(
 
     if (inputs->tec_telemetry_valid) {
         if (laser_controller_board_read_adc_voltage(ADC_CHANNEL_7, &voltage_v) == ESP_OK) {
-            inputs->tec_temp_adc_voltage_v = voltage_v;
-            inputs->tec_temp_c = laser_controller_board_lookup_tec_temp_c(voltage_v);
+            const float filtered_v = laser_controller_adc_filter_update(
+                &s_adc_filter_tec_temp_v, voltage_v);
+            inputs->tec_temp_adc_voltage_v = filtered_v;
+            inputs->tec_temp_c = laser_controller_board_lookup_tec_temp_c(filtered_v);
         }
 
         if (laser_controller_board_read_adc_voltage(ADC_CHANNEL_8, &voltage_v) == ESP_OK) {
-            inputs->tec_current_a = (voltage_v - 1.25f) / 0.285f;
+            const float filtered_v = laser_controller_adc_filter_update(
+                &s_adc_filter_tec_current, voltage_v);
+            inputs->tec_current_a = (filtered_v - 1.25f) / 0.285f;
         }
 
         if (laser_controller_board_read_adc_voltage(ADC_CHANNEL_9, &voltage_v) == ESP_OK) {
-            inputs->tec_voltage_v = voltage_v * 2.0f;
+            const float filtered_v = laser_controller_adc_filter_update(
+                &s_adc_filter_tec_voltage, voltage_v);
+            inputs->tec_voltage_v = filtered_v * 2.0f;
         }
     } else {
         inputs->tec_temp_c = 0.0f;
@@ -3974,6 +4501,9 @@ void laser_controller_board_read_inputs(
         inputs->tec_current_a = 0.0f;
         inputs->tec_voltage_v = 0.0f;
         inputs->tec_temp_good = false;
+        laser_controller_adc_filter_reset(&s_adc_filter_tec_temp_v);
+        laser_controller_adc_filter_reset(&s_adc_filter_tec_current);
+        laser_controller_adc_filter_reset(&s_adc_filter_tec_voltage);
     }
 
     if (imu_expected) {
@@ -4022,6 +4552,22 @@ void laser_controller_board_read_inputs(
     inputs->imu_readback = s_imu_readback;
     inputs->haptic_readback = s_haptic_readback;
     inputs->tof_readback = s_tof_readback;
+
+    /*
+     * Button board read. Failures clear pressed state automatically (see
+     * laser_controller_buttons_refresh fail-safe) so a stuck bus cannot
+     * latch the laser on. The previous-tick state lives in
+     * s_last_button_state for edge detection — kept on the control task
+     * (the only caller of read_inputs).
+     */
+    (void)laser_controller_buttons_refresh(
+        &inputs->button,
+        &s_last_button_state,
+        &s_button_readback);
+    s_last_button_state = inputs->button;
+    inputs->buttons_readback = s_button_readback;
+    inputs->rgb_readback = s_rgb_readback;
+
     laser_controller_board_capture_gpio_inspector();
     inputs->gpio_inspector = s_gpio_inspector;
 }
@@ -4037,6 +4583,13 @@ void laser_controller_board_apply_outputs(const laser_controller_board_outputs_t
     laser_controller_board_apply_gpio_overrides();
     laser_controller_board_apply_tof_sideband_state(
         laser_controller_board_any_owns_tof_sideband());
+    /*
+     * Apply RGB status LED. Dirty-compare lives inside the driver — the
+     * I2C transaction only runs when the requested state actually changed.
+     * Failures are non-fatal at this layer; the next tick retries because
+     * the dirty-compare check sees `last_applied != requested`.
+     */
+    (void)laser_controller_rgb_led_apply(&outputs->rgb_led, &s_rgb_readback);
 }
 
 void laser_controller_board_apply_debug_gpio_state_now(void)
@@ -4409,6 +4962,7 @@ void laser_controller_board_reset_gpio_debug_state(void)
         const uint32_t gpio_num = kGpioInspectorPins[index].gpio_num;
 
         if (laser_controller_board_is_transport_or_strap_gpio(gpio_num) ||
+            laser_controller_board_is_adc_input_gpio(gpio_num) ||
             (preserve_i2c_pins &&
              laser_controller_board_is_shared_i2c_gpio(gpio_num)) ||
             (preserve_spi_pins &&
@@ -4675,9 +5229,15 @@ esp_err_t laser_controller_board_set_tof_illumination(
         return ESP_ERR_INVALID_STATE;
     }
 
-    s_tof_illumination.enabled = enabled && duty_cycle_pct > 0U;
+    /* Hard safety cap — clamp BEFORE storing / applying. See
+     * s_tof_led_max_duty_pct commentary. */
+    const uint32_t capped_duty =
+        duty_cycle_pct > s_tof_led_max_duty_pct
+            ? s_tof_led_max_duty_pct
+            : duty_cycle_pct;
+    s_tof_illumination.enabled = enabled && capped_duty > 0U;
     s_tof_illumination.duty_cycle_pct =
-        laser_controller_board_clamp_u32(duty_cycle_pct, 0U, 100U);
+        laser_controller_board_clamp_u32(capped_duty, 0U, 100U);
     s_tof_illumination.frequency_hz = laser_controller_board_clamp_u32(
         frequency_hz > 0U ? frequency_hz : LASER_CONTROLLER_TOF_LED_PWM_DEFAULT_FREQ_HZ,
         LASER_CONTROLLER_TOF_LED_PWM_MIN_FREQ_HZ,
@@ -4693,9 +5253,27 @@ esp_err_t laser_controller_board_set_runtime_tof_illumination(
     uint32_t duty_cycle_pct,
     uint32_t frequency_hz)
 {
-    s_tof_illumination.enabled = enabled && duty_cycle_pct > 0U;
+    /*
+     * GPIO6 Dual-Driver Rule (AGENT.md): the runtime path MUST bail out
+     * when service mode owns the sideband. Without this guard, the control
+     * task's 5ms tick overwrites s_tof_illumination every cycle and stomps
+     * the service's desired state — producing the "flash on, then stuck
+     * off" behavior observed on the Integrate page.
+     */
+    if (laser_controller_board_service_owns_tof_sideband()) {
+        s_tof_runtime_owns_sideband = false;
+        return ESP_OK;
+    }
+
+    /* Hard safety cap — same clamp as the service path. A runtime caller
+     * requesting duty above the cap is silently reduced to the cap. */
+    const uint32_t capped_duty =
+        duty_cycle_pct > s_tof_led_max_duty_pct
+            ? s_tof_led_max_duty_pct
+            : duty_cycle_pct;
+    s_tof_illumination.enabled = enabled && capped_duty > 0U;
     s_tof_illumination.duty_cycle_pct =
-        laser_controller_board_clamp_u32(duty_cycle_pct, 0U, 100U);
+        laser_controller_board_clamp_u32(capped_duty, 0U, 100U);
     s_tof_illumination.frequency_hz = laser_controller_board_clamp_u32(
         frequency_hz > 0U ? frequency_hz : LASER_CONTROLLER_TOF_LED_PWM_DEFAULT_FREQ_HZ,
         LASER_CONTROLLER_TOF_LED_PWM_MIN_FREQ_HZ,
@@ -4704,6 +5282,17 @@ esp_err_t laser_controller_board_set_runtime_tof_illumination(
 
     return laser_controller_board_apply_tof_sideband_state_locked(
         laser_controller_board_any_owns_tof_sideband());
+}
+
+void laser_controller_board_set_tof_led_max_duty_pct(uint32_t cap)
+{
+    s_tof_led_max_duty_pct =
+        laser_controller_board_clamp_u32(cap, 0U, 100U);
+}
+
+uint32_t laser_controller_board_get_tof_led_max_duty_pct(void)
+{
+    return s_tof_led_max_duty_pct;
 }
 
 esp_err_t laser_controller_board_fire_haptic_test(void)

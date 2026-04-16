@@ -57,6 +57,12 @@ const char *laser_controller_fault_code_name(laser_controller_fault_code_t code)
             return "comms_timeout";
         case LASER_CONTROLLER_FAULT_SERVICE_OVERRIDE_REJECTED:
             return "service_override_rejected";
+        case LASER_CONTROLLER_FAULT_USB_DEBUG_MOCK_PD_CONFLICT:
+            return "usb_debug_mock_pd_conflict";
+        case LASER_CONTROLLER_FAULT_LD_LP_GOOD_TIMEOUT:
+            return "ld_lp_good_timeout";
+        case LASER_CONTROLLER_FAULT_BUTTON_BOARD_I2C_LOST:
+            return "button_board_i2c_lost";
         default:
             return "unknown_fault";
     }

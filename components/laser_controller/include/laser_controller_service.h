@@ -161,6 +161,13 @@ typedef struct {
     bool tof_illumination_enabled;
     uint32_t tof_illumination_duty_cycle_pct;
     uint32_t tof_illumination_frequency_hz;
+    /*
+     * ToF VL53L1X runtime calibration. Persisted in its own dedicated NVS
+     * blob (namespace "laser_ctrl", key "tof_cal") so the operator's
+     * calibration survives reboot and is re-applied by the board layer on
+     * every ToF init. Added 2026-04-15.
+     */
+    laser_controller_tof_calibration_t tof_calibration;
     laser_controller_service_pd_profile_t
         pd_profiles[LASER_CONTROLLER_SERVICE_PD_PROFILE_COUNT];
     float pd_programming_only_max_w;
@@ -269,6 +276,17 @@ void laser_controller_service_set_tof_config(
     float min_range_m,
     float max_range_m,
     uint32_t stale_timeout_ms,
+    laser_controller_time_ms_t now_ms);
+/*
+ * ToF VL53L1X runtime calibration + ROI. Persisted in the dedicated
+ * "tof_cal" NVS blob immediately (no separate save_profile call needed).
+ * Board layer reads this via laser_controller_service_get_tof_calibration
+ * on every ToF init path. Added 2026-04-15.
+ */
+void laser_controller_service_get_tof_calibration(
+    laser_controller_tof_calibration_t *out);
+esp_err_t laser_controller_service_set_tof_calibration(
+    const laser_controller_tof_calibration_t *calibration,
     laser_controller_time_ms_t now_ms);
 void laser_controller_service_set_runtime_safety_policy(
     const laser_controller_safety_thresholds_t *thresholds,

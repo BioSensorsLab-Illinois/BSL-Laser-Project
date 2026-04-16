@@ -420,3 +420,14 @@ These gaps block a complete firmware pin/peripheral spec:
 4. Default the DAC to an explicit zero-safe configuration immediately after boot even though the hardware stuffing already biases it that way.
 5. Plan STUSB4500 supervision around I2C polling only, because no alert/status GPIOs are wired.
 6. Do not finalize the ToF interlock module until the `VL53L1X` driver, timing budget, stale-data handling, and interrupt policy are implemented and validated on real hardware.
+
+## Button Board Addendum (2026-04-15)
+
+The button board is now source-backed and shares the **MainPCB J2 Sensor & LED** physical connector with the ToF daughterboard. The board adds two I²C devices to the shared `GPIO4`/`GPIO5` bus:
+
+- `MCP23017` GPIO expander @ `0x20` — A2:A0 strapped to GND. Open-drain `INTA` output → ESP32 `GPIO7`. Internal pull-up enabled on `GPIO7` ESP-side.
+- `TLC59116` LED driver @ `0x60` — A3:A0 strapped to GND. Drives a single RGB LED on `OUT0`/`OUT1`/`OUT2` with non-standard `B`/`R`/`G` channel order per the schematic.
+
+`GPIO7` was previously the `VL53L1X GPIO1` data-ready input. As of 2026-04-15 it is owned exclusively by the MCP23017 INTA. The ToF chip's `GPIO1` output is no longer wired into the ESP-side input — verify on the new revision schematic before populating both daughterboards together. The ToF runs in polling-only mode via the `RANGE_STATUS` register (existing 75 ms intermeasurement cadence).
+
+Implication for stuffing: with the button board fitted, the shared `GPIO4`/`GPIO5` bus carries 6 distinct addresses + the TLC59116 ALLCALL slot (`0x68`). No collisions. If a future revision pushes I²C to 400 kHz, re-verify the parallel pull-up network on a scope.

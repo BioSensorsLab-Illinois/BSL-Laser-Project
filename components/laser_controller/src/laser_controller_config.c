@@ -76,6 +76,12 @@ void laser_controller_config_load_defaults(laser_controller_config_t *config)
     config->thresholds.max_laser_current_a = 5.2f;
     config->thresholds.off_current_threshold_a = 0.200f;
     config->thresholds.current_match_tolerance_a = 0.020f;
+    /*
+     * GPIO6 ToF-board LED hard brightness cap — 50% duty. Enforced in the
+     * board layer at every LED entry point. User directive 2026-04-15 to
+     * prevent thermal damage from extended full-duty operation.
+     */
+    config->thresholds.max_tof_led_duty_cycle_pct = 50U;
 
     config->timeouts.imu_stale_ms = 50U;
     config->timeouts.tof_stale_ms = 100U;
@@ -190,6 +196,10 @@ bool laser_controller_config_validate_runtime_safety(
         config->thresholds.max_laser_current_a <= 0.0f ||
         config->thresholds.off_current_threshold_a < 0.0f ||
         config->thresholds.current_match_tolerance_a < 0.0f) {
+        return false;
+    }
+
+    if (config->thresholds.max_tof_led_duty_cycle_pct > 100U) {
         return false;
     }
 

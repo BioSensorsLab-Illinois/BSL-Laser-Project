@@ -1,3 +1,8 @@
+---
+name: Uncodixfy
+description: Mandatory design-language skill for any GUI/CSS work. Bans default AI-UI patterns (glassmorphism, dark glass, hero sections in dashboards, pill overloads, gradient text, dramatic shadows, transform animations) in favor of a restrained light instrument aesthetic (Linear / Raycast / Stripe / GitHub). Trigger on any host-console/ CSS change, component styling, layout decisions, rendered-page critique, or new workspace design.
+---
+
 # Uncodixify
 
 Mandatory first-read skill for any GUI-related work in this repository.

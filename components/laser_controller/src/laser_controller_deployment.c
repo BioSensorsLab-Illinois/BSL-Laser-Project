@@ -56,6 +56,8 @@ const char *laser_controller_deployment_step_name(
             return "rail_sequence";
         case LASER_CONTROLLER_DEPLOYMENT_STEP_TEC_SETTLE:
             return "tec_settle";
+        case LASER_CONTROLLER_DEPLOYMENT_STEP_LP_GOOD_CHECK:
+            return "lp_good_check";
         case LASER_CONTROLLER_DEPLOYMENT_STEP_READY_POSTURE:
             return "ready_posture";
         default:
@@ -87,6 +89,8 @@ const char *laser_controller_deployment_step_label(
             return "Rail sequencing";
         case LASER_CONTROLLER_DEPLOYMENT_STEP_TEC_SETTLE:
             return "TEC settle to deployment target";
+        case LASER_CONTROLLER_DEPLOYMENT_STEP_LP_GOOD_CHECK:
+            return "Driver loop-lock verification (SBDN \u2192 LP_GOOD \u2264 1 s)";
         case LASER_CONTROLLER_DEPLOYMENT_STEP_READY_POSTURE:
             return "Final ready posture";
         default:

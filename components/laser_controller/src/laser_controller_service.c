@@ -16,6 +16,15 @@
 #define LASER_CONTROLLER_LSM6DSO_WHOAMI 0x6CU
 #define LASER_CONTROLLER_SERVICE_NVS_NAMESPACE "laser_ctrl"
 #define LASER_CONTROLLER_SERVICE_NVS_KEY       "svc_profile"
+/*
+ * Dedicated NVS blob for VL53L1X calibration + ROI. Separate from the main
+ * service-profile blob so (a) the complex profile-version migration chain
+ * is not disturbed, (b) tof calibration can be cleared / rewritten
+ * independently of bring-up profile. Version byte is the first byte of
+ * the blob; on version mismatch we fall back to defaults.
+ */
+#define LASER_CONTROLLER_SERVICE_TOF_CAL_NVS_KEY "tof_cal"
+#define LASER_CONTROLLER_SERVICE_TOF_CAL_VERSION 1U
 #define LASER_CONTROLLER_SERVICE_PROFILE_VER   6U
 #define LASER_CONTROLLER_SERVICE_PROFILE_VER_MIN 3U
 #define LASER_CONTROLLER_SERVICE_DAC_MAX_V     2.5f
@@ -1067,6 +1076,22 @@ static void laser_controller_service_apply_core_preset_locked(const char *profil
     s_service.status.tof_illumination_duty_cycle_pct = 0U;
     s_service.status.tof_illumination_frequency_hz =
         LASER_CONTROLLER_SERVICE_TOF_ILLUMINATION_PWM_HZ;
+    /*
+     * VL53L1X runtime calibration defaults. These match the board-layer
+     * hardcoded init behavior prior to 2026-04-15 (long mode, 50 ms
+     * timing budget, full 16x16 ROI, zero offset, xtalk disabled) so
+     * upgrade without a prior saved calibration produces the same
+     * behavior as the pre-calibration firmware.
+     */
+    s_service.status.tof_calibration.distance_mode =
+        LASER_CONTROLLER_TOF_DISTANCE_MODE_LONG;
+    s_service.status.tof_calibration.timing_budget_ms = 50U;
+    s_service.status.tof_calibration.roi_width_spads = 16U;
+    s_service.status.tof_calibration.roi_height_spads = 16U;
+    s_service.status.tof_calibration.roi_center_spad = 199U;
+    s_service.status.tof_calibration.offset_mm = 0;
+    s_service.status.tof_calibration.xtalk_cps = 0U;
+    s_service.status.tof_calibration.xtalk_enabled = false;
     memcpy(
         s_service.status.pd_profiles,
         kDefaultPdProfiles,
@@ -1264,6 +1289,9 @@ static void laser_controller_service_sync_shadow_regs_locked(void)
     s_service.drv2605_regs[0x1AU] = feedback_reg;
 }
 
+static bool laser_controller_service_load_tof_calibration_locked(
+    laser_controller_tof_calibration_t *out);
+
 void laser_controller_service_init_defaults(void)
 {
     laser_controller_service_status_t status;
@@ -1271,6 +1299,18 @@ void laser_controller_service_init_defaults(void)
     portENTER_CRITICAL(&s_service_lock);
     laser_controller_service_apply_manual_defaults_locked("manual-bringup");
     (void)laser_controller_service_load_profile_locked();
+    /*
+     * Restore ToF calibration from its dedicated NVS blob, AFTER the
+     * defaults + main profile are loaded (so the persisted calibration
+     * overrides the defaults). A missing or version-mismatched blob
+     * leaves the defaults in place.
+     */
+    {
+        laser_controller_tof_calibration_t cal;
+        if (laser_controller_service_load_tof_calibration_locked(&cal)) {
+            s_service.status.tof_calibration = cal;
+        }
+    }
     status = s_service.status;
     portEXIT_CRITICAL(&s_service_lock);
 
@@ -1969,6 +2009,157 @@ void laser_controller_service_set_tof_config(
         "ToF threshold tuning staged.",
         now_ms);
     portEXIT_CRITICAL(&s_service_lock);
+}
+
+/*
+ * ToF calibration persistence.
+ *
+ * Stored in its own NVS blob so the main service-profile migration chain
+ * stays undisturbed. Blob layout:
+ *   byte 0          : LASER_CONTROLLER_SERVICE_TOF_CAL_VERSION
+ *   byte 1..size-1  : laser_controller_tof_calibration_t bytes
+ *
+ * On version mismatch (future upgrade) the blob is discarded and defaults
+ * are applied — the operator will need to re-calibrate. Acceptable given
+ * this is a per-unit calibration anyway.
+ *
+ * Written on every `laser_controller_service_set_tof_calibration` call so
+ * the operator's latest values survive immediately (no separate "save"
+ * trigger needed).
+ */
+static bool laser_controller_service_validate_tof_calibration(
+    const laser_controller_tof_calibration_t *cal)
+{
+    if (cal == NULL) {
+        return false;
+    }
+    if (cal->distance_mode > LASER_CONTROLLER_TOF_DISTANCE_MODE_LONG) {
+        return false;
+    }
+    /*
+     * Only the presets covered by board.c set_timing_budget_ms are legal.
+     * 500 ms is not yet supported by board.c at the time of this commit,
+     * so it is excluded pending register-table extension.
+     */
+    switch (cal->timing_budget_ms) {
+        case 20U:
+        case 33U:
+        case 50U:
+        case 100U:
+        case 200U:
+            break;
+        default:
+            return false;
+    }
+    if (cal->roi_width_spads < 4U || cal->roi_width_spads > 16U) {
+        return false;
+    }
+    if (cal->roi_height_spads < 4U || cal->roi_height_spads > 16U) {
+        return false;
+    }
+    /* roi_center_spad is a raw byte index; any value 0..255 is legal. */
+    /* offset_mm signed; accept any int32_t (hardware clamps internally). */
+    if (cal->xtalk_cps > 0x7FFFFFFFU) {
+        return false;
+    }
+    return true;
+}
+
+static void laser_controller_service_save_tof_calibration_locked(
+    const laser_controller_tof_calibration_t *cal)
+{
+    nvs_handle_t handle = 0;
+    uint8_t blob[1U + sizeof(laser_controller_tof_calibration_t)];
+    blob[0] = (uint8_t)LASER_CONTROLLER_SERVICE_TOF_CAL_VERSION;
+    memcpy(&blob[1], cal, sizeof(*cal));
+
+    esp_err_t err = nvs_open(
+        LASER_CONTROLLER_SERVICE_NVS_NAMESPACE,
+        NVS_READWRITE,
+        &handle);
+    if (err == ESP_OK) {
+        err = nvs_set_blob(
+            handle,
+            LASER_CONTROLLER_SERVICE_TOF_CAL_NVS_KEY,
+            blob,
+            sizeof(blob));
+        if (err == ESP_OK) {
+            (void)nvs_commit(handle);
+        }
+    }
+    if (handle != 0) {
+        nvs_close(handle);
+    }
+}
+
+static bool laser_controller_service_load_tof_calibration_locked(
+    laser_controller_tof_calibration_t *out)
+{
+    if (out == NULL) {
+        return false;
+    }
+    nvs_handle_t handle = 0;
+    uint8_t blob[1U + sizeof(laser_controller_tof_calibration_t)];
+    size_t size = sizeof(blob);
+
+    esp_err_t err = nvs_open(
+        LASER_CONTROLLER_SERVICE_NVS_NAMESPACE,
+        NVS_READONLY,
+        &handle);
+    if (err != ESP_OK) {
+        return false;
+    }
+
+    err = nvs_get_blob(
+        handle,
+        LASER_CONTROLLER_SERVICE_TOF_CAL_NVS_KEY,
+        blob,
+        &size);
+    nvs_close(handle);
+
+    if (err != ESP_OK || size != sizeof(blob)) {
+        return false;
+    }
+    if (blob[0] != (uint8_t)LASER_CONTROLLER_SERVICE_TOF_CAL_VERSION) {
+        return false;
+    }
+
+    laser_controller_tof_calibration_t candidate;
+    memcpy(&candidate, &blob[1], sizeof(candidate));
+    if (!laser_controller_service_validate_tof_calibration(&candidate)) {
+        return false;
+    }
+    *out = candidate;
+    return true;
+}
+
+void laser_controller_service_get_tof_calibration(
+    laser_controller_tof_calibration_t *out)
+{
+    if (out == NULL) {
+        return;
+    }
+    portENTER_CRITICAL(&s_service_lock);
+    *out = s_service.status.tof_calibration;
+    portEXIT_CRITICAL(&s_service_lock);
+}
+
+esp_err_t laser_controller_service_set_tof_calibration(
+    const laser_controller_tof_calibration_t *calibration,
+    laser_controller_time_ms_t now_ms)
+{
+    if (!laser_controller_service_validate_tof_calibration(calibration)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    portENTER_CRITICAL(&s_service_lock);
+    s_service.status.tof_calibration = *calibration;
+    laser_controller_service_save_tof_calibration_locked(calibration);
+    laser_controller_service_write_action_locked(
+        "ToF calibration applied + persisted to tof_cal NVS blob.",
+        now_ms);
+    portEXIT_CRITICAL(&s_service_lock);
+    return ESP_OK;
 }
 
 void laser_controller_service_set_runtime_safety_policy(

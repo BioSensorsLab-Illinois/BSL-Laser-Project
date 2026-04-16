@@ -21,6 +21,17 @@ import { ConfirmActionDialog } from './ConfirmActionDialog'
 import { ControllerBusyOverlay } from './ControllerBusyOverlay'
 import { ImuPostureCard } from './ImuPostureCard'
 import { ProgressMeter } from './ProgressMeter'
+/*
+ * Panels that used to sit at the top of the Integrate workspace now live
+ * inside the matching Bring-up sub-pages per user directive 2026-04-15
+ * (late): `UsbDebugMockPanel` under Power supplies, `TofCalibrationPanel`
+ * under ToF, `ButtonBoardPanel` under Buttons. Keeps every sub-module's
+ * live state and service controls under one roof instead of scattered
+ * across the Integrate top bar.
+ */
+import { UsbDebugMockPanel } from './UsbDebugMockPanel'
+import { TofCalibrationPanel } from './TofCalibrationPanel'
+import { ButtonBoardPanel } from './ButtonBoardPanel'
 import type { RealtimeTelemetryStore } from '../lib/live-telemetry'
 import {
   dacReferenceOptions,
@@ -195,7 +206,7 @@ type HapticPatternDraft = {
   hazardAccepted: boolean
 }
 
-type LdSbdnMode = 'firmware' | 'off-pd' | 'on-pu' | 'standby-hiz'
+type LdSbdnMode = 'off-pd' | 'standby-hiz' | 'on-pu'
 type LdPcnMode = 'firmware' | 'lisl' | 'lish'
 
 type ProbeRequest = {
@@ -560,7 +571,7 @@ function describeLdSbdnMode(snapshot: DeviceSnapshot) {
 
   if (pin === undefined) {
     return {
-      mode: 'firmware' as const,
+      mode: 'off-pd' as const,
       label: 'GPIO13 unavailable',
       tone: 'off' as const,
       detail: 'GPIO inspector has not published LD_SBDN yet.',
@@ -571,9 +582,9 @@ function describeLdSbdnMode(snapshot: DeviceSnapshot) {
     if (pin.overrideMode === 'input') {
       return {
         mode: 'standby-hiz' as const,
-        label: 'Legacy Hi-Z',
+        label: 'Stand-By',
         tone: 'warn' as const,
-        detail: 'GPIO13 is released to high impedance. V2 does not treat standby Hi-Z as a normal operating posture.',
+        detail: 'GPIO13 is high impedance. SBDN floats into the stand-by threshold window (~2.1–2.4 V).',
       }
     }
 
@@ -597,9 +608,9 @@ function describeLdSbdnMode(snapshot: DeviceSnapshot) {
   if (!pin.outputEnabled && pin.inputEnabled) {
     return {
       mode: 'standby-hiz' as const,
-      label: 'Legacy Hi-Z',
+      label: 'Stand-By',
       tone: 'warn' as const,
-      detail: 'GPIO13 is high impedance. V2 expects SBDN to be low for shutdown or high for powered runtime.',
+      detail: 'GPIO13 is high impedance. SBDN floats into the stand-by threshold window (~2.1–2.4 V).',
     }
   }
 
@@ -612,20 +623,11 @@ function describeLdSbdnMode(snapshot: DeviceSnapshot) {
     }
   }
 
-  if (pin.outputEnabled && !pin.levelHigh) {
-    return {
-      mode: 'off-pd' as const,
-      label: 'Off',
-      tone: 'off' as const,
-      detail: 'Firmware currently drives GPIO13 low.',
-    }
-  }
-
   return {
-    mode: 'firmware' as const,
-    label: 'Auto',
+    mode: 'off-pd' as const,
+    label: 'Off',
     tone: 'off' as const,
-    detail: 'GPIO13 is still under the normal firmware state machine.',
+    detail: 'Firmware currently drives GPIO13 low.',
   }
 }
 
@@ -3142,34 +3144,31 @@ export function BringupWorkbench({
 
 async function setLdSbdnMode(mode: LdSbdnMode) {
     const labelByMode: Record<LdSbdnMode, string> = {
-      firmware: 'Auto',
       'off-pd': 'Off',
+      'standby-hiz': 'Stand-By',
       'on-pu': 'On',
-      'standby-hiz': 'Standby',
     }
     const detailByMode: Record<LdSbdnMode, string> = {
-      firmware: 'Releasing GPIO13 back to normal firmware ownership...',
       'off-pd': 'Driving GPIO13 low for Off...',
+      'standby-hiz': 'Setting GPIO13 to input (Hi-Z) for Stand-By...',
       'on-pu': 'Driving GPIO13 high for On...',
-      'standby-hiz': 'Releasing GPIO13 to input mode for Standby...',
     }
     const noteByMode: Record<LdSbdnMode, string> = {
-      firmware: 'Release GPIO13 so the original firmware logic regains SBDN ownership.',
       'off-pd': 'Service-only override: drive GPIO13 low to hold the laser driver off.',
+      'standby-hiz': 'Service-only override: set GPIO13 as input with no pulls so SBDN floats into the stand-by threshold window (~2.1–2.4 V).',
       'on-pu': 'Service-only override: drive GPIO13 high to force the laser driver on.',
-      'standby-hiz': 'Service-only override: leave GPIO13 high impedance so SBDN sits in the standby threshold window.',
     }
     const argsByMode: Record<LdSbdnMode, Record<string, number | string | boolean>> = {
-      firmware: {
+      'off-pd': {
         gpio: 13,
-        mode: 'firmware',
+        mode: 'output',
         level_high: false,
         pullup_enabled: false,
         pulldown_enabled: false,
       },
-      'off-pd': {
+      'standby-hiz': {
         gpio: 13,
-        mode: 'output',
+        mode: 'input',
         level_high: false,
         pullup_enabled: false,
         pulldown_enabled: false,
@@ -3178,13 +3177,6 @@ async function setLdSbdnMode(mode: LdSbdnMode) {
         gpio: 13,
         mode: 'output',
         level_high: true,
-        pullup_enabled: false,
-        pulldown_enabled: false,
-      },
-      'standby-hiz': {
-        gpio: 13,
-        mode: 'input',
-        level_high: false,
         pullup_enabled: false,
         pulldown_enabled: false,
       },
@@ -3421,6 +3413,18 @@ async function setLdSbdnMode(mode: LdSbdnMode) {
 
     return (
       <div className="bringup-page-grid">
+        {/*
+         * USB-Debug Mock lives at the top of the Power supplies sub-page
+         * per user directive 2026-04-15 (late). USB-only sessions have no
+         * real rails; operators need the mock UI next to the rail
+         * enable/PGOOD controls it shadows.
+         */}
+        <UsbDebugMockPanel
+          snapshot={liveSnapshot}
+          transportStatus={transportStatus}
+          onIssueCommandAwaitAck={onIssueCommandAwaitAck}
+        />
+
         <article className="panel-cutout bringup-hero">
           <div className="cutout-head">
             <Cable size={16} />
@@ -5214,16 +5218,29 @@ async function setLdSbdnMode(mode: LdSbdnMode) {
       <div className="bringup-page-grid">
         {renderModuleSettings('tof')}
 
+        {/*
+         * ToF calibration lives at the top of the ToF sub-page per user
+         * directive 2026-04-15 (late). Distance mode / timing budget /
+         * ROI / offset / crosstalk are module-local tuning that should
+         * sit alongside the module's own bring-up controls.
+         */}
+        <TofCalibrationPanel
+          snapshot={liveSnapshot}
+          transportStatus={transportStatus}
+          onIssueCommandAwaitAck={onIssueCommandAwaitAck}
+        />
+
         <article className="panel-cutout">
           <div className="cutout-head">
             <Waves size={16} />
             <strong>VL53L1X board status</strong>
           </div>
           <p className="panel-note">
-            This board is now modeled as a shared-I2C `VL53L1X` daughtercard.
+            This board is modeled as a shared-I2C `VL53L1X` daughtercard.
             Firmware probes `0x29` on `GPIO4/GPIO5`, treats `GPIO7` as the optional
-            `GPIO1` interrupt input, and holds `GPIO6` low so the onboard LED-driver
-            control path stays inactive unless it is intentionally exercised.
+            `GPIO1` interrupt input, and holds `GPIO6` low by default. The front
+            visible LED on GPIO6 (TPS61169) is driven from the service-only PWM
+            block below.
           </p>
 
           <div className="bringup-fact-grid">
@@ -5253,92 +5270,7 @@ async function setLdSbdnMode(mode: LdSbdnMode) {
             full interlock policy is staged together.
           </p>
 
-          <div className="panel-cutout bringup-illumination-card">
-            <div className="cutout-head">
-              <Activity size={16} />
-              <strong>Front illumination</strong>
-            </div>
-            <p className="inline-help">
-              The front visible LED path uses the TPS61169 `CTRL` pin on `GPIO6`.
-              Firmware keeps that line low by default, and only drives a service-only
-              `20 kHz` PWM dimming signal here while service mode is active.
-            </p>
-
-            <label className="field">
-              <FieldLabel
-                label="Brightness duty cycle"
-                help="Service-only PWM duty on GPIO6 into TPS61169 CTRL. Zero keeps the illumination path low."
-              />
-              <input
-                type="range"
-                min="0"
-                max="100"
-                step="1"
-                value={stagedIlluminationDuty}
-                title="Stage the service-only front illumination brightness."
-                onChange={(event) => setTofIlluminationDutyPct(event.target.value)}
-              />
-            </label>
-
-            <div className="bringup-illumination-meter">
-              <div>
-                <span>Staged duty</span>
-                <strong>{stagedIlluminationDuty}%</strong>
-              </div>
-              <span className={liveIllumination.enabled ? 'status-badge is-on' : 'status-badge is-off'}>
-                {liveIllumination.enabled ? 'service PWM active' : 'forced low'}
-              </span>
-            </div>
-
-            <ProgressMeter
-              value={stagedIlluminationDuty}
-              tone={liveIllumination.enabled ? 'warning' : 'steady'}
-              compact
-            />
-
-            <div className="button-row">
-              <button
-                type="button"
-                className="action-button is-inline is-accent"
-                disabled={writesDisabled || stagedIlluminationDuty <= 0}
-                onClick={() => {
-                  void applyTofIllumination(true)
-                }}
-              >
-                Apply front light
-              </button>
-              <button
-                type="button"
-                className="action-button is-inline"
-                disabled={writesDisabled || !liveIllumination.enabled}
-                onClick={() => {
-                  void applyTofIllumination(false)
-                }}
-              >
-                Lights off
-              </button>
-            </div>
-
-            <p className="inline-help">
-              TPS61169 brightness dimming is PWM-based on `CTRL`; this bring-up path
-              keeps a fixed `20 kHz` carrier and only changes duty cycle so the test
-              stays easy to reproduce. Leaving service mode forces the line low again.
-            </p>
-          </div>
-
           <div className="bringup-fact-grid">
-            <div>
-              <span>Service illumination</span>
-              <strong>{liveIllumination.enabled ? 'Active' : 'Off'}</strong>
-            </div>
-            <div>
-              <span>Service duty</span>
-              <strong>{liveIllumination.dutyCyclePct}%</strong>
-            </div>
-            <div>
-              <span>PWM carrier</span>
-              <strong>{formatNumber(liveIllumination.frequencyHz / 1000, 1)} kHz</strong>
-            </div>
             <div>
               <span>Controller filtered distance</span>
               <strong>{formatNumber(snapshot.tof.distanceM, 2)} m</strong>
@@ -5400,6 +5332,99 @@ async function setLdSbdnMode(mode: LdSbdnMode) {
             is direct peripheral readback and can jump before the controller accepts it
             as a stable, fresh safety sample.
           </p>
+
+          {/*
+           * Front illumination (GPIO6 / TPS61169) moved back into the ToF
+           * sub-page per user directive 2026-04-15 (late). GPIO6 is the
+           * ToF daughterboard's LED driver CTRL pin; co-locating the
+           * service PWM test here keeps ToF-local controls together.
+           */}
+          <div className="panel-cutout bringup-illumination-card">
+            <div className="cutout-head">
+              <Activity size={16} />
+              <strong>Front illumination</strong>
+            </div>
+            <p className="inline-help">
+              The front visible LED path uses the TPS61169 `CTRL` pin on `GPIO6`.
+              Firmware keeps that line low by default, and only drives a service-only
+              `20 kHz` PWM dimming signal here while service mode is active.
+            </p>
+
+            <label className="field">
+              <FieldLabel
+                label="Brightness duty cycle"
+                help="Service-only PWM duty on GPIO6 into TPS61169 CTRL. Zero keeps the illumination path low."
+              />
+              <input
+                type="range"
+                min="0"
+                max="100"
+                step="1"
+                value={stagedIlluminationDuty}
+                title="Stage the service-only front illumination brightness."
+                onChange={(event) => setTofIlluminationDutyPct(event.target.value)}
+              />
+            </label>
+
+            <div className="bringup-illumination-meter">
+              <div>
+                <span>Staged duty</span>
+                <strong>{stagedIlluminationDuty}%</strong>
+              </div>
+              <span className={liveIllumination.enabled ? 'status-badge is-on' : 'status-badge is-off'}>
+                {liveIllumination.enabled ? 'service PWM active' : 'forced low'}
+              </span>
+            </div>
+
+            <ProgressMeter
+              value={stagedIlluminationDuty}
+              tone={liveIllumination.enabled ? 'warning' : 'steady'}
+              compact
+            />
+
+            <div className="button-row">
+              <button
+                type="button"
+                className="action-button is-inline is-accent"
+                disabled={writesDisabled || stagedIlluminationDuty <= 0}
+                title={
+                  writesDisabled
+                    ? writeLockReason
+                    : stagedIlluminationDuty <= 0
+                      ? 'Raise the duty above 0 before enabling.'
+                      : 'Enable the service-only front illumination at the staged duty.'
+                }
+                onClick={() => {
+                  void applyTofIllumination(true)
+                }}
+              >
+                Apply front light
+              </button>
+              <button
+                type="button"
+                className="action-button is-inline"
+                disabled={writesDisabled || !liveIllumination.enabled}
+                title={
+                  writesDisabled
+                    ? writeLockReason
+                    : !liveIllumination.enabled
+                      ? 'Front illumination is already off.'
+                      : 'Force GPIO6 low and disable the service PWM path.'
+                }
+                onClick={() => {
+                  void applyTofIllumination(false)
+                }}
+              >
+                Lights off
+              </button>
+            </div>
+
+            <p className="inline-help">
+              TPS61169 brightness dimming is PWM-based on `CTRL`; this bring-up path
+              keeps a fixed `20 kHz` carrier and only changes duty cycle so the test
+              stays easy to reproduce. Leaving service mode forces the line low again.
+            </p>
+          </div>
         </article>
       </div>
     )
@@ -5973,30 +5998,18 @@ async function setLdSbdnMode(mode: LdSbdnMode) {
       <div className="bringup-page-grid">
         {renderModuleSettings('buttons')}
 
-        <article className="panel-cutout">
-          <div className="cutout-head">
-            <Layers3 size={16} />
-            <strong>Two-stage trigger note</strong>
-          </div>
-          <p className="panel-note">
-            The current bench plan keeps the trigger absent. This page exists so the
-            absence is explicit and auditable instead of surfacing as a fault.
-          </p>
-          <div className="bringup-step-list">
-            <div className="bringup-step-list__item">
-              <strong>Stage 1 future job</strong>
-              <p>Green alignment laser request gated by the same hard interlocks.</p>
-            </div>
-            <div className="bringup-step-list__item">
-              <strong>Stage 2 future job</strong>
-              <p>NIR request with immediate beam-off on release or illegal transition.</p>
-            </div>
-            <div className="bringup-step-list__item">
-              <strong>Current status</strong>
-              <p>No GPIO mapping is treated as authoritative until the missing sensor board files are reviewed.</p>
-            </div>
-          </div>
-        </article>
+        {/*
+         * Button Board panel moved in here from the top of the Integrate
+         * workspace per user directive 2026-04-15 (late). Live button
+         * state, MCP23017 + TLC59116 reachability, INTA fire counter,
+         * trigger phase, and the RGB-LED service test are all scoped to
+         * the Buttons sub-page now.
+         */}
+        <ButtonBoardPanel
+          snapshot={liveSnapshot}
+          transportStatus={transportStatus}
+          onIssueCommandAwaitAck={onIssueCommandAwaitAck}
+        />
       </div>
     )
   }
@@ -6235,17 +6248,6 @@ async function setLdSbdnMode(mode: LdSbdnMode) {
                   <div className="bringup-ld__mode-switch bringup-ld__mode-switch--sbdn">
                     <button
                       type="button"
-                      className={sbdnStatus.mode === 'firmware' ? 'segmented__button is-active' : 'segmented__button'}
-                      disabled={writesDisabled}
-                      title="Release GPIO13 back to firmware ownership."
-                      onClick={() => {
-                        void setLdSbdnMode('firmware')
-                      }}
-                    >
-                      Auto
-                    </button>
-                    <button
-                      type="button"
                       className={sbdnStatus.mode === 'off-pd' ? 'segmented__button is-active' : 'segmented__button'}
                       disabled={writesDisabled}
                       title="Drive GPIO13 low to force the laser driver off."
@@ -6254,6 +6256,17 @@ async function setLdSbdnMode(mode: LdSbdnMode) {
                       }}
                     >
                       Off
+                    </button>
+                    <button
+                      type="button"
+                      className={sbdnStatus.mode === 'standby-hiz' ? 'segmented__button is-active' : 'segmented__button'}
+                      disabled={writesDisabled}
+                      title="Set GPIO13 as input (Hi-Z) so SBDN floats into the stand-by threshold window."
+                      onClick={() => {
+                        void setLdSbdnMode('standby-hiz')
+                      }}
+                    >
+                      Stand-By
                     </button>
                     <button
                       type="button"

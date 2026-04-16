@@ -457,6 +457,23 @@ export function makeDefaultBringupStatus(): BringupStatus {
       tofMinRangeM: 0.2,
       tofMaxRangeM: 1,
       tofStaleTimeoutMs: 150,
+      /*
+       * VL53L1X calibration defaults match the firmware safe defaults
+       * (long mode, 50 ms timing budget, full 16×16 ROI centred, zero
+       * offset, xtalk off). Firmware auto-persists the operator's values
+       * to the `tof_cal` NVS blob; these are only the fallback when the
+       * live snapshot hasn't arrived yet.
+       */
+      tofCalibration: {
+        distanceMode: 'long',
+        timingBudgetMs: 50,
+        roiWidthSpads: 16,
+        roiHeightSpads: 16,
+        roiCenterSpad: 199,
+        offsetMm: 0,
+        xtalkCps: 0,
+        xtalkEnabled: false,
+      },
       pdProfiles: makeDefaultPdProfiles(),
       pdProgrammingOnlyMaxW: 30,
       pdReducedModeMinW: 30,

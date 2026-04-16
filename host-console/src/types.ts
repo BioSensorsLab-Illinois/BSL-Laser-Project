@@ -155,6 +155,74 @@ export interface TecStatus {
   settlingSecondsRemaining: number
 }
 
+/**
+ * SBDN pin physical drive state on the ATLS6A214 laser driver (GPIO13).
+ * Mirrors `laser_controller_sbdn_state_t` in firmware.
+ *   - 'off'     → GPIO drive LOW, fast 20us shutdown
+ *   - 'on'      → GPIO drive HIGH, driver operate
+ *   - 'standby' → GPIO input / Hi-Z, external divider holds ~2.25V standby
+ */
+export type SbdnState = 'off' | 'on' | 'standby'
+
+/**
+ * Firmware-computed reason why a host-control action cannot be requested
+ * right now. Produced on every bench status frame. Green alignment is
+ * always 'none' (ungated per user directive 2026-04-14).
+ *
+ * Must stay in sync with `laser_controller_comms_nir_blocked_reason`
+ * and `laser_controller_comms_led_blocked_reason` in firmware.
+ */
+export type NirBlockedReason =
+  | 'none'
+  | 'not-connected'
+  | 'fault-latched'
+  | 'deployment-off'
+  | 'checklist-running'
+  | 'checklist-not-ready'
+  | 'ready-not-idle'
+  | 'not-modulated-host'
+  | 'power-not-full'
+  | 'rail-not-good'
+  | 'tec-not-settled'
+
+export type LedBlockedReason =
+  | 'none'
+  | 'not-connected'
+  | 'deployment-off'
+  | 'checklist-running'
+
+export interface HostControlReadiness {
+  nirBlockedReason: NirBlockedReason
+  alignmentBlockedReason: 'none'
+  ledBlockedReason: LedBlockedReason
+  sbdnState: SbdnState
+}
+
+/**
+ * USB-Debug Mock Layer status. Mirrors the firmware module
+ * `laser_controller_usb_debug_mock_status_t` and is published in every
+ * bench status frame (`bench.usbDebugMock`).
+ *
+ * `active` true means the controller is synthesizing TEC/LD rail PGOOD
+ * and telemetry to allow online testing from a USB-only session. The
+ * GUI MUST render a loud, app-wide banner whenever this is true and
+ * MUST flag every TEC/LD readout as synthesized. Failing to surface
+ * the mock state is a safety-visibility regression (see AGENT.md).
+ *
+ * `pdConflictLatched` true means real PD power was detected while the
+ * mock was active and the firmware latched the
+ * `usb_debug_mock_pd_conflict` SYSTEM_MAJOR fault. The operator must
+ * clear faults explicitly before the mock can be re-enabled.
+ */
+export interface UsbDebugMockStatus {
+  active: boolean
+  pdConflictLatched: boolean
+  enablePending: boolean
+  activatedAtMs: number
+  deactivatedAtMs: number
+  lastDisableReason: string
+}
+
 export interface BenchControlStatus {
   targetMode: BenchTargetMode
   runtimeMode: RuntimeMode
@@ -166,7 +234,7 @@ export interface BenchControlStatus {
   requestedCurrentA: number
   requestedLedEnabled: boolean
   requestedLedDutyCyclePct: number
-  appliedLedOwner: 'none' | 'integrate_service' | 'operate_runtime' | 'deployment'
+  appliedLedOwner: 'none' | 'integrate_service' | 'operate_runtime' | 'deployment' | 'button_trigger'
   appliedLedPinHigh: boolean
   illuminationEnabled: boolean
   illuminationDutyCyclePct: number
@@ -175,6 +243,8 @@ export interface BenchControlStatus {
   modulationFrequencyHz: number
   modulationDutyCyclePct: number
   lowStateCurrentA: number
+  hostControlReadiness: HostControlReadiness
+  usbDebugMock: UsbDebugMockStatus
 }
 
 export interface DeploymentStep {
@@ -256,6 +326,24 @@ export interface PdSinkProfile {
   currentA: number
 }
 
+/*
+ * VL53L1X runtime calibration + ROI. Persisted in a dedicated NVS blob
+ * ("tof_cal") on the controller; survives reboot and is re-applied on
+ * every ToF init. Editable via `integrate.tof.set_calibration`.
+ */
+export type TofDistanceMode = 'short' | 'medium' | 'long'
+
+export interface TofCalibration {
+  distanceMode: TofDistanceMode
+  timingBudgetMs: 20 | 33 | 50 | 100 | 200
+  roiWidthSpads: number   // 4..16
+  roiHeightSpads: number  // 4..16
+  roiCenterSpad: number   // 0..255, default 199 = grid centre
+  offsetMm: number        // signed mm
+  xtalkCps: number        // unsigned counts/sec
+  xtalkEnabled: boolean
+}
+
 export interface BringupTuning {
   dacLdChannelV: number
   dacTecChannelV: number
@@ -275,6 +363,7 @@ export interface BringupTuning {
   tofMinRangeM: number
   tofMaxRangeM: number
   tofStaleTimeoutMs: number
+  tofCalibration: TofCalibration
   pdProfiles: PdSinkProfile[]
   pdProgrammingOnlyMaxW: number
   pdReducedModeMinW: number
@@ -306,6 +395,90 @@ export interface ButtonRuntimeStatus {
   stage2Pressed: boolean
   stage1Edge: boolean
   stage2Edge: boolean
+  /*
+   * Side buttons on the MCP23017 expander GPA2/GPA3. Used by the firmware
+   * binary-trigger policy to step the front LED brightness +/- 10 %. No
+   * safety implication on side buttons.
+   */
+  side1Pressed: boolean
+  side2Pressed: boolean
+  side1Edge: boolean
+  side2Edge: boolean
+  /*
+   * `boardReachable` is TRUE when the MCP23017 button expander has been
+   * probed and configured. When FALSE, the firmware drops all pressed
+   * state to inactive and the host should disable any "switch to
+   * binary_trigger" UI.
+   */
+  boardReachable: boolean
+  /*
+   * Monotonic count of GPIO7 INTA ISR fires since boot. Useful for
+   * verifying the interrupt line in service mode without physical button
+   * presses.
+   */
+  isrFireCount: number
+}
+
+/*
+ * RGB status LED on the button board (TLC59116 channels 0/1/2 wired
+ * B/R/G respectively). Mirrors `laser_controller_rgb_led_state_t` in
+ * firmware. `enabled=false` means the LED is dark regardless of R/G/B.
+ * `blink=true` engages the firmware-configured 1 Hz / 50% group blink.
+ */
+export interface RgbLedState {
+  r: number
+  g: number
+  b: number
+  blink: boolean
+  enabled: boolean
+}
+
+/*
+ * Trigger phase exposed by the firmware so the host doesn't need to
+ * recompute the RGB policy. Mirrors the helper in
+ * components/laser_controller/src/laser_controller_comms.c
+ * (laser_controller_comms_trigger_phase). Keep in lockstep with both
+ * the firmware helper and the mock helper in mock-transport.ts.
+ *
+ *   off          - outside deployment-ready-idle, LED dark
+ *   ready        - deployment ready, awaiting trigger (solid blue)
+ *   armed        - stage1 pressed + LD_GOOD + TEC_GOOD (solid green)
+ *   firing       - NIR currently emitting (solid red)
+ *   interlock    - recoverable interlock active (flashing orange)
+ *   lockout      - press-and-hold lockout latched (flashing orange)
+ *   unrecoverable - SYSTEM_MAJOR fault or button board lost (flashing red)
+ */
+export type TriggerPhase =
+  | 'off'
+  | 'ready'
+  | 'armed'
+  | 'firing'
+  | 'interlock'
+  | 'lockout'
+  | 'unrecoverable'
+
+/*
+ * Top-level button-board telemetry. Published in every snapshot under
+ * `DeviceSnapshot.buttonBoard`. The MCP23017 + TLC59116 reachability and
+ * the firmware-computed RGB / trigger-phase state. Four-place sync
+ * target: firmware comms.c, mock-transport.ts, docs/protocol-spec.md.
+ */
+export interface ButtonBoardStatus {
+  mcpAddr: string
+  tlcAddr: string
+  mcpReachable: boolean
+  mcpConfigured: boolean
+  mcpLastError: number
+  mcpConsecFailures: number
+  tlcReachable: boolean
+  tlcConfigured: boolean
+  tlcLastError: number
+  isrFireCount: number
+  rgb: RgbLedState & { testActive: boolean }
+  ledBrightnessPct: number
+  ledOwned: boolean
+  triggerLockout: boolean
+  triggerPhase: TriggerPhase
 }
 
 export interface DacPeripheralReadback {
@@ -422,6 +595,29 @@ export interface BringupStatus {
   tools: BringupTools
 }
 
+/**
+ * Frozen at-trip diagnostic frame for a fault.
+ *
+ * Currently populated by firmware ONLY for `LD_OVERTEMP` (added
+ * 2026-04-15 late, after operators saw spurious overtemp trips
+ * with no visibility into the ADC reading or rail settle state).
+ * The shape is general so future faults (loop-bad, rail-bad,
+ * unexpected-current) can reuse it without a schema migration.
+ *
+ * The firmware captures this ONCE on the rising edge of the fault
+ * and never overwrites it while the fault stays latched. Cleared
+ * only by `clear_faults`.
+ */
+export interface FaultTriggerDiag {
+  code: string
+  measuredC: number
+  measuredVoltageV: number
+  limitC: number
+  ldPgoodForMs: number
+  sbdnNotOffForMs: number
+  expr: string
+}
+
 export interface FaultSummary {
   latched: boolean
   activeCode: string
@@ -431,6 +627,7 @@ export interface FaultSummary {
   activeCount: number
   tripCounter: number
   lastFaultAtIso: string | null
+  triggerDiag: FaultTriggerDiag | null
 }
 
 export interface RealtimeSessionStatus {
@@ -509,6 +706,7 @@ export interface RealtimeFaultSummary {
   latchedClass: string
   activeCount: number
   tripCounter: number
+  triggerDiag: FaultTriggerDiag | null
 }
 
 type DeepPartial<T> = {
@@ -529,6 +727,7 @@ export interface RealtimeTelemetry {
   tec: TecStatus
   safety: RealtimeSafetyStatus
   buttons: ButtonRuntimeStatus
+  buttonBoard: ButtonBoardStatus
   bringup: RealtimeBringupStatus
   deployment: RealtimeDeploymentStatus
   fault: RealtimeFaultSummary
@@ -563,6 +762,13 @@ export interface SafetyStatus {
   tecReadyToleranceC: number
   maxLaserCurrentA: number
   offCurrentThresholdA: number
+  /*
+   * Hard safety cap on the GPIO6 ToF-board front LED duty cycle,
+   * integer percent 0..100. Enforced in firmware at every illumination
+   * entry point (service + runtime). Default 50 per user directive
+   * 2026-04-15. Editable via `integrate.set_safety` while in service mode.
+   */
+  maxTofLedDutyCyclePct: number
   actualLambdaNm: number
   targetLambdaNm: number
   lambdaDriftNm: number
@@ -595,6 +801,7 @@ export interface DeviceSnapshot {
   laser: LaserStatus
   tec: TecStatus
   buttons: ButtonRuntimeStatus
+  buttonBoard: ButtonBoardStatus
   peripherals: PeripheralReadback
   gpioInspector: GpioInspectorStatus
   bench: BenchControlStatus

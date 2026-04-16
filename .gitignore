@@ -10,3 +10,12 @@ host-console/.vite/
 host-console/.DS_Store
 host-console/*.tsbuildinfo
 *.log
+
+# BSL agentic workflow — session-local state (sentinels, changelogs, reminders)
+.claude/state/
+# Claude Code local worktrees
+.claude/worktrees/
+
+# Python bytecode caches from validation / utility scripts
+__pycache__/
+*.pyc

@@ -29,7 +29,7 @@ ESP32-S3 module pin numbers were cross-referenced against the official Espressif
    - the BMS battery-toggle connector
 3. `GPIO37` is electrically shared between the DRV2605 `IN/TRIG` input and the visible laser switch enable path.
 4. The ToF daughterboard is now source-backed and uses `VL53L1X` over the shared `GPIO4/GPIO5` I2C bus, with optional sideband on `GPIO7` and `GPIO6`.
-5. The separate button board is still unresolved at source level.
+5. The button board (MCP23017 + TLC59116) is now source-backed (2026-04-15); see the "Button board" section below.
 6. The board as drawn assumes a compatible ESP32-S3 module variant that exposes `GPIO35/36/37` and supports `GPIO47/48` at 3.3 V logic.
 
 ## Confirmed ESP32 GPIO Map
@@ -42,7 +42,7 @@ ESP32-S3 module pin numbers were cross-referenced against the official Espressif
 | `GPIO16` | `9` | `PWR_TEC_GOOD` | input | `U2 MPM3530GRF PG` | TEC rail power-good |
 | `GPIO17` | `10` | `PWR_LD_EN` | output | `U5 MPM3530GRF EN`, also `LMV331` shutdown path net | LD rail enable |
 | `GPIO18` | `11` | `PWR_LD_PGOOD` | input | `U5 MPM3530GRF PG` | LD rail power-good |
-| `GPIO13` | `21` | `LD_SBDN` | output | `U3 ATLS6A214 SBDN` | fast beam-off / standby control |
+| `GPIO13` | `21` | `LD_SBDN` | tri-state (output or input/Hi-Z) | `U3 ATLS6A214 SBDN` | three-state control: drive LOW = shutdown (20 us fast beam-off), drive HIGH = operate, input/Hi-Z = standby (external R27=13k7 / R28=29k4 divider holds 2.25 V in datasheet 2.1-2.4 V standby band). Pulls MUST stay disabled — internal pulls would fight the divider. Fault paths force drive-LOW, never Hi-Z. |
 | `GPIO21` | `23` | `LD-PCN` | output | `U3 ATLS6A214 PCN` | low/high current selection |
 | `GPIO14` | `22` | `LD_LPGD` | input | `U3 ATLS6A214 LPGD` | driver loop-good input |
 | `GPIO47` | `24` | `TEC_TEMPGD` | input | `U4 TEC14M5V3R5AS TEMPGD` | TEC settle-good input |
@@ -157,7 +157,7 @@ Firmware implication:
   - `GPIO6` -> recommended output to the onboard LED-driver `CTRL` input (`LD_INT` on the daughterboard)
 - `VL53L1X XSHUT` is pulled up locally on the daughterboard and is not exported, so no dedicated MCU shutdown line exists on this revision
 - the ToF board is I2C only; do not route it onto the IMU SPI bus
-- `GPIO4/5/6/7` still must remain board-configurable because the separate button board is not yet source-backed
+- `GPIO4/5/6/7` must remain board-configurable; GPIO7 is now `LASER_CONTROLLER_GPIO_BUTTON_INTA` (button-board ISR) — see the "Button board" section below
 
 ### BMS J2 battery-toggle connector
 
@@ -193,13 +193,73 @@ The schematic symbol is generic `ESP32-S3-WROOM-1U`, but the actual fitted subva
 
 Production firmware should therefore lock the allowed module BOM, not just the symbol family.
 
+## Button board (MCP23017 + TLC59116) — 2026-04-15
+
+The button board is now source-backed and shares the **MainPCB J2 Sensor & LED** physical connector with the ToF daughterboard.
+
+Two I²C devices fitted, both with all address pins strapped to GND:
+
+| Device | Address | Role |
+| --- | --- | --- |
+| MCP23017 | `0x20` | GPIO expander; 4 active button inputs on GPA0..GPA3, INTA → ESP32 GPIO7 |
+| TLC59116 | `0x60` | LED driver; RGB status LED on OUT0/OUT1/OUT2 (B/R/G channel order — non-standard) |
+
+MCP23017 button pin assignments:
+
+| MCP23017 pin | Function | Notes |
+| --- | --- | --- |
+| `GPA0` | Main trigger stage 1 (shallow press) | Active-low to GND, idle-high via 3V3 + internal pull-up |
+| `GPA1` | Main trigger stage 2 (deep press) | Active-low; stage2 mechanically implies stage1 |
+| `GPA2` | Side button 1 (LED brightness +10%) | Active-low |
+| `GPA3` | Side button 2 (LED brightness -10%) | Active-low |
+| `GPA4..GPA7`, `GPB0..GPB7` | Reserved / unused | Configured as input with internal pull-up |
+
+Firmware configures the MCP23017 via:
+
+- `IOCON = 0x64` (BANK=0, MIRROR=1, SEQOP=1, ODR=1 → INTA open-drain, mirrors INTB)
+- `IODIRA = 0xFF` (all inputs)
+- `IPOLA = 0x00` (no hardware inversion; firmware inverts to "pressed")
+- `GPPUA = 0x0F` (internal pull-up on the four button pins)
+- `GPINTENA = 0x0F` (interrupt-on-change on all four)
+- `INTCONA = 0x00` (any-edge — compare against previous, not DEFVAL)
+- `DEFVALA = 0xFF` (idle-high reference, deterministic init)
+
+TLC59116 is configured via:
+
+- `MODE1 = 0x01` (SLEEP=0, ALLCALL enabled at default 0x68 — harmless because no other device on the bus uses 0x68)
+- `MODE2.DMBLNK` flips between dim/blink mode at runtime (`0` = solid, `1` = group blink at fixed 1 Hz / 50 % duty)
+- `LEDOUT0 = 0b00111111` (mode 3 on OUT0/1/2: individual PWM × group dim/blink; OUT3 off). LEDOUT1..3 = 0x00.
+- `GRPFREQ = 23` → period = `(GRPFREQ+1)/24 = 1.0 s` per the datasheet formula
+- `GRPPWM = 128` → 50 % duty
+- `PWM0 = B`, `PWM1 = R`, `PWM2 = G` (0..255)
+
+### GPIO7 ownership transfer (2026-04-15)
+
+`GPIO7` was previously `LASER_CONTROLLER_GPIO_TOF_GPIO1_INT` (VL53L1X data-ready). It is now `LASER_CONTROLLER_GPIO_BUTTON_INTA` exclusively. The pinmap macro was renamed in `components/laser_controller/include/laser_controller_pinmap.h`. The ToF daughterboard physically shares the same J2 connector, so its GPIO1 output net is no longer wired into the ESP-side input on this revision; the ToF runs in polling-only mode (RANGE_STATUS register).
+
+`GPIO7` now requires an internal pull-up on the ESP side because MCP23017 INTA is open-drain. The firmware ISR is registered in `laser_controller_board.c` (`laser_controller_board_button_inta_isr`); it does NOT perform any I²C work — it only increments an atomic counter (`laser_controller_buttons_on_isr_fired`) for control-task drainage and telemetry.
+
+### Shared-bus loading after button-board addition
+
+GPIO4/5 now carries six addresses + ALLCALL:
+
+| 7-bit | Device |
+| --- | --- |
+| `0x20` | MCP23017 (button board) |
+| `0x28` | STUSB4500 (USB-PD) |
+| `0x29` | VL53L1X (ToF) |
+| `0x48` | DAC80502 |
+| `0x5A` | DRV2605 |
+| `0x60` | TLC59116 (button board) |
+| `0x68` | TLC59116 ALLCALL (passive — no other device claims this slot) |
+
+No collisions. Bus pull-up network is unchanged — the existing 3 × 4.7 kΩ parallel pulls remain adequate at the standard 100 kHz I²C clock; if a future revision adds a 7th address or moves to 400 kHz, re-verify with a scope.
+
 ## Remaining Unknowns
 
 The following are still not finished:
 
-- two-stage trigger button pin-level wiring
-- whether the final production button board shares or repurposes any of `GPIO4/5/6/7`
-- the exact firmware policy for `VL53L1X GPIO1` interrupt usage versus polling-only operation
-- the total added I2C pull-up/loading once every external daughterboard is populated
+- the total added I2C pull-up/loading once every external daughterboard is populated (verify scope at 400 kHz if the bus speed is bumped)
+- the exact mechanical interlock model for the J2 connector when both ToF and button board are present (firmware assumes ToF GPIO1 is physically not driving the line; hardware team must verify)
 
-The ToF board itself is no longer a netlist-level unknown, but the full external-board stack still needs review before hard-freezing every off-board GPIO assignment.
+Both the ToF board and the button board are now source-backed in this repo. The two-stage trigger button pin-level wiring is no longer unknown — see the Button board section above.

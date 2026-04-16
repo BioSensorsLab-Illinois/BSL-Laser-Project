@@ -19,6 +19,7 @@
 #include "laser_controller_service.h"
 #include "laser_controller_safety.h"
 #include "laser_controller_state.h"
+#include "laser_controller_usb_debug_mock.h"
 
 #define LASER_CONTROLLER_CONTROL_PERIOD_MS 5U
 #define LASER_CONTROLLER_SLOW_DIVIDER 10U
@@ -108,11 +109,103 @@ typedef struct {
     bool deployment_step_action_performed;
     laser_controller_time_ms_t deployment_tec_loss_since_ms;
     laser_controller_time_ms_t deployment_ld_loss_since_ms;
+    /*
+     * Rising-edge anchors for the LD-overtemp temp-valid gate.
+     *
+     * `ld_rail_pgood_since_ms` = timestamp at which the LD rail last rose
+     *    from PGOOD-low to PGOOD-high. 0 when the rail is currently off.
+     * `sbdn_not_off_since_ms` = timestamp at which `last_outputs.sbdn_state`
+     *    last transitioned from OFF to STANDBY or ON. 0 when SBDN is
+     *    currently OFF.
+     *
+     * The LD driver thermistor ADC read is not trusted until BOTH anchors
+     * are at least LASER_CONTROLLER_LD_TEMP_SETTLE_MS (2 s) old — garbage
+     * first-sample reads during rail rise or tri-state SBDN transitions
+     * used to latch spurious SYSTEM_MAJOR LD_OVERTEMP faults. User
+     * directive 2026-04-15 (late). Control-task-owned write; safety
+     * snapshot carries the derived durations into safety_evaluate.
+     */
+    laser_controller_time_ms_t ld_rail_pgood_since_ms;
+    laser_controller_time_ms_t sbdn_not_off_since_ms;
+    /*
+     * Diagnostic payload captured AT TRIP for LD_OVERTEMP. Populated on
+     * the rising edge of the fault, frozen while the fault stays latched.
+     * Cleared by `laser_controller_app_clear_fault_latch`. See
+     * `laser_controller_runtime_status_t.active_fault_diag` docstring in
+     * laser_controller_app.h for the full contract.
+     *
+     * THREADING: `active_fault_diag.*` is owned by the control task. Writes
+     * happen in two places, both from the control task:
+     *   - `run_fast_cycle` rising-edge capture after safety_evaluate.
+     *   - `run_fast_cycle` drain of `clear_fault_diag_request` at the top
+     *     of the tick.
+     * The comms task NEVER writes `active_fault_diag.*` directly. Instead
+     * it sets `clear_fault_diag_request = true` under `s_context_lock` and
+     * the control task picks the flag up on the next tick (<=5 ms). This
+     * eliminates the data race that would otherwise let comms zero a
+     * just-captured at-trip frame.
+     */
+    struct {
+        bool valid;
+        laser_controller_fault_code_t code;
+        float measured_c;
+        float measured_voltage_v;
+        float limit_c;
+        uint32_t ld_pgood_for_ms;
+        uint32_t sbdn_not_off_for_ms;
+        char expr[64];
+    } active_fault_diag;
+    /*
+     * Cross-task request flag: set by `laser_controller_app_clear_fault_latch`
+     * (comms task) under `s_context_lock`, drained by `run_fast_cycle`
+     * (control task) under `s_context_lock`. When the control task sees
+     * the flag, it zeros `active_fault_diag` and clears the flag. This is
+     * the canonical cross-task hand-off pattern per
+     * `.agent/skills/firmware-change/SKILL.md`.
+     */
+    bool clear_fault_diag_request;
     bool deployment_force_ld_safe;
     bool deployment_tec_contradiction_reported;
     laser_controller_board_inputs_t last_inputs;
     laser_controller_board_outputs_t last_outputs;
     laser_controller_safety_decision_t last_decision;
+    /*
+     * Button-board press-and-hold lockout state.
+     *
+     * `button_nir_lockout` is set by the control task when an interlock
+     * fires during a binary-trigger NIR press (stage1+stage2 held).
+     * Once set, NIR is forced off until BOTH stages release, then on the
+     * next press the lockout is cleared and gates re-evaluate normally.
+     * Cleared explicitly by `!stage1 && !stage2` edge in the control task.
+     *
+     * Written ONLY by the control task — same threading model as
+     * `fault_latched`. Do not write from comms or main.
+     */
+    bool button_nir_lockout;
+    /*
+     * Front LED-board brightness (GPIO6 illumination) that the
+     * binary-trigger button policy wants applied this tick. Stepped by
+     * side1 (+10%) and side2 (-10%) edges. Reset to 20% on every stage1
+     * rising edge per user directive 2026-04-15. Range 0..100.
+     */
+    uint32_t button_led_brightness_pct;
+    /*
+     * TRUE when the binary-trigger policy owns the GPIO6 front LED this
+     * tick. When TRUE, the runtime illumination call uses
+     * `button_led_brightness_pct` instead of the bench-status host slider
+     * value. Set to TRUE when binary_trigger + deployment ready_idle +
+     * stage1_pressed.
+     */
+    bool button_led_active;
+    /*
+     * Optional integrate-test RGB override. When `rgb_test_until_ms` is
+     * non-zero and >= now_ms, the RGB policy returns `rgb_test_state`
+     * verbatim. Cleared on service-mode exit, on any fault, on deployment
+     * entry, or when the watchdog window expires. Watchdog window is
+     * 5 seconds, set in the comms.c handler.
+     */
+    laser_controller_rgb_led_state_t rgb_test_state;
+    laser_controller_time_ms_t rgb_test_until_ms;
 } laser_controller_context_t;
 
 static laser_controller_context_t s_context;
@@ -129,7 +222,12 @@ static laser_controller_board_outputs_t laser_controller_safe_outputs(void)
         .enable_tec_vin = false,
         .enable_haptic_driver = false,
         .enable_alignment_laser = false,
-        .assert_driver_standby = true,
+        /*
+         * Safe posture is FAST SHUTDOWN (SBDN driven LOW). Standby (Hi-Z)
+         * is reserved for intentional NIR-off-in-ready; safe outputs fire
+         * on boot / power loss / unknown — must be fully shut down.
+         */
+        .sbdn_state = LASER_CONTROLLER_SBDN_STATE_OFF,
         .select_driver_low_current = true,
     };
 }
@@ -862,7 +960,7 @@ static bool laser_controller_deployment_outputs_off_confirmed(
            !context->last_outputs.enable_tec_vin &&
            !context->last_outputs.enable_haptic_driver &&
            !context->last_outputs.enable_alignment_laser &&
-           context->last_outputs.assert_driver_standby &&
+           context->last_outputs.sbdn_state == LASER_CONTROLLER_SBDN_STATE_OFF &&
            context->last_outputs.select_driver_low_current &&
            laser_controller_deployment_pin_is_low(inputs, LASER_CONTROLLER_GPIO_LD_SBDN) &&
            laser_controller_deployment_pin_is_low(inputs, LASER_CONTROLLER_GPIO_LD_PCN) &&
@@ -884,7 +982,7 @@ static bool laser_controller_deployment_ready_posture_confirmed(
            inputs != NULL &&
            context->last_outputs.enable_ld_vin &&
            context->last_outputs.enable_tec_vin &&
-           !context->last_outputs.assert_driver_standby &&
+           context->last_outputs.sbdn_state == LASER_CONTROLLER_SBDN_STATE_ON &&
            context->last_outputs.select_driver_low_current &&
            inputs->ld_rail_pgood &&
            inputs->tec_rail_pgood &&
@@ -1082,7 +1180,7 @@ static void laser_controller_deployment_tick(
         }
 
         if (!context->deployment_force_ld_safe &&
-            !context->last_outputs.assert_driver_standby &&
+            context->last_outputs.sbdn_state == LASER_CONTROLLER_SBDN_STATE_ON &&
             !context->last_outputs.select_driver_low_current &&
             !context->last_inputs.driver_loop_good) {
             laser_controller_deployment_invalidate_ready(
@@ -1311,6 +1409,90 @@ static void laser_controller_deployment_tick(
                     now_ms,
                     LASER_CONTROLLER_FAULT_TEC_NOT_SETTLED,
                     "TEC did not settle to the deployment target");
+            }
+            break;
+        case LASER_CONTROLLER_DEPLOYMENT_STEP_LP_GOOD_CHECK:
+            /*
+             * Three-phase loop-lock verification per user directive
+             * 2026-04-15 (late).
+             *
+             *   substep 0 — "LD rail settle". SBDN stays OFF. Wait for
+             *     `ld_rail_pgood_for_ms >= 2000` so the rail is provably
+             *     stable before the driver is enabled. Advances when the
+             *     rail has been good for 2 s; fails at 5 s if the rail
+             *     never stabilizes (fallback to the existing loss path).
+             *
+             *   substep 1 — "SBDN settle". derive_outputs drives SBDN
+             *     HIGH (OPERATE). Wait for `sbdn_not_off_for_ms >= 2000`
+             *     — tracked off the COMMITTED last_outputs.sbdn_state
+             *     (not Hi-Z STANDBY, strictly HIGH). Fails at 5 s if
+             *     somehow SBDN never goes HIGH.
+             *
+             *   substep 2 — "LP_GOOD probe". Check `driver_loop_good`
+             *     within a 1 s window. Fails with LD_LP_GOOD_TIMEOUT if
+             *     the line never asserts.
+             *
+             * select_driver_low_current stays true throughout so PCN is
+             * LOW — this is a loop-lock-at-zero-drive check. READY_POSTURE
+             * still does the bias verification afterward.
+             */
+            {
+                const uint32_t ld_pgood_for_ms =
+                    context->ld_rail_pgood_since_ms == 0U
+                        ? 0U
+                        : (uint32_t)(now_ms - context->ld_rail_pgood_since_ms);
+                const uint32_t sbdn_not_off_for_ms =
+                    context->sbdn_not_off_since_ms == 0U
+                        ? 0U
+                        : (uint32_t)(now_ms - context->sbdn_not_off_since_ms);
+
+                if (context->deployment_substep == 0U) {
+                    if (ld_pgood_for_ms >= 2000U) {
+                        context->deployment_substep = 1U;
+                        context->deployment_step_started_ms = now_ms;
+                        laser_controller_logger_log(
+                            now_ms,
+                            "deploy",
+                            "LP_GOOD_CHECK: LD rail stable for 2 s, driving SBDN HIGH");
+                    } else if ((now_ms - context->deployment_step_started_ms) >=
+                               5000U) {
+                        laser_controller_deployment_fail(
+                            context,
+                            now_ms,
+                            LASER_CONTROLLER_FAULT_LD_RAIL_BAD,
+                            "LD rail did not hold PGOOD for 2 s during LP_GOOD_CHECK");
+                    }
+                } else if (context->deployment_substep == 1U) {
+                    if (sbdn_not_off_for_ms >= 2000U &&
+                        context->last_outputs.sbdn_state ==
+                            LASER_CONTROLLER_SBDN_STATE_ON) {
+                        context->deployment_substep = 2U;
+                        context->deployment_step_started_ms = now_ms;
+                        laser_controller_logger_log(
+                            now_ms,
+                            "deploy",
+                            "LP_GOOD_CHECK: SBDN HIGH stable for 2 s, probing LP_GOOD");
+                    } else if ((now_ms - context->deployment_step_started_ms) >=
+                               5000U) {
+                        laser_controller_deployment_fail(
+                            context,
+                            now_ms,
+                            LASER_CONTROLLER_FAULT_LD_LP_GOOD_TIMEOUT,
+                            "SBDN did not reach HIGH+stable within 5 s during LP_GOOD_CHECK");
+                    }
+                } else {
+                    if (context->last_inputs.driver_loop_good) {
+                        laser_controller_deployment_complete_current_step(
+                            context, now_ms);
+                    } else if ((now_ms - context->deployment_step_started_ms) >=
+                               1000U) {
+                        laser_controller_deployment_fail(
+                            context,
+                            now_ms,
+                            LASER_CONTROLLER_FAULT_LD_LP_GOOD_TIMEOUT,
+                            "SBDN HIGH but LP_GOOD never asserted within 1 s");
+                    }
+                }
             }
             break;
         case LASER_CONTROLLER_DEPLOYMENT_STEP_READY_POSTURE:
@@ -1565,6 +1747,18 @@ static void laser_controller_record_fault(
         context->latched_fault_code = fault_code;
         context->latched_fault_class = fault_class;
         context->fault_latched = true;
+        /*
+         * Any non-auto-clear fault auto-disables the USB-Debug Mock if it
+         * was active. Idempotent if mock is already off. Skipped for the
+         * mock's own PD-conflict fault to avoid a redundant log line —
+         * the mock already auto-disabled itself in the same tick before
+         * recording the fault.
+         */
+        if (fault_code != LASER_CONTROLLER_FAULT_USB_DEBUG_MOCK_PD_CONFLICT) {
+            laser_controller_usb_debug_mock_force_disable_on_fault(
+                laser_controller_fault_code_name(fault_code),
+                now_ms);
+        }
     } else if (!laser_controller_fault_latch_active(context)) {
         context->fault_latched = false;
     }
@@ -1628,6 +1822,34 @@ static void laser_controller_publish_runtime_status(
     s_runtime_status.decision = context->last_decision;
     s_runtime_status.config = config_snapshot;
     s_runtime_status.deployment = context->deployment;
+    s_runtime_status.button_runtime.nir_lockout = context->button_nir_lockout;
+    s_runtime_status.button_runtime.led_brightness_pct =
+        context->button_led_brightness_pct;
+    s_runtime_status.button_runtime.led_owned = context->button_led_active;
+    s_runtime_status.button_runtime.rgb_test_active =
+        context->rgb_test_until_ms != 0U && now_ms <= context->rgb_test_until_ms;
+    /*
+     * Mirror the frozen at-trip diagnostic frame for the comms-side fault
+     * JSON writer. `valid == false` means "no diag captured" and the host
+     * will render `triggerDiag: null`.
+     */
+    s_runtime_status.active_fault_diag.valid =
+        context->active_fault_diag.valid;
+    s_runtime_status.active_fault_diag.code =
+        context->active_fault_diag.code;
+    s_runtime_status.active_fault_diag.measured_c =
+        context->active_fault_diag.measured_c;
+    s_runtime_status.active_fault_diag.measured_voltage_v =
+        context->active_fault_diag.measured_voltage_v;
+    s_runtime_status.active_fault_diag.limit_c =
+        context->active_fault_diag.limit_c;
+    s_runtime_status.active_fault_diag.ld_pgood_for_ms =
+        context->active_fault_diag.ld_pgood_for_ms;
+    s_runtime_status.active_fault_diag.sbdn_not_off_for_ms =
+        context->active_fault_diag.sbdn_not_off_for_ms;
+    memcpy(s_runtime_status.active_fault_diag.expr,
+           context->active_fault_diag.expr,
+           sizeof(s_runtime_status.active_fault_diag.expr));
     portEXIT_CRITICAL(&s_runtime_status_lock);
 }
 
@@ -1639,8 +1861,52 @@ static laser_controller_board_outputs_t laser_controller_derive_outputs(
         laser_controller_service_interlocks_disabled();
     laser_controller_board_outputs_t outputs =
         laser_controller_safe_outputs();
+    /*
+     * GREEN ALIGNMENT — NO SOFTWARE INTERLOCK (user directive 2026-04-14).
+     * `alignment_output_enable` is set in safety.c to mirror the operator
+     * request unconditionally. Every path below that is reachable after
+     * boot-complete honors that request; only the pre-boot / pre-config path
+     * keeps green off, because the GPIO peripheral has not been configured
+     * and driving the pin is not even physically possible yet.
+     */
+    const bool green_request_after_boot = decision->alignment_output_enable;
 
     if (!context->boot_complete || !context->config_valid) {
+        return outputs;
+    }
+
+    /*
+     * Hard-fault override (added 2026-04-14 alongside USB-Debug Mock).
+     *
+     * If a SYSTEM_MAJOR fault is present OR latched, force safe outputs
+     * immediately and DO NOT take any deployment-step branch below. The
+     * deployment running paths previously force `sbdn_state = ON` during
+     * the READY_POSTURE substep, which would race with a same-tick
+     * SYSTEM_MAJOR fault (e.g. LD_RAIL_BAD, TEC_RAIL_BAD).
+     *
+     * Two conditions, because:
+     *  - `decision.fault_present` is set by safety_evaluate when a fault
+     *    is detected during this tick (rail timeouts, etc.).
+     *  - `context.fault_latched` is set by `record_fault` BEFORE
+     *    safety_evaluate runs (e.g. USB_DEBUG_MOCK_PD_CONFLICT recorded
+     *    in run_fast_cycle right after mock_tick). On that tick,
+     *    safety_evaluate's fault_latched short-circuit returns WITHOUT
+     *    setting `decision.fault_present`, so checking only the decision
+     *    field would miss the same-tick latch. The latched-class check
+     *    closes that gap (Agent B1 audit 2026-04-14).
+     *
+     * Green follows request even through hard faults, per user directive.
+     */
+    const bool latched_system_major =
+        context != NULL && context->fault_latched &&
+        context->latched_fault_class ==
+            LASER_CONTROLLER_FAULT_CLASS_SYSTEM_MAJOR;
+    const bool decision_system_major =
+        decision != NULL && decision->fault_present &&
+        decision->fault_class == LASER_CONTROLLER_FAULT_CLASS_SYSTEM_MAJOR;
+    if (decision_system_major || latched_system_major) {
+        outputs.enable_alignment_laser = green_request_after_boot;
+        outputs.sbdn_state = LASER_CONTROLLER_SBDN_STATE_OFF;
         return outputs;
     }
 
@@ -1649,6 +1915,7 @@ static laser_controller_board_outputs_t laser_controller_derive_outputs(
             &outputs.enable_ld_vin,
             &outputs.enable_tec_vin,
             &outputs.enable_haptic_driver);
+        outputs.enable_alignment_laser = green_request_after_boot;
         return outputs;
     }
 
@@ -1660,19 +1927,57 @@ static laser_controller_board_outputs_t laser_controller_derive_outputs(
                     outputs.enable_ld_vin =
                         context->deployment_substep >=
                         LASER_CONTROLLER_DEPLOYMENT_RAIL_PHASE_LD;
+                    outputs.enable_alignment_laser = green_request_after_boot;
                     return outputs;
                 case LASER_CONTROLLER_DEPLOYMENT_STEP_TEC_SETTLE:
                     outputs.enable_tec_vin = true;
                     outputs.enable_ld_vin = true;
+                    outputs.enable_alignment_laser = green_request_after_boot;
+                    return outputs;
+                case LASER_CONTROLLER_DEPLOYMENT_STEP_LP_GOOD_CHECK:
+                    /*
+                     * Three-phase loop-lock verification per user
+                     * directive 2026-04-15 (late).
+                     *
+                     *   substep 0: SBDN = OFF. LD rail must settle for
+                     *     2 s before the driver is enabled. The
+                     *     `deployment_tick` switch advances to substep 1
+                     *     when `ld_rail_pgood_for_ms >= 2000`.
+                     *
+                     *   substep 1 / 2: SBDN = ON (OPERATE). The
+                     *     `deployment_tick` then waits 2 s for
+                     *     `sbdn_not_off_for_ms >= 2000` (substep 1),
+                     *     then probes LP_GOOD within 1 s (substep 2).
+                     *
+                     * select_driver_low_current stays true throughout so
+                     * PCN is LOW — this is a loop-lock-at-zero-drive
+                     * check. READY_POSTURE still does the bias
+                     * verification afterward.
+                     */
+                    outputs.enable_tec_vin = true;
+                    outputs.enable_ld_vin = true;
+                    outputs.sbdn_state =
+                        context->deployment_substep == 0U
+                            ? LASER_CONTROLLER_SBDN_STATE_OFF
+                            : LASER_CONTROLLER_SBDN_STATE_ON;
+                    outputs.select_driver_low_current = true;
+                    outputs.enable_alignment_laser = green_request_after_boot;
                     return outputs;
                 case LASER_CONTROLLER_DEPLOYMENT_STEP_READY_POSTURE:
                     outputs.enable_tec_vin = true;
                     outputs.enable_ld_vin = true;
-                    outputs.assert_driver_standby = false;
+                    /*
+                     * Arm SBDN high for the ready-posture bias verification.
+                     * The checklist needs the driver in OPERATE to confirm
+                     * the low-current bias truly flows when PCN is low.
+                     */
+                    outputs.sbdn_state = LASER_CONTROLLER_SBDN_STATE_ON;
                     outputs.select_driver_low_current =
                         context->deployment_substep != 0U;
+                    outputs.enable_alignment_laser = green_request_after_boot;
                     return outputs;
                 default:
+                    outputs.enable_alignment_laser = green_request_after_boot;
                     return outputs;
             }
         }
@@ -1682,8 +1987,9 @@ static laser_controller_board_outputs_t laser_controller_derive_outputs(
             !context->deployment.running) {
             outputs.enable_tec_vin = true;
             outputs.enable_ld_vin = false;
-            outputs.enable_alignment_laser = false;
-            outputs.assert_driver_standby = true;
+            outputs.enable_alignment_laser = green_request_after_boot;
+            /* Force-safe: fast shutdown (drive LOW). Not Hi-Z. */
+            outputs.sbdn_state = LASER_CONTROLLER_SBDN_STATE_OFF;
             outputs.select_driver_low_current = true;
             return outputs;
         }
@@ -1696,41 +2002,56 @@ static laser_controller_board_outputs_t laser_controller_derive_outputs(
              * invalidation must drop the LD path safe immediately without
              * reflexively turning TEC off as well. This preserves the
              * TEC-first / LD-safe policy and avoids collapsing the TEC rail on
-             * transient post-ready faults.
+             * transient post-ready faults. Green stays ungated.
+             *
+             * SBDN must be driven LOW (OFF) — the 20us fast-shutdown path.
+             * Standby (Hi-Z) is not acceptable here because a post-ready
+             * invalidation is a fault event.
              */
             outputs.enable_tec_vin = true;
             outputs.enable_ld_vin = false;
-            outputs.enable_alignment_laser = false;
-            outputs.assert_driver_standby = true;
+            outputs.enable_alignment_laser = green_request_after_boot;
+            outputs.sbdn_state = LASER_CONTROLLER_SBDN_STATE_OFF;
             outputs.select_driver_low_current = true;
             return outputs;
         }
 
         if (!context->deployment.ready || context->deployment.failed) {
+            outputs.enable_alignment_laser = green_request_after_boot;
             return outputs;
         }
 
         outputs.enable_tec_vin = true;
         outputs.enable_ld_vin = true;
-        outputs.enable_alignment_laser = decision->alignment_output_enable;
-        outputs.assert_driver_standby = false;
+        outputs.enable_alignment_laser = green_request_after_boot;
+        /*
+         * Defer to the safety decision for SBDN posture in the ready path.
+         * safety.c sets sbdn_state = ON when NIR is requested and allowed,
+         * and STANDBY (Hi-Z) when NIR is off — that is the documented
+         * operator-facing semantics (datasheet p.2-5 and user directive
+         * 2026-04-14).
+         */
+        outputs.sbdn_state = decision->sbdn_state;
         outputs.select_driver_low_current = !decision->nir_output_enable;
         if (decision->fault_present &&
             decision->fault_class == LASER_CONTROLLER_FAULT_CLASS_SYSTEM_MAJOR) {
             outputs.enable_ld_vin = false;
             outputs.enable_tec_vin = false;
-            outputs.enable_alignment_laser = false;
-            outputs.assert_driver_standby = true;
+            /* Fault → fast shutdown (drive LOW). Standby is not the
+             * safe-on-fault posture — see hardware-safety audit. */
+            outputs.sbdn_state = LASER_CONTROLLER_SBDN_STATE_OFF;
+            /* Green follows request even through SYSTEM_MAJOR faults. */
         }
         return outputs;
     }
 
     if ((!interlocks_disabled && laser_controller_fault_latch_active(context)) ||
         laser_controller_service_mode_requested()) {
+        outputs.enable_alignment_laser = green_request_after_boot;
         return outputs;
     }
 
-    outputs.enable_alignment_laser = decision->alignment_output_enable;
+    outputs.enable_alignment_laser = green_request_after_boot;
     return outputs;
 }
 
@@ -1849,6 +2170,256 @@ static void laser_controller_log_state_if_changed(
         laser_controller_state_name(context->state_machine.current));
 }
 
+/*
+ * Button-board policy — runs on the control task after safety_evaluate
+ * and the SYSTEM_MAJOR overrides. Updates:
+ *   - context->button_nir_lockout: press-and-hold lockout state
+ *   - context->button_led_brightness_pct: stepped by side button edges
+ *   - context->button_led_active: TRUE when binary_trigger should drive LED
+ *   - context->last_outputs.rgb_led: RGB status color/brightness/blink
+ *
+ * Also raises FAULT_BUTTON_BOARD_I2C_LOST when binary_trigger is the
+ * active runtime mode and the MCP23017 has been declared unreachable.
+ *
+ * Threading: control-task only. Same ownership as fault writes.
+ */
+static void laser_controller_apply_button_board_policy(
+    laser_controller_context_t *context,
+    laser_controller_safety_decision_t *decision,
+    const laser_controller_bench_status_t *bench_status,
+    laser_controller_time_ms_t now_ms)
+{
+    if (context == NULL || decision == NULL || bench_status == NULL) {
+        return;
+    }
+
+    const laser_controller_button_state_t *btn = &context->last_inputs.button;
+    const bool binary_trigger =
+        bench_status->runtime_mode ==
+            LASER_CONTROLLER_RUNTIME_MODE_BINARY_TRIGGER;
+    const bool deployment_ready_idle =
+        context->deployment.active &&
+        context->deployment.ready &&
+        context->deployment.ready_idle &&
+        !context->deployment.running;
+    const bool button_board_present = btn->board_reachable;
+
+    /*
+     * Press-and-hold lockout. We track the prev tick's NIR firing AND any
+     * fault that fires while the operator is still holding the trigger.
+     * Once latched, lockout stays until BOTH stages release.
+     */
+    if (binary_trigger && deployment_ready_idle && button_board_present) {
+        if (decision->fault_present &&
+            (btn->stage1_pressed || btn->stage2_pressed)) {
+            context->button_nir_lockout = true;
+        }
+        if (!btn->stage1_pressed && !btn->stage2_pressed) {
+            context->button_nir_lockout = false;
+        }
+    } else {
+        /* Outside binary-trigger mode the lockout has no meaning. */
+        context->button_nir_lockout = false;
+    }
+
+    /*
+     * LED-brightness stepping. side1 = +10%, side2 = -10%. Stage1 rising
+     * edge resets to 20% per user directive. Bounded to [0, 100].
+     * Side buttons are honored regardless of stage1 so the operator can
+     * pre-set the brightness; effective output gating happens in the
+     * runtime-illumination call below via `button_led_active`.
+     */
+    if (binary_trigger && deployment_ready_idle && button_board_present) {
+        if (btn->stage1_edge) {
+            context->button_led_brightness_pct = 20U;
+        }
+        if (btn->side1_edge) {
+            uint32_t next = context->button_led_brightness_pct + 10U;
+            if (next > 100U) {
+                next = 100U;
+            }
+            context->button_led_brightness_pct = next;
+        }
+        if (btn->side2_edge) {
+            uint32_t cur = context->button_led_brightness_pct;
+            context->button_led_brightness_pct = cur >= 10U ? cur - 10U : 0U;
+        }
+        context->button_led_active = btn->stage1_pressed;
+    } else {
+        context->button_led_active = false;
+    }
+
+    /*
+     * MCP23017 lost in binary-trigger mode → SYSTEM_MAJOR fault. Do not
+     * fault when the operator is in MODULATED_HOST mode because the
+     * button board is optional in that mode.
+     */
+    if (binary_trigger &&
+        context->deployment.active &&
+        !btn->board_reachable &&
+        !context->fault_latched) {
+        laser_controller_record_fault(
+            context,
+            now_ms,
+            LASER_CONTROLLER_FAULT_BUTTON_BOARD_I2C_LOST,
+            LASER_CONTROLLER_FAULT_CLASS_SYSTEM_MAJOR,
+            "button board MCP23017 unreachable in binary-trigger mode");
+        decision->fault_present = true;
+        decision->fault_code = LASER_CONTROLLER_FAULT_BUTTON_BOARD_I2C_LOST;
+        decision->fault_class = LASER_CONTROLLER_FAULT_CLASS_SYSTEM_MAJOR;
+        decision->fault_reason = "button board unreachable";
+    }
+
+    /*
+     * RGB status policy. Computed in firmware so the host doesn't need to
+     * mirror gate ordering. Priorities (highest first):
+     *
+     *   1. Integrate test override (service-mode-only, watchdog-bounded).
+     *   2. SYSTEM_MAJOR latched / present, or button-board lost
+     *      → flash RED (255, 0, 0). "Unrecoverable" per user spec.
+     *   3. SAFETY_LATCHED or INTERLOCK_AUTO_CLEAR fault present, or button
+     *      lockout active → flash ORANGE (255, 80, 0). "Recoverable".
+     *   4. Outside deployment-ready-idle → off.
+     *   5. NIR currently emitting → solid RED.
+     *   6. stage1 + LD_GOOD + TEC_TEMP_GOOD → solid GREEN (armed).
+     *   7. otherwise → solid BLUE (ready, awaiting trigger).
+     */
+    laser_controller_rgb_led_state_t rgb = {
+        .r = 0U,
+        .g = 0U,
+        .b = 0U,
+        .blink = false,
+        .enabled = false,
+    };
+
+    if (context->rgb_test_until_ms != 0U && now_ms <= context->rgb_test_until_ms) {
+        rgb = context->rgb_test_state;
+    } else {
+        if (context->rgb_test_until_ms != 0U && now_ms > context->rgb_test_until_ms) {
+            context->rgb_test_until_ms = 0U;
+        }
+
+        const bool unrecoverable =
+            (context->fault_latched &&
+             context->latched_fault_class ==
+                 LASER_CONTROLLER_FAULT_CLASS_SYSTEM_MAJOR) ||
+            (decision->fault_present &&
+             decision->fault_class ==
+                 LASER_CONTROLLER_FAULT_CLASS_SYSTEM_MAJOR);
+        const bool recoverable =
+            !unrecoverable &&
+            (context->fault_latched ||
+             decision->fault_present ||
+             context->button_nir_lockout);
+
+        if (unrecoverable) {
+            rgb.r = 255U;
+            rgb.g = 0U;
+            rgb.b = 0U;
+            rgb.blink = true;
+            rgb.enabled = true;
+        } else if (recoverable) {
+            /* Orange = warm red + a touch of green to take the chill off. */
+            rgb.r = 255U;
+            rgb.g = 80U;
+            rgb.b = 0U;
+            rgb.blink = true;
+            rgb.enabled = true;
+        } else if (!deployment_ready_idle) {
+            /* Pre-deployment / pre-ready: LED dark. */
+            rgb.enabled = false;
+        } else if (decision->nir_output_enable) {
+            rgb.r = 255U;
+            rgb.g = 0U;
+            rgb.b = 0U;
+            rgb.blink = false;
+            rgb.enabled = true;
+        } else if (binary_trigger &&
+                   button_board_present &&
+                   btn->stage1_pressed &&
+                   context->last_inputs.ld_rail_pgood &&
+                   context->last_inputs.tec_temp_good) {
+            rgb.r = 0U;
+            rgb.g = 255U;
+            rgb.b = 0U;
+            rgb.blink = false;
+            rgb.enabled = true;
+        } else {
+            /* Solid blue: ready for NIR, awaiting trigger. */
+            rgb.r = 0U;
+            rgb.g = 0U;
+            rgb.b = 255U;
+            rgb.blink = false;
+            rgb.enabled = true;
+        }
+    }
+
+    context->last_outputs.rgb_led = rgb;
+}
+
+/*
+ * Service entry point used by comms.c integrate.rgb_led.set. Validates
+ * gating (service mode + no deployment + no fault latch) and arms the
+ * watchdog window. The control task picks up the override via the
+ * context fields on the next tick.
+ *
+ * Threading: comms task → context fields are control-task-owned but a
+ * single-word atomic-ish write is acceptable because:
+ *   (a) we use a portENTER_CRITICAL around the writes,
+ *   (b) the control task only READS these fields in the policy helper.
+ */
+esp_err_t laser_controller_app_set_rgb_test(
+    uint8_t r, uint8_t g, uint8_t b, bool blink, uint32_t hold_ms)
+{
+    if (!s_context.started) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /*
+     * Gate re-check. Read `s_context` fields directly under the lock
+     * instead of calling `laser_controller_app_copy_status` — the full
+     * status struct is ~10 KB and the comms RX task stack is 8 KB, so a
+     * local copy here on top of the caller's local copy blows the stack
+     * (2026-04-15 crash fix). The canonical gates are already enforced
+     * at the comms-side handler; this is a belt-and-suspenders re-check
+     * in case another caller (future) routes through without going
+     * through comms.c.
+     */
+    portENTER_CRITICAL(&s_context_lock);
+    const bool deployment_active = s_context.deployment.active;
+    const bool fault_latched = s_context.fault_latched;
+    portEXIT_CRITICAL(&s_context_lock);
+
+    if (deployment_active || fault_latched) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const laser_controller_time_ms_t now_ms = laser_controller_board_uptime_ms();
+    const uint32_t bounded_hold = hold_ms == 0U ? 5000U : hold_ms;
+
+    portENTER_CRITICAL(&s_context_lock);
+    s_context.rgb_test_state.r = r;
+    s_context.rgb_test_state.g = g;
+    s_context.rgb_test_state.b = b;
+    s_context.rgb_test_state.blink = blink;
+    s_context.rgb_test_state.enabled = true;
+    s_context.rgb_test_until_ms = now_ms + bounded_hold;
+    portEXIT_CRITICAL(&s_context_lock);
+    return ESP_OK;
+}
+
+esp_err_t laser_controller_app_clear_rgb_test(void)
+{
+    if (!s_context.started) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    portENTER_CRITICAL(&s_context_lock);
+    s_context.rgb_test_state.enabled = false;
+    s_context.rgb_test_until_ms = 0U;
+    portEXIT_CRITICAL(&s_context_lock);
+    return ESP_OK;
+}
+
 static void laser_controller_run_fast_cycle(laser_controller_context_t *context)
 {
     const laser_controller_time_ms_t now_ms = laser_controller_board_uptime_ms();
@@ -1858,11 +2429,40 @@ static void laser_controller_run_fast_cycle(laser_controller_context_t *context)
     laser_controller_safety_decision_t decision;
     bool raw_lambda_drift_blocked;
     bool raw_tec_temp_adc_blocked;
+    bool clear_fault_diag_requested = false;
     const laser_controller_power_tier_t previous_tier = context->power_tier;
 
     portENTER_CRITICAL(&s_context_lock);
     config_snapshot = context->config;
+    clear_fault_diag_requested = context->clear_fault_diag_request;
+    context->clear_fault_diag_request = false;
     portEXIT_CRITICAL(&s_context_lock);
+
+    /*
+     * Drain the cross-task `active_fault_diag` clear request from comms.
+     * Control task is the sole writer of `active_fault_diag.*` — see the
+     * struct docstring. Performing the zero-out here closes the data race
+     * that would otherwise exist if comms wrote the fields directly.
+     */
+    if (clear_fault_diag_requested) {
+        context->active_fault_diag.valid = false;
+        context->active_fault_diag.code = LASER_CONTROLLER_FAULT_NONE;
+        context->active_fault_diag.measured_c = 0.0f;
+        context->active_fault_diag.measured_voltage_v = 0.0f;
+        context->active_fault_diag.limit_c = 0.0f;
+        context->active_fault_diag.ld_pgood_for_ms = 0U;
+        context->active_fault_diag.sbdn_not_off_for_ms = 0U;
+        context->active_fault_diag.expr[0] = '\0';
+    }
+
+    /*
+     * Push the operator-configured TOF LED hard brightness cap into the
+     * board layer every tick. Enforced at both illumination entry points
+     * (service + runtime) — no LED write can exceed this cap. Default
+     * set to 50% in config_load_defaults per user directive 2026-04-15.
+     */
+    laser_controller_board_set_tof_led_max_duty_pct(
+        config_snapshot.thresholds.max_tof_led_duty_cycle_pct);
 
     laser_controller_board_read_inputs(&context->last_inputs, &config_snapshot);
     laser_controller_bench_copy_status(&bench_status);
@@ -1879,6 +2479,68 @@ static void laser_controller_run_fast_cycle(laser_controller_context_t *context)
             context->last_inputs.pd_negotiated_power_w,
             context->last_inputs.pd_contract_valid,
             context->last_inputs.pd_source_is_host_only);
+    }
+
+    /*
+     * USB-Debug Mock Layer (control-task only).
+     *
+     * Order matters:
+     *   1. Tick the mock state machine using the REAL power_tier from the
+     *      live PD readback. The mock auto-disables itself if real power
+     *      arrives, and signals a SYSTEM_MAJOR fault if so.
+     *   2. Apply the mock's synthesized telemetry into `context->last_inputs`
+     *      AFTER classify_power_tier so we don't trick the PD logic. The
+     *      mock only synthesizes rail PGOOD and TEC/LD telemetry; the PD
+     *      tier remains real.
+     *   3. If the mock signals a PD-conflict on this tick, record a
+     *      SYSTEM_MAJOR fault so the same tick collapses rails safe.
+     */
+    {
+        const bool service_mode_active_now =
+            laser_controller_service_mode_requested();
+        const bool mock_pd_conflict_latched_now =
+            laser_controller_usb_debug_mock_tick(
+                service_mode_active_now,
+                context->power_tier,
+                now_ms);
+        if (mock_pd_conflict_latched_now) {
+            laser_controller_record_fault(
+                context,
+                now_ms,
+                LASER_CONTROLLER_FAULT_USB_DEBUG_MOCK_PD_CONFLICT,
+                LASER_CONTROLLER_FAULT_CLASS_SYSTEM_MAJOR,
+                "USB debug mock auto-disabled by real PD power");
+        }
+        laser_controller_usb_debug_mock_apply_to_inputs(
+            &context->last_inputs,
+            &context->last_outputs,
+            laser_controller_deployment_target_temp_c(context, &bench_status),
+            bench_status.high_state_current_a,
+            now_ms);
+    }
+
+    /*
+     * LD-temp settle anchors. Updated AFTER the mock apply so the tracked
+     * inputs match what safety_evaluate will see. The SBDN anchor uses the
+     * previous-tick committed `last_outputs.sbdn_state`, because the
+     * current tick's decision has not yet been evaluated. This introduces
+     * a one-tick (5 ms) lag which is immaterial against the 2 s window.
+     * User directive 2026-04-15 (late).
+     */
+    if (context->last_inputs.ld_rail_pgood) {
+        if (context->ld_rail_pgood_since_ms == 0U) {
+            context->ld_rail_pgood_since_ms = now_ms;
+        }
+    } else {
+        context->ld_rail_pgood_since_ms = 0U;
+    }
+
+    if (context->last_outputs.sbdn_state != LASER_CONTROLLER_SBDN_STATE_OFF) {
+        if (context->sbdn_not_off_since_ms == 0U) {
+            context->sbdn_not_off_since_ms = now_ms;
+        }
+    } else {
+        context->sbdn_not_off_since_ms = 0U;
     }
 
     if (laser_controller_power_tier_is_operational(previous_tier) &&
@@ -1922,8 +2584,14 @@ static void laser_controller_run_fast_cycle(laser_controller_context_t *context)
     snapshot.last_distance_blocked = context->last_distance_blocked;
     snapshot.last_lambda_drift_blocked = context->lambda_drift_filter.state;
     snapshot.last_tec_temp_adc_blocked = context->tec_temp_adc_filter.state;
+    /*
+     * "driver_operate_expected" is TRUE only when the driver is armed in
+     * OPERATE mode (SBDN high, PCN high). STANDBY (Hi-Z) does NOT count —
+     * in that state the driver is idle and no current should flow, so the
+     * unexpected-current heuristic should not fire.
+     */
     snapshot.driver_operate_expected =
-        !context->last_outputs.assert_driver_standby &&
+        context->last_outputs.sbdn_state == LASER_CONTROLLER_SBDN_STATE_ON &&
         !context->last_outputs.select_driver_low_current;
     snapshot.ready_idle_bias_allowed =
         context->deployment.active &&
@@ -1938,12 +2606,34 @@ static void laser_controller_run_fast_cycle(laser_controller_context_t *context)
         bench_status.runtime_mode ==
             LASER_CONTROLLER_RUNTIME_MODE_MODULATED_HOST &&
         bench_status.requested_nir;
+    /*
+     * Runtime mode + button lockout flow into the safety evaluator. In
+     * BINARY_TRIGGER mode the buttons are the NIR request source and the
+     * lockout is honored. In MODULATED_HOST the buttons are advisory and
+     * the lockout is ignored (stage1 cannot fire NIR anyway).
+     */
+    snapshot.runtime_mode = bench_status.runtime_mode;
+    snapshot.button_nir_lockout = context->button_nir_lockout;
     snapshot.target_lambda_nm = laser_controller_deployment_target_lambda_nm(
         context,
         &bench_status);
     snapshot.actual_lambda_nm = laser_controller_lambda_from_temp(
         &config_snapshot,
         context->last_inputs.tec_temp_c);
+    /*
+     * LD-temp settle durations. safety_evaluate uses both to gate the
+     * LD_OVERTEMP check — see LASER_CONTROLLER_LD_TEMP_SETTLE_MS in
+     * laser_controller_safety.c. Durations are computed here from the
+     * rising-edge anchors; a 0 anchor means the corresponding condition
+     * is not currently met (rail off, or SBDN == OFF), so the duration
+     * reports 0 and the gate stays closed.
+     */
+    snapshot.ld_rail_pgood_for_ms = (context->ld_rail_pgood_since_ms == 0U)
+        ? 0U
+        : (uint32_t)(now_ms - context->ld_rail_pgood_since_ms);
+    snapshot.sbdn_not_off_for_ms = (context->sbdn_not_off_since_ms == 0U)
+        ? 0U
+        : (uint32_t)(now_ms - context->sbdn_not_off_since_ms);
     snapshot.hw = &context->last_inputs;
 
     laser_controller_safety_evaluate(&config_snapshot, &snapshot, &decision);
@@ -1974,12 +2664,63 @@ static void laser_controller_run_fast_cycle(laser_controller_context_t *context)
     if (decision.lambda_drift_blocked || decision.tec_temp_adc_blocked) {
         decision.allow_nir = false;
         decision.nir_output_enable = false;
-        decision.driver_standby_asserted = true;
+        /* Interlock-auto-clear fault → fast shutdown. */
+        decision.sbdn_state = LASER_CONTROLLER_SBDN_STATE_OFF;
     }
     context->last_horizon_blocked = decision.horizon_blocked;
     context->last_distance_blocked = decision.distance_blocked;
 
     laser_controller_latch_fault_if_needed(context, now_ms, &decision);
+
+    /*
+     * LD_OVERTEMP diag capture — rising-edge only.
+     *
+     * Gate on ALL THREE:
+     *   1. decision.fault_present && decision.fault_code == LD_OVERTEMP
+     *      (the fault actually won the first-fault-wins race inside
+     *      safety_evaluate — otherwise LD_OVERTEMP was beaten by a
+     *      higher-priority fault and we should not record its diag).
+     *   2. decision.ld_overtemp_diag_valid (safety_evaluate saw the
+     *      overtemp condition fire this tick — set inside the gated
+     *      overtemp check in laser_controller_safety.c).
+     *   3. !context->active_fault_diag.valid — only capture on the first
+     *      tick. Later ticks may see the same condition but the captured
+     *      frame must stay frozen at trip time so operators see the
+     *      value that tripped, not a drifted rolling reading.
+     *
+     * Cleared by `laser_controller_app_clear_fault_latch` when the user
+     * explicitly clears the latched fault.
+     */
+    if (decision.fault_present &&
+        decision.fault_code == LASER_CONTROLLER_FAULT_LD_OVERTEMP &&
+        decision.ld_overtemp_diag_valid &&
+        !context->active_fault_diag.valid) {
+        context->active_fault_diag.valid = true;
+        context->active_fault_diag.code = LASER_CONTROLLER_FAULT_LD_OVERTEMP;
+        context->active_fault_diag.measured_c = decision.ld_overtemp_measured_c;
+        context->active_fault_diag.measured_voltage_v =
+            decision.ld_overtemp_voltage_v;
+        context->active_fault_diag.limit_c = decision.ld_overtemp_limit_c;
+        context->active_fault_diag.ld_pgood_for_ms =
+            decision.ld_overtemp_pgood_for_ms;
+        context->active_fault_diag.sbdn_not_off_for_ms =
+            decision.ld_overtemp_sbdn_for_ms;
+        (void)snprintf(
+            context->active_fault_diag.expr,
+            sizeof(context->active_fault_diag.expr),
+            "ld_temp_c > %.1f C @ %.1f C, %.3f V",
+            (double)decision.ld_overtemp_limit_c,
+            (double)decision.ld_overtemp_measured_c,
+            (double)decision.ld_overtemp_voltage_v);
+        laser_controller_logger_logf(
+            now_ms,
+            "fault",
+            "ld_overtemp diag captured: %s "
+            "(ld_pgood_for=%lu ms, sbdn_not_off_for=%lu ms)",
+            context->active_fault_diag.expr,
+            (unsigned long)context->active_fault_diag.ld_pgood_for_ms,
+            (unsigned long)context->active_fault_diag.sbdn_not_off_for_ms);
+    }
 
     context->last_outputs = laser_controller_derive_outputs(context, &decision);
     if (!decision.fault_present &&
@@ -2020,13 +2761,26 @@ static void laser_controller_run_fast_cycle(laser_controller_context_t *context)
     }
     if (decision.fault_present &&
         decision.fault_class == LASER_CONTROLLER_FAULT_CLASS_SYSTEM_MAJOR) {
-        decision.allow_alignment = false;
+        /*
+         * SYSTEM_MAJOR → fast shutdown. Per user directive green is still
+         * ungated — alignment_output_enable keeps mirroring request. But
+         * we leave `allow_alignment=true` (set earlier in safety.c). The
+         * NIR path is forcibly zeroed and SBDN goes hard LOW.
+         */
         decision.allow_nir = false;
-        decision.alignment_output_enable = false;
         decision.nir_output_enable = false;
-        decision.driver_standby_asserted = true;
+        decision.sbdn_state = LASER_CONTROLLER_SBDN_STATE_OFF;
         context->last_outputs = laser_controller_derive_outputs(context, &decision);
     }
+    /*
+     * Button-board policy runs AFTER all fault overrides have settled so
+     * the RGB color decision sees the final fault state (and any rail
+     * timeout that fired this tick). It writes the RGB target into
+     * `context->last_outputs.rgb_led` so apply_outputs picks it up.
+     */
+    laser_controller_apply_button_board_policy(
+        context, &decision, &bench_status, now_ms);
+
     context->last_decision = decision;
     laser_controller_board_apply_outputs(&context->last_outputs);
     {
@@ -2052,11 +2806,32 @@ static void laser_controller_run_fast_cycle(laser_controller_context_t *context)
         bench_status.modulation_duty_cycle_pct,
         decision.nir_output_enable,
         context->last_outputs.select_driver_low_current);
+        /*
+         * GPIO6 front-LED ownership:
+         *   - Service mode: integrate bring-up owns the sideband (existing).
+         *   - Binary-trigger + deployment ready + stage1 pressed: button
+         *     policy owns the brightness (button_led_active).
+         *   - Otherwise: bench (operate slider) owns it.
+         */
+        const bool service_owns =
+            laser_controller_service_mode_requested();
+        const bool button_owns =
+            !service_owns && context->button_led_active;
+        const bool illum_enabled =
+            !service_owns &&
+            (button_owns ?
+                true :
+                bench_status.illumination_enabled);
+        const uint32_t illum_duty =
+            button_owns ?
+                context->button_led_brightness_pct :
+                bench_status.illumination_duty_cycle_pct;
+        const uint32_t illum_freq =
+            bench_status.illumination_frequency_hz;
         (void)laser_controller_board_set_runtime_tof_illumination(
-            !laser_controller_service_mode_requested() &&
-                bench_status.illumination_enabled,
-            bench_status.illumination_duty_cycle_pct,
-            bench_status.illumination_frequency_hz);
+            illum_enabled,
+            illum_duty,
+            illum_freq);
     }
 
     const laser_controller_state_t next_state =
@@ -2069,7 +2844,13 @@ static void laser_controller_run_slow_cycle(laser_controller_context_t *context)
 {
     const laser_controller_time_ms_t now_ms = laser_controller_board_uptime_ms();
     const bool alignment_enabled = context->last_outputs.enable_alignment_laser;
-    const bool nir_enabled = !context->last_outputs.assert_driver_standby;
+    /*
+     * "nir_enabled" in the summary log means the driver is actually armed
+     * to operate (SBDN == ON). STANDBY (Hi-Z) is not "enabled" — the
+     * driver is idle but not emitting.
+     */
+    const bool nir_enabled =
+        context->last_outputs.sbdn_state == LASER_CONTROLLER_SBDN_STATE_ON;
 
     laser_controller_maybe_reconcile_pd_runtime(context, now_ms);
 
@@ -2325,6 +3106,28 @@ esp_err_t laser_controller_app_clear_fault_latch(void)
     s_context.latched_fault_class = LASER_CONTROLLER_FAULT_CLASS_NONE;
     s_context.last_fault_ms = 0U;
     portEXIT_CRITICAL(&s_runtime_status_lock);
+
+    /*
+     * Defer the `active_fault_diag` zero-out to the control task via a
+     * request flag taken under `s_context_lock`. The control task is the
+     * sole writer of `active_fault_diag.*` (see the struct docstring).
+     * Writing the flag (not the fields) from comms here is the canonical
+     * cross-task hand-off pattern. The control task picks this up on its
+     * next tick (<=5 ms) inside `run_fast_cycle`.
+     */
+    portENTER_CRITICAL(&s_context_lock);
+    s_context.clear_fault_diag_request = true;
+    portEXIT_CRITICAL(&s_context_lock);
+
+    /*
+     * Also clear the USB-Debug Mock PD-conflict latch. The mock blocks
+     * re-enable while the latch is set, so the global fault-clear flow
+     * must drop both at the same time. The mock latch is owned by the
+     * control task — but this function is normally called from comms,
+     * and the next control tick will pick it up before any further mock
+     * enable request is processed.
+     */
+    laser_controller_usb_debug_mock_clear_pd_conflict_latch();
 
     laser_controller_logger_log(now_ms, "fault", "fault latch cleared by explicit request");
     laser_controller_publish_runtime_status(&s_context, now_ms);
@@ -2594,10 +3397,39 @@ esp_err_t laser_controller_app_exit_deployment_mode(void)
     s_context.deployment_step_action_performed = false;
     portEXIT_CRITICAL(&s_context_lock);
 
+    /*
+     * Auto-clear the fault latch on deployment exit per user directive
+     * 2026-04-15 (late). Operators were having to click "Exit deployment"
+     * then "Clear faults" separately for every failed deployment attempt.
+     * This consolidates the two into a single gesture.
+     *
+     * The clear follows the same pattern as
+     * `laser_controller_app_clear_fault_latch`: direct write under
+     * `s_runtime_status_lock`, then a request flag for the diag frame
+     * routed through `s_context_lock` so the control task picks it up on
+     * its next tick. Rails drop in `derive_outputs` on the same tick
+     * thanks to `deployment.active = false`, so re-latching of
+     * rail-gated faults is unlikely.
+     */
+    portENTER_CRITICAL(&s_runtime_status_lock);
+    s_context.fault_latched = false;
+    s_context.active_fault_code = LASER_CONTROLLER_FAULT_NONE;
+    s_context.active_fault_class = LASER_CONTROLLER_FAULT_CLASS_NONE;
+    s_context.latched_fault_code = LASER_CONTROLLER_FAULT_NONE;
+    s_context.latched_fault_class = LASER_CONTROLLER_FAULT_CLASS_NONE;
+    s_context.last_fault_ms = 0U;
+    portEXIT_CRITICAL(&s_runtime_status_lock);
+
+    portENTER_CRITICAL(&s_context_lock);
+    s_context.clear_fault_diag_request = true;
+    portEXIT_CRITICAL(&s_context_lock);
+
+    laser_controller_usb_debug_mock_clear_pd_conflict_latch();
+
     laser_controller_logger_log(
         now_ms,
         "deploy",
-        "deployment mode exited; controller returned to non-deployed safe supervision");
+        "deployment mode exited; controller returned to non-deployed safe supervision (fault latch auto-cleared)");
     laser_controller_publish_runtime_status(&s_context, now_ms);
     return ESP_OK;
 }

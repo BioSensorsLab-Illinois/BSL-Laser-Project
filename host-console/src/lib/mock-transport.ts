@@ -59,6 +59,29 @@ type MockState = {
   lowStateCurrentA: number
   laserHighCurrentA: number
   hapticDriverEnabled: boolean
+  /*
+   * USB-Debug Mock fields. Mirror firmware semantics: explicit opt-in,
+   * auto-disable on real PD, latched fault on conflict. The mock NEVER
+   * drives anything in the mock — it only flips snapshot fields.
+   */
+  usbDebugMockActive: boolean
+  usbDebugMockPdConflictLatched: boolean
+  usbDebugMockActivatedAtMs: number
+  usbDebugMockDeactivatedAtMs: number
+  usbDebugMockLastDisableReason: string
+  /*
+   * Button board mock state. Defaults: both chips reachable so the mock
+   * lets the operator switch into binary_trigger mode and exercise the
+   * trigger UI. Side-effect-free until commands or test scripts mutate.
+   */
+  mcpReachable: boolean
+  tlcReachable: boolean
+  buttonIsrFireCount: number
+  buttonLedBrightnessPct: number
+  buttonLedOwned: boolean
+  buttonNirLockout: boolean
+  rgbState: import('../types').RgbLedState
+  rgbTestUntilMs: number
   safety: DeviceSnapshot['safety']
   bringup: DeviceSnapshot['bringup']
   deployment: DeviceSnapshot['deployment']
@@ -113,6 +136,110 @@ function runtimeModeLockReason(state: MockState): string | null {
   }
 
   return null
+}
+
+/*
+ * Keep these three helpers IN SYNC with the firmware equivalents in
+ * components/laser_controller/src/laser_controller_comms.c
+ * (laser_controller_comms_{nir,led}_blocked_reason, sbdn_state_name).
+ * See .agent/skills/protocol-evolution/SKILL.md — the four-place rule.
+ */
+function mockNirBlockedReason(
+  state: MockState,
+): import('../types').NirBlockedReason {
+  if (!state.connected) {
+    return 'not-connected'
+  }
+  if (state.faultLatched) {
+    return 'fault-latched'
+  }
+  if (!state.deployment.active) {
+    return 'deployment-off'
+  }
+  if (state.deployment.running) {
+    return 'checklist-running'
+  }
+  if (!state.deployment.ready) {
+    return 'checklist-not-ready'
+  }
+  if (!state.deployment.readyIdle) {
+    return 'ready-not-idle'
+  }
+  if (state.runtimeMode !== 'modulated_host') {
+    return 'not-modulated-host'
+  }
+  if (state.powerTier !== 'full') {
+    return 'power-not-full'
+  }
+  // Mock assumes rails are healthy whenever deployment.ready-idle is true.
+  return 'none'
+}
+
+function mockLedBlockedReason(
+  state: MockState,
+): import('../types').LedBlockedReason {
+  if (!state.connected) {
+    return 'not-connected'
+  }
+  if (!state.deployment.active) {
+    return 'deployment-off'
+  }
+  if (state.deployment.running) {
+    return 'checklist-running'
+  }
+  return 'none'
+}
+
+/*
+ * Mock trigger-phase helper. Mirrors
+ * components/laser_controller/src/laser_controller_comms.c
+ * (laser_controller_comms_trigger_phase). Keep IN SYNC with both the
+ * firmware version and the host TriggerPhase union in types.ts —
+ * see .agent/skills/protocol-evolution/SKILL.md (four-place rule).
+ */
+function mockTriggerPhase(
+  state: MockState,
+): import('../types').TriggerPhase {
+  if (!state.connected) {
+    return 'off'
+  }
+  if (state.faultLatched) {
+    return 'unrecoverable'
+  }
+  if (state.buttonNirLockout) {
+    return 'lockout'
+  }
+  if (
+    !state.deployment.active ||
+    !state.deployment.ready ||
+    !state.deployment.readyIdle
+  ) {
+    return 'off'
+  }
+  if (state.laserRequested) {
+    return 'firing'
+  }
+  if (state.runtimeMode === 'binary_trigger' && state.alignmentRequested) {
+    return 'armed'
+  }
+  return 'ready'
+}
+
+function mockSbdnState(state: MockState): import('../types').SbdnState {
+  // SBDN goes hard OFF on fault or when not in a ready state.
+  if (state.faultLatched) {
+    return 'off'
+  }
+  if (!state.deployment.active || !state.deployment.ready) {
+    return 'off'
+  }
+  // When NIR is actively being driven, SBDN is ON.
+  if (state.laserRequested && state.runtimeMode === 'modulated_host') {
+    return 'on'
+  }
+  // Ready-idle with NIR off → STANDBY (Hi-Z). This is the new semantics the
+  // user directed on 2026-04-14.
+  return 'standby'
 }
 
 function makeDefaultDeploymentSteps(): DeviceSnapshot['deployment']['steps'] {
@@ -282,6 +409,19 @@ export class MockTransport implements DeviceTransport {
     lowStateCurrentA: 0,
     laserHighCurrentA: currentFromOpticalPowerW(2.8),
     hapticDriverEnabled: false,
+    usbDebugMockActive: false,
+    usbDebugMockPdConflictLatched: false,
+    usbDebugMockActivatedAtMs: 0,
+    usbDebugMockDeactivatedAtMs: 0,
+    usbDebugMockLastDisableReason: '',
+    mcpReachable: true,
+    tlcReachable: true,
+    buttonIsrFireCount: 0,
+    buttonLedBrightnessPct: 20,
+    buttonLedOwned: false,
+    buttonNirLockout: false,
+    rgbState: { r: 0, g: 0, b: 0, blink: false, enabled: false },
+    rgbTestUntilMs: 0,
     safety: {
       allowAlignment: true,
       allowNir: true,
@@ -309,6 +449,7 @@ export class MockTransport implements DeviceTransport {
       tecReadyToleranceC: 0.25,
       maxLaserCurrentA: 5.2,
       offCurrentThresholdA: 0.2,
+      maxTofLedDutyCyclePct: 50,
       actualLambdaNm: 786.1,
       targetLambdaNm: 786.1,
       lambdaDriftNm: 0,
@@ -410,6 +551,9 @@ export class MockTransport implements DeviceTransport {
     })
     this.emit({ kind: 'transport', status: 'connected', detail: this.label })
     this.emitRealtimeFrame(true)
+
+    void this.sendCommand({ id: -1, type: 'cmd', cmd: 'deployment.enter' })
+    void this.sendCommand({ id: -2, type: 'cmd', cmd: 'deployment.run' })
   }
 
   async disconnect(): Promise<void> {
@@ -492,6 +636,15 @@ export class MockTransport implements DeviceTransport {
         }
         {
           const requestedMode = command.args.mode as RuntimeMode
+          if (
+            requestedMode === 'binary_trigger' &&
+            !this.state.mcpReachable
+          ) {
+            ackOk = false
+            ackNote =
+              'Button board (MCP23017 @ 0x20) is not reachable. Confirm wiring before selecting binary_trigger.'
+            break
+          }
           if (
             requestedMode !== this.state.runtimeMode &&
             runtimeModeLockReason(this.state) !== null
@@ -632,6 +785,9 @@ export class MockTransport implements DeviceTransport {
       case 'clear_faults':
         this.state.activeFault = 'none'
         this.state.faultLatched = false
+        // Mirror firmware: clearing all faults also clears the
+        // usb_debug_mock_pd_conflict latch so the mock can be re-enabled.
+        this.state.usbDebugMockPdConflictLatched = false
         this.emit({
           kind: 'event',
           event: this.makeEvent(
@@ -652,8 +808,10 @@ export class MockTransport implements DeviceTransport {
         this.state.alignmentRequested = false
         break
       case 'operate.set_alignment':
+        // Green alignment is UNGATED per user directive 2026-04-14.
+        // Accept the request from any deployment state.
         if (typeof command.args?.enabled === 'boolean') {
-          this.state.alignmentRequested = command.args.enabled && this.state.deployment.ready
+          this.state.alignmentRequested = command.args.enabled
           if (this.state.alignmentRequested) {
             this.state.laserRequested = false
           }
@@ -907,6 +1065,20 @@ export class MockTransport implements DeviceTransport {
           this.state.pdPowerW <= 5.1,
           this.state.bringup.tuning,
         )
+        // Mirror firmware guard: real PD power upgrade auto-disables the
+        // mock and latches the SYSTEM_MAJOR fault.
+        if (
+          this.state.usbDebugMockActive &&
+          this.state.powerTier !== 'programming_only'
+        ) {
+          this.state.usbDebugMockActive = false
+          this.state.usbDebugMockPdConflictLatched = true
+          this.state.usbDebugMockDeactivatedAtMs = Date.now()
+          this.state.usbDebugMockLastDisableReason =
+            'real PD power detected (auto-disable + fault latched)'
+          this.state.activeFault = 'usb_debug_mock_pd_conflict'
+          this.state.faultLatched = true
+        }
         this.bumpBringupRevision('USB-PD sink planning updated.')
         break
       case 'pd_burn_nvm':
@@ -1073,7 +1245,137 @@ export class MockTransport implements DeviceTransport {
         this.state.bringup.illumination.tof.enabled = false
         this.state.systemState = 'SAFE_IDLE'
         this.state.hapticDriverEnabled = false
+        // Service-mode exit auto-disables the USB-Debug Mock (firmware
+        // mirror).
+        if (this.state.usbDebugMockActive) {
+          this.state.usbDebugMockActive = false
+          this.state.usbDebugMockDeactivatedAtMs = Date.now()
+          this.state.usbDebugMockLastDisableReason = 'service mode exited'
+        }
         break
+      case 'service.usb_debug_mock_enable':
+        // Mirror firmware guards: service mode + programming_only PD tier
+        // + no latched PD-conflict fault.
+        if (!this.state.serviceMode) {
+          ackOk = false
+          ackNote = 'Enter service mode before enabling the USB debug mock.'
+          break
+        }
+        if (this.state.powerTier !== 'programming_only') {
+          ackOk = false
+          ackNote =
+            'USB debug mock only engages when power_tier is programming_only.'
+          break
+        }
+        if (this.state.usbDebugMockPdConflictLatched) {
+          ackOk = false
+          ackNote =
+            'Clear the latched usb_debug_mock_pd_conflict fault before re-enabling.'
+          break
+        }
+        this.state.usbDebugMockActive = true
+        this.state.usbDebugMockActivatedAtMs = Date.now()
+        this.state.usbDebugMockLastDisableReason = ''
+        break
+      case 'service.usb_debug_mock_disable':
+        if (this.state.usbDebugMockActive) {
+          this.state.usbDebugMockActive = false
+          this.state.usbDebugMockDeactivatedAtMs = Date.now()
+          this.state.usbDebugMockLastDisableReason = 'operator request'
+        }
+        break
+      case 'integrate.rgb_led.set': {
+        // Mirror firmware guards (comms.c handler):
+        //   service mode active + no deployment + no fault latch.
+        if (!this.state.serviceMode) {
+          ackOk = false
+          ackNote = 'Enter service mode before driving the RGB LED test.'
+          break
+        }
+        if (this.state.deployment.active) {
+          ackOk = false
+          ackNote = 'Exit deployment mode before driving the RGB LED test.'
+          break
+        }
+        if (this.state.faultLatched) {
+          ackOk = false
+          ackNote = 'Clear the latched fault before driving the RGB LED test.'
+          break
+        }
+        const r = clamp(Number(command.args?.r ?? 0), 0, 255)
+        const g = clamp(Number(command.args?.g ?? 0), 0, 255)
+        const b = clamp(Number(command.args?.b ?? 0), 0, 255)
+        const blink = Boolean(command.args?.blink)
+        const requestedHold = Number(command.args?.hold_ms)
+        const holdMs =
+          Number.isFinite(requestedHold) && requestedHold > 0
+            ? Math.min(30000, requestedHold)
+            : 5000
+        this.state.rgbState = { r, g, b, blink, enabled: true }
+        this.state.rgbTestUntilMs = Date.now() + holdMs
+        break
+      }
+      case 'integrate.rgb_led.clear':
+        this.state.rgbState = { r: 0, g: 0, b: 0, blink: false, enabled: false }
+        this.state.rgbTestUntilMs = 0
+        break
+      case 'integrate.tof.set_calibration': {
+        // Mirror firmware guards at `laser_controller_comms.c`.
+        if (!this.state.serviceMode) {
+          ackOk = false
+          ackNote = 'Enter service mode before updating ToF calibration.'
+          break
+        }
+        if (this.state.deployment.active) {
+          ackOk = false
+          ackNote = 'Exit deployment mode before updating ToF calibration.'
+          break
+        }
+        if (this.state.faultLatched) {
+          ackOk = false
+          ackNote = 'Clear the latched fault before updating ToF calibration.'
+          break
+        }
+        const cur = this.state.bringup.tuning.tofCalibration
+        const distanceRaw = command.args?.distance_mode
+        const nextDistance =
+          distanceRaw === 'short' || distanceRaw === 'medium' || distanceRaw === 'long'
+            ? distanceRaw
+            : cur.distanceMode
+        const clampInt = (v: unknown, min: number, max: number, fallback: number): number => {
+          const n = Number(v)
+          if (!Number.isFinite(n)) return fallback
+          return Math.max(min, Math.min(max, Math.round(n)))
+        }
+        const allowedTiming = [20, 33, 50, 100, 200] as const
+        const requestedTiming = Number(command.args?.timing_budget_ms)
+        const nextTiming = allowedTiming.includes(
+          requestedTiming as (typeof allowedTiming)[number],
+        )
+          ? (requestedTiming as (typeof allowedTiming)[number])
+          : cur.timingBudgetMs
+        const nextRoiW = clampInt(command.args?.roi_width_spads, 4, 16, cur.roiWidthSpads)
+        const nextRoiH = clampInt(command.args?.roi_height_spads, 4, 16, cur.roiHeightSpads)
+        const nextRoiC = clampInt(command.args?.roi_center_spad, 0, 255, cur.roiCenterSpad)
+        const nextOffset = clampInt(command.args?.offset_mm, -2000, 2000, cur.offsetMm)
+        const nextXtalkCps = clampInt(command.args?.xtalk_cps, 0, 0xffff, cur.xtalkCps)
+        const nextXtalkEnabled =
+          typeof command.args?.xtalk_enabled === 'boolean'
+            ? command.args.xtalk_enabled
+            : cur.xtalkEnabled
+        this.state.bringup.tuning.tofCalibration = {
+          distanceMode: nextDistance,
+          timingBudgetMs: nextTiming,
+          roiWidthSpads: nextRoiW,
+          roiHeightSpads: nextRoiH,
+          roiCenterSpad: nextRoiC,
+          offsetMm: nextOffset,
+          xtalkCps: nextXtalkCps,
+          xtalkEnabled: nextXtalkEnabled,
+        }
+        this.bumpBringupRevision('ToF calibration updated from the host console.')
+        break
+      }
       case 'apply_bringup_preset':
         if (typeof command.args?.preset === 'string') {
           this.applyBringupPreset(command.args.preset)
@@ -1349,6 +1651,16 @@ export class MockTransport implements DeviceTransport {
         this.state.systemState = 'PROGRAMMING_ONLY'
         this.state.alignmentRequested = false
         this.state.laserRequested = false
+        break
+      case 'simulate_ld_overtemp_trip':
+        /*
+         * Test-only path that lets operators (and render-check agents)
+         * exercise the LD_OVERTEMP fault banner + triggerDiag sub-card in
+         * InspectorRail without running real thermal stress on the bench.
+         * The triggerDiag synthesis lives in the snapshot emitter keyed on
+         * `activeFaultCode === 'ld_overtemp' && faultLatched`.
+         */
+        this.raiseFault('ld_overtemp')
         break
       default:
         break
@@ -2006,6 +2318,34 @@ export class MockTransport implements DeviceTransport {
         stage2Pressed: this.state.laserRequested,
         stage1Edge: false,
         stage2Edge: false,
+        side1Pressed: false,
+        side2Pressed: false,
+        side1Edge: false,
+        side2Edge: false,
+        boardReachable: this.state.mcpReachable,
+        isrFireCount: this.state.buttonIsrFireCount,
+      },
+      buttonBoard: {
+        mcpAddr: '0x20',
+        tlcAddr: '0x60',
+        mcpReachable: this.state.mcpReachable,
+        mcpConfigured: this.state.mcpReachable,
+        mcpLastError: 0,
+        mcpConsecFailures: 0,
+        tlcReachable: this.state.tlcReachable,
+        tlcConfigured: this.state.tlcReachable,
+        tlcLastError: 0,
+        isrFireCount: this.state.buttonIsrFireCount,
+        rgb: {
+          ...this.state.rgbState,
+          testActive:
+            this.state.rgbTestUntilMs > 0 &&
+            Date.now() <= this.state.rgbTestUntilMs,
+        },
+        ledBrightnessPct: this.state.buttonLedBrightnessPct,
+        ledOwned: this.state.buttonLedOwned,
+        triggerLockout: this.state.buttonNirLockout,
+        triggerPhase: mockTriggerPhase(this.state),
       },
       peripherals: {
         dac: {
@@ -2086,10 +2426,44 @@ export class MockTransport implements DeviceTransport {
         illuminationEnabled: this.state.bringup.illumination.tof.enabled,
         illuminationDutyCyclePct: this.state.bringup.illumination.tof.dutyCyclePct,
         illuminationFrequencyHz: this.state.bringup.illumination.tof.frequencyHz,
+        /*
+         * Mirror laser_controller_comms_led_owner_name priority order:
+         * integrate_service > operate_runtime > button_trigger > deployment > none.
+         * The button_trigger branch was added 2026-04-15 alongside the firmware
+         * led_owner_name update. Keep this in sync with comms.c.
+         */
+        appliedLedOwner: this.state.serviceMode &&
+                         this.state.bringup.illumination.tof.enabled
+          ? 'integrate_service'
+          : this.state.bringup.illumination.tof.enabled
+            ? 'operate_runtime'
+            : this.state.buttonLedOwned
+              ? 'button_trigger'
+              : this.state.deployment.active
+                ? 'deployment'
+                : 'none',
+        appliedLedPinHigh:
+          (this.state.bringup.illumination.tof.enabled &&
+            this.state.bringup.illumination.tof.dutyCyclePct > 0) ||
+          (this.state.buttonLedOwned && this.state.buttonLedBrightnessPct > 0),
         modulationEnabled: this.state.modulationEnabled,
         modulationFrequencyHz: this.state.modulationFrequencyHz,
         modulationDutyCyclePct: this.state.modulationDutyCyclePct,
         lowStateCurrentA: this.state.lowStateCurrentA,
+        hostControlReadiness: {
+          nirBlockedReason: mockNirBlockedReason(this.state),
+          alignmentBlockedReason: 'none',
+          ledBlockedReason: mockLedBlockedReason(this.state),
+          sbdnState: mockSbdnState(this.state),
+        },
+        usbDebugMock: {
+          active: this.state.usbDebugMockActive,
+          pdConflictLatched: this.state.usbDebugMockPdConflictLatched,
+          enablePending: false,
+          activatedAtMs: this.state.usbDebugMockActivatedAtMs,
+          deactivatedAtMs: this.state.usbDebugMockDeactivatedAtMs,
+          lastDisableReason: this.state.usbDebugMockLastDisableReason,
+        },
       },
       safety: {
         ...this.state.safety,
@@ -2133,6 +2507,24 @@ export class MockTransport implements DeviceTransport {
         activeCount: this.state.faultCount,
         tripCounter: this.state.tripCounter,
         lastFaultAtIso: this.state.lastFaultAtIso,
+        // Mirror firmware: triggerDiag is populated ONLY for LD_OVERTEMP,
+        // frozen at trip time. Representative numbers chosen to look
+        // plausible for a real trip (68.3 °C with a 55 °C limit, gates
+        // already past the 2 s settle so a real overtemp, not a false
+        // trip). Real firmware captures exact ADC voltages; the mock
+        // approximates from the same 192.5576 - 90.1040*V curve.
+        triggerDiag:
+          activeFaultCode === 'ld_overtemp' && this.state.faultLatched
+            ? {
+                code: 'ld_overtemp',
+                measuredC: 68.3,
+                measuredVoltageV: 1.3776, // (192.5576 - 68.3) / 90.1040
+                limitC: 55.0,
+                ldPgoodForMs: 4200,
+                sbdnNotOffForMs: 3800,
+                expr: 'ld_temp_c > 55.0 C @ 68.3 C, 1.378 V',
+              }
+            : null,
       },
       counters: {
         commsTimeouts: 0,

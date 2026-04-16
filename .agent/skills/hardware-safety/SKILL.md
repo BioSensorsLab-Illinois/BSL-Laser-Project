@@ -1,3 +1,8 @@
+---
+name: hardware-safety
+description: Required for hardware-facing, safety-facing, or GPIO-ownership work. Separates USB Phase 1 claims from Powered Phase 2 claims, enforces TEC-before-LD sequencing, TEC-loss immediate LD shutdown, and explicit telemetry-valid vs telemetry-invalid rendering. Trigger on schematic/pinmap edits, rail sequencing logic, GPIO ownership changes, ADC telemetry paths, fault gating, or any change touching SBDN/PCN/PWR_TEC_EN/PWR_LD_EN. Consult schematics and datasheets before asserting.
+---
+
 # hardware-safety
 
 Use this skill for any hardware-facing, safety-facing, or permission-sensitive work.

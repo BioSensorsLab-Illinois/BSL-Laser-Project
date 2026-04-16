@@ -1,0 +1,20 @@
+{
+  "name": "bsl-laser-workflow",
+  "description": "Agentic workflow for the BSL 785nm surgical laser controller — safety-critical firmware + host-console + hardware stack. Bundles 11 specialized sub-agents, 8 slash commands, 14 project skills, a SessionStart/PreToolUse/PostToolUse/Stop hook suite, a safety-critical output style, and nested CLAUDE.md guardrails.",
+  "version": "2.0.0",
+  "author": {
+    "name": "Zhongmin Zhu (zz4)",
+    "email": "zz4@bsl"
+  },
+  "homepage": "https://github.com/zz4/BSL-Laser",
+  "keywords": [
+    "firmware",
+    "esp32-s3",
+    "laser",
+    "surgical",
+    "safety-critical",
+    "hardware",
+    "medical-device",
+    "agentic-workflow"
+  ]
+}

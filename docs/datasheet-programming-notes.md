@@ -358,3 +358,30 @@ When real drivers land, each module patch should include:
 - the mode selection policy
 - any board-specific strap assumptions
 - the exact fault behavior when the part is missing, stale, or implausible
+
+## MCP23017 I²C GPIO expander (button board, 2026-04-15)
+
+Reference: `docs/Datasheets/MCP23017-Data-Sheet-DS20001952.pdf` Tables 1.6 and 3-2.
+
+Firmware-facing rules (driver lives in `components/laser_controller/src/laser_controller_buttons.c`):
+
+- Always write `IOCON` first, before any other register, to lock the addressing mode (`BANK=0`) and the INT electrical behavior (`ODR=1` → INTA open-drain). Without this the byte-stream addresses are ambiguous and INT polarity is undefined.
+- INTA is wired open-drain to ESP32 GPIO7. The ESP-side internal pull-up is mandatory; without it a quiescent expander still pulls the line low and the ISR fires continuously.
+- `INTCONA = 0x00` selects "interrupt-on-previous-state" — equivalent to any-edge for our use. `INTCONA = 0xFF` would compare against `DEFVAL` and miss release events.
+- `IPOLA` is left at `0x00` and the firmware inverts `GPIOA` in software. The "pressed" semantic is defined at the call site, not on the chip; this avoids a class of "I forgot the polarity" bugs.
+- Reading either `INTCAPA` or `GPIOA` clears the interrupt latch. The driver reads both: `INTCAPA` for the value-at-edge (diagnostic) and `GPIOA` for the current value (decision input).
+- After `GPINTENA` is enabled, a spurious edge can latch from the discrepancy between the configured DEFVAL and the live pin state. The driver reads `INTCAPA` once at the end of init to clear that pending latch.
+
+## TLC59116 16-channel I²C LED driver (button board, 2026-04-15)
+
+Reference: `docs/Datasheets/tlc59116.pdf` Sections 7.3.4 (registers) and 8.5 (group dimming/blinking).
+
+Firmware-facing rules (driver lives in `components/laser_controller/src/laser_controller_rgb_led.c`):
+
+- `MODE1.SLEEP` defaults to `1` after reset. Writing `MODE1 = 0x01` clears SLEEP (oscillator on) and keeps `ALLCALL` enabled. The chip ignores PWM updates while SLEEPing.
+- `LEDOUTn` is two bits per channel. Mode `0b11` selects "individual PWM × group dimming + group blinking". Use this on the channels you want to drive; leave unused channels at `0b00`.
+- `MODE2.DMBLNK` selects between dimming (`0`) and blinking (`1`) for the group. Toggling at runtime is a single-byte write — cheap.
+- Group blink period is `(GRPFREQ + 1) / 24 s`. `GRPFREQ = 23` gives a 1.0 s period. `GRPPWM` sets duty as `value/256` → `128` is 50 %. Both registers are written once at init; only `MODE2` toggles at runtime.
+- `MODE1.AI` (auto-increment) is left OFF in our driver because writes are infrequent and single-register. Turning it on is fine but means readers must clear it before single-byte register reads.
+- Default ALLCALL address is `0x68`. Our driver does not write to that slot, but if a second TLC59116 ever lands on the bus the firmware MUST disable ALLCALL on one of them (`MODE1.ALLCALL = 0`) or change `ALLCALLADR` to avoid cross-talk.
+- The B/R/G channel order on the BSL button board is non-standard. `PWM0 = B`, `PWM1 = R`, `PWM2 = G`. Document this at every call site.

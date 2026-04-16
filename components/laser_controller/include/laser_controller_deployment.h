@@ -36,6 +36,21 @@ typedef enum {
     LASER_CONTROLLER_DEPLOYMENT_STEP_PERIPHERALS_VERIFY,
     LASER_CONTROLLER_DEPLOYMENT_STEP_RAIL_SEQUENCE,
     LASER_CONTROLLER_DEPLOYMENT_STEP_TEC_SETTLE,
+    /*
+     * Added 2026-04-15: SBDN -> LP_GOOD loop-lock verification.
+     *
+     * Drives the ATLS6A214 SBDN pin HIGH (OPERATE) with select_driver_low_current
+     * asserted (PCN LOW → low-current mode) so the driver can lock its loop
+     * without any runtime current being requested. Waits up to 1 s for
+     * LD_LPGD (GPIO14) to go HIGH. If the timeout expires, the step fails
+     * with primary fault LD_LP_GOOD_TIMEOUT and the deployment aborts.
+     *
+     * This is a safety-critical check because the rails can be PGOOD yet
+     * the driver loop can still be unable to lock (e.g. missing interconnect,
+     * damaged laser diode, incorrect TMO). Without this test, READY_POSTURE
+     * could declare ready-idle on a driver that cannot actually operate.
+     */
+    LASER_CONTROLLER_DEPLOYMENT_STEP_LP_GOOD_CHECK,
     LASER_CONTROLLER_DEPLOYMENT_STEP_READY_POSTURE,
     LASER_CONTROLLER_DEPLOYMENT_STEP_COUNT,
 } laser_controller_deployment_step_t;

@@ -23,6 +23,7 @@
 #include "laser_controller_logger.h"
 #include "laser_controller_signature.h"
 #include "laser_controller_state.h"
+#include "laser_controller_usb_debug_mock.h"
 #include "laser_controller_wireless.h"
 
 #define LASER_CONTROLLER_COMMS_TX_STACK_BYTES 6144U
@@ -432,6 +433,17 @@ static const char *laser_controller_comms_led_owner_name(
         return "operate_runtime";
     }
 
+    /*
+     * Button-trigger policy owns the GPIO6 LED when binary_trigger +
+     * deployment ready_idle + stage1 pressed (computed in app.c
+     * apply_button_board_policy). Reported here so the host can pre-
+     * disable the operate LED slider when buttons are driving the LED.
+     * Set 2026-04-15.
+     */
+    if (status->button_runtime.led_owned) {
+        return "button_trigger";
+    }
+
     pin = laser_controller_comms_find_gpio_pin(
         status,
         LASER_CONTROLLER_GPIO_TOF_LED_CTRL);
@@ -660,6 +672,19 @@ static uint32_t laser_controller_comms_encode_button_flags(
     if (status->inputs.button.stage2_pressed) {
         flags |= (1U << 1);
     }
+    /*
+     * Side buttons packed into bits 2/3 as of 2026-04-15 so the 60 ms
+     * fast-telemetry frame reflects live state. Prior to this the fast
+     * frame only carried stage1/2, and the host's decodeFastTelemetry
+     * path slammed side1/2 back to `false` on every tick, blowing away
+     * the correct values from the 1 s live telemetry.
+     */
+    if (status->inputs.button.side1_pressed) {
+        flags |= (1U << 2);
+    }
+    if (status->inputs.button.side2_pressed) {
+        flags |= (1U << 3);
+    }
 
     return flags;
 }
@@ -674,11 +699,188 @@ static void laser_controller_comms_write_button_state_json(
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        "\"buttons\":{\"stage1Pressed\":%s,\"stage2Pressed\":%s,\"stage1Edge\":%s,\"stage2Edge\":%s},",
+        "\"buttons\":{\"stage1Pressed\":%s,\"stage2Pressed\":%s,"
+        "\"stage1Edge\":%s,\"stage2Edge\":%s,"
+        "\"side1Pressed\":%s,\"side2Pressed\":%s,"
+        "\"side1Edge\":%s,\"side2Edge\":%s,"
+        "\"boardReachable\":%s,\"isrFireCount\":%u},",
         status->inputs.button.stage1_pressed ? "true" : "false",
         status->inputs.button.stage2_pressed ? "true" : "false",
         status->inputs.button.stage1_edge ? "true" : "false",
-        status->inputs.button.stage2_edge ? "true" : "false");
+        status->inputs.button.stage2_edge ? "true" : "false",
+        status->inputs.button.side1_pressed ? "true" : "false",
+        status->inputs.button.side2_pressed ? "true" : "false",
+        status->inputs.button.side1_edge ? "true" : "false",
+        status->inputs.button.side2_edge ? "true" : "false",
+        status->inputs.button.board_reachable ? "true" : "false",
+        (unsigned)status->inputs.button.isr_fire_count);
+}
+
+/*
+ * Compute the trigger-phase token. Mirrors the firmware RGB policy in
+ * app.c — keep these in lockstep when extending the policy.
+ */
+static const char *laser_controller_comms_trigger_phase(
+    const laser_controller_runtime_status_t *status)
+{
+    if (status == NULL) {
+        return "off";
+    }
+    const bool unrecoverable =
+        (status->fault_latched &&
+         status->latched_fault_class ==
+             LASER_CONTROLLER_FAULT_CLASS_SYSTEM_MAJOR) ||
+        (status->decision.fault_present &&
+         status->decision.fault_class ==
+             LASER_CONTROLLER_FAULT_CLASS_SYSTEM_MAJOR);
+    if (unrecoverable) {
+        return "unrecoverable";
+    }
+    if (status->fault_latched ||
+        status->decision.fault_present ||
+        status->button_runtime.nir_lockout) {
+        return status->button_runtime.nir_lockout ? "lockout" : "interlock";
+    }
+    if (!status->deployment.active || !status->deployment.ready ||
+        !status->deployment.ready_idle) {
+        return "off";
+    }
+    if (status->decision.nir_output_enable) {
+        return "firing";
+    }
+    if (status->bench.runtime_mode ==
+            LASER_CONTROLLER_RUNTIME_MODE_BINARY_TRIGGER &&
+        status->inputs.button.board_reachable &&
+        status->inputs.button.stage1_pressed) {
+        return "armed";
+    }
+    return "ready";
+}
+
+/*
+ * Top-level buttonBoard block — published in every snapshot. Mirrors
+ * laser_controller_button_board_readback_t + laser_controller_rgb_led_state_t
+ * + the control-task button_runtime_status. Four-place sync target:
+ * host-console/src/types.ts ButtonBoardStatus,
+ * host-console/src/lib/mock-transport.ts mock helpers,
+ * docs/protocol-spec.md.
+ */
+static void laser_controller_comms_write_button_board_json(
+    laser_controller_comms_buffer_t *buffer,
+    const laser_controller_runtime_status_t *status)
+{
+    if (buffer == NULL || status == NULL) {
+        return;
+    }
+
+    const laser_controller_rgb_led_state_t *rgb = &status->outputs.rgb_led;
+    const laser_controller_button_board_readback_t *bb =
+        &status->inputs.buttons_readback;
+    const laser_controller_rgb_led_readback_t *rb =
+        &status->inputs.rgb_readback;
+
+    laser_controller_comms_buffer_append_fmt(
+        buffer,
+        "\"buttonBoard\":{"
+        "\"mcpAddr\":\"0x%02X\",\"tlcAddr\":\"0x%02X\","
+        "\"mcpReachable\":%s,\"mcpConfigured\":%s,"
+        "\"mcpLastError\":%d,\"mcpConsecFailures\":%u,"
+        "\"tlcReachable\":%s,\"tlcConfigured\":%s,"
+        "\"tlcLastError\":%d,"
+        "\"isrFireCount\":%u,"
+        "\"rgb\":{\"r\":%u,\"g\":%u,\"b\":%u,"
+        "\"blink\":%s,\"enabled\":%s,\"testActive\":%s},"
+        "\"ledBrightnessPct\":%u,\"ledOwned\":%s,"
+        "\"triggerLockout\":%s,\"triggerPhase\":\"%s\"},",
+        (unsigned)LASER_CONTROLLER_BUTTON_MCP23017_I2C_ADDR,
+        (unsigned)LASER_CONTROLLER_BUTTON_TLC59116_I2C_ADDR,
+        bb->reachable ? "true" : "false",
+        bb->configured ? "true" : "false",
+        (int)bb->last_error,
+        (unsigned)bb->consecutive_read_failures,
+        rb->reachable ? "true" : "false",
+        rb->configured ? "true" : "false",
+        (int)rb->last_error,
+        (unsigned)status->inputs.button.isr_fire_count,
+        (unsigned)rgb->r,
+        (unsigned)rgb->g,
+        (unsigned)rgb->b,
+        rgb->blink ? "true" : "false",
+        rgb->enabled ? "true" : "false",
+        status->button_runtime.rgb_test_active ? "true" : "false",
+        (unsigned)status->button_runtime.led_brightness_pct,
+        status->button_runtime.led_owned ? "true" : "false",
+        status->button_runtime.nir_lockout ? "true" : "false",
+        laser_controller_comms_trigger_phase(status));
+}
+
+/*
+ * host_control_readiness reasons — terse tokens the GUI renders as
+ * pre-disabled reasons on the NIR / LED buttons. See
+ * host-console/src/types.ts for the canonical union; any rename here must
+ * land in the four-place protocol sync.
+ */
+static const char *laser_controller_comms_nir_blocked_reason(
+    const laser_controller_runtime_status_t *status)
+{
+    if (status == NULL) {
+        return "not-connected";
+    }
+    if (status->fault_latched) {
+        return "fault-latched";
+    }
+    if (!status->deployment.active) {
+        return "deployment-off";
+    }
+    if (status->deployment.running) {
+        return "checklist-running";
+    }
+    if (!status->deployment.ready) {
+        return "checklist-not-ready";
+    }
+    if (!status->deployment.ready_idle) {
+        return "ready-not-idle";
+    }
+    if (status->bench.runtime_mode !=
+            LASER_CONTROLLER_RUNTIME_MODE_MODULATED_HOST) {
+        return "not-modulated-host";
+    }
+    if (status->power_tier != LASER_CONTROLLER_POWER_TIER_FULL) {
+        return "power-not-full";
+    }
+    if (!status->inputs.ld_rail_pgood || !status->inputs.tec_rail_pgood) {
+        return "rail-not-good";
+    }
+    if (status->config.require_tec_for_nir && !status->inputs.tec_temp_good) {
+        return "tec-not-settled";
+    }
+    return "none";
+}
+
+static const char *laser_controller_comms_led_blocked_reason(
+    const laser_controller_runtime_status_t *status)
+{
+    if (status == NULL) {
+        return "not-connected";
+    }
+    if (!status->deployment.active) {
+        return "deployment-off";
+    }
+    if (status->deployment.running) {
+        return "checklist-running";
+    }
+    return "none";
+}
+
+static const char *laser_controller_comms_sbdn_state_name(
+    laser_controller_sbdn_state_t state)
+{
+    switch (state) {
+        case LASER_CONTROLLER_SBDN_STATE_ON:      return "on";
+        case LASER_CONTROLLER_SBDN_STATE_STANDBY: return "standby";
+        case LASER_CONTROLLER_SBDN_STATE_OFF:
+        default:                                   return "off";
+    }
 }
 
 static void laser_controller_comms_write_bench_json(
@@ -722,7 +924,7 @@ static void laser_controller_comms_write_bench_json(
         laser_controller_comms_led_owner_name(status));
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        ",\"appliedLedPinHigh\":%s,\"illuminationEnabled\":%s,\"illuminationDutyCyclePct\":%lu,\"illuminationFrequencyHz\":%lu,\"modulationEnabled\":%s,\"modulationFrequencyHz\":%lu,\"modulationDutyCyclePct\":%lu,\"lowStateCurrentA\":%.3f}",
+        ",\"appliedLedPinHigh\":%s,\"illuminationEnabled\":%s,\"illuminationDutyCyclePct\":%lu,\"illuminationFrequencyHz\":%lu,\"modulationEnabled\":%s,\"modulationFrequencyHz\":%lu,\"modulationDutyCyclePct\":%lu,\"lowStateCurrentA\":%.3f",
         laser_controller_comms_gpio_pin_high(
             status,
             LASER_CONTROLLER_GPIO_TOF_LED_CTRL) ? "true" : "false",
@@ -733,6 +935,56 @@ static void laser_controller_comms_write_bench_json(
         (unsigned long)status->bench.modulation_frequency_hz,
         (unsigned long)status->bench.modulation_duty_cycle_pct,
         status->bench.low_state_current_a);
+
+    /*
+     * host_control_readiness block — terse reason tokens the GUI renders as
+     * pre-disabled tooltip reasons. Green alignment is always "none" because
+     * it is now ungated at the software level. Structured like this so the
+     * GUI does not re-implement the firmware's gate ordering.
+     */
+    laser_controller_comms_buffer_append_raw(
+        buffer,
+        ",\"hostControlReadiness\":{\"nirBlockedReason\":");
+    laser_controller_comms_write_escaped_string(
+        buffer,
+        laser_controller_comms_nir_blocked_reason(status));
+    laser_controller_comms_buffer_append_raw(
+        buffer,
+        ",\"alignmentBlockedReason\":\"none\",\"ledBlockedReason\":");
+    laser_controller_comms_write_escaped_string(
+        buffer,
+        laser_controller_comms_led_blocked_reason(status));
+    laser_controller_comms_buffer_append_raw(buffer, ",\"sbdnState\":");
+    laser_controller_comms_write_escaped_string(
+        buffer,
+        laser_controller_comms_sbdn_state_name(status->outputs.sbdn_state));
+    laser_controller_comms_buffer_append_raw(buffer, "}");
+
+    /*
+     * usbDebugMock block — operator visibility so the host can render a
+     * loud banner whenever telemetry is synthesized. Per AGENT.md, the
+     * GUI MUST surface this state every time it is true; failing to do so
+     * is a safety-visibility regression.
+     */
+    {
+        laser_controller_usb_debug_mock_status_t mock_status;
+        memset(&mock_status, 0, sizeof(mock_status));
+        laser_controller_usb_debug_mock_get_status(&mock_status);
+        laser_controller_comms_buffer_append_fmt(
+            buffer,
+            ",\"usbDebugMock\":{\"active\":%s,\"pdConflictLatched\":%s,\"enablePending\":%s,\"activatedAtMs\":%llu,\"deactivatedAtMs\":%llu,\"lastDisableReason\":",
+            mock_status.active ? "true" : "false",
+            mock_status.pd_conflict_latched ? "true" : "false",
+            mock_status.enable_pending ? "true" : "false",
+            (unsigned long long)mock_status.activated_at_ms,
+            (unsigned long long)mock_status.deactivated_at_ms);
+        laser_controller_comms_write_escaped_string(
+            buffer,
+            mock_status.last_disable_reason != NULL
+                ? mock_status.last_disable_reason
+                : "");
+        laser_controller_comms_buffer_append_raw(buffer, "}}");
+    }
 }
 
 static void laser_controller_comms_write_fault_json(
@@ -763,6 +1015,35 @@ static void laser_controller_comms_write_fault_json(
     laser_controller_comms_write_escaped_string(
         buffer,
         laser_controller_fault_class_name(status->latched_fault_class));
+
+    /*
+     * Trigger diagnostic frame — currently populated only for LD_OVERTEMP
+     * (added 2026-04-15 late to address spurious trips with no operator
+     * visibility into the ADC reading / gate state). When `valid == false`
+     * we emit `triggerDiag:null` so the host can render an explicit
+     * "no diag" state without a schema-version dance.
+     */
+    if (status->active_fault_diag.valid) {
+        laser_controller_comms_buffer_append_raw(buffer, ",\"triggerDiag\":{\"code\":");
+        laser_controller_comms_write_escaped_string(
+            buffer,
+            laser_controller_fault_code_name(status->active_fault_diag.code));
+        laser_controller_comms_buffer_append_fmt(
+            buffer,
+            ",\"measuredC\":%.3f,\"measuredVoltageV\":%.4f,\"limitC\":%.3f,"
+            "\"ldPgoodForMs\":%lu,\"sbdnNotOffForMs\":%lu,\"expr\":",
+            (double)status->active_fault_diag.measured_c,
+            (double)status->active_fault_diag.measured_voltage_v,
+            (double)status->active_fault_diag.limit_c,
+            (unsigned long)status->active_fault_diag.ld_pgood_for_ms,
+            (unsigned long)status->active_fault_diag.sbdn_not_off_for_ms);
+        laser_controller_comms_write_escaped_string(
+            buffer,
+            status->active_fault_diag.expr);
+        laser_controller_comms_buffer_append_raw(buffer, "}");
+    } else {
+        laser_controller_comms_buffer_append_raw(buffer, ",\"triggerDiag\":null");
+    }
 
     if (!include_counters) {
         laser_controller_comms_buffer_append_raw(buffer, "}");
@@ -1611,13 +1892,19 @@ static bool laser_controller_comms_is_runtime_control_command(const char *comman
             strcmp(command, "configure_modulation") == 0);
 }
 
-static bool laser_controller_comms_is_aux_control_command(const char *command)
+/*
+ * Green alignment laser is NOW UNGATED at the software level (comms, safety,
+ * derive_outputs). User directive 2026-04-14: "Green laser considered safe
+ * to activate at ALL TIME, no interlock for it at all." Alignment commands
+ * (`operate.set_alignment`, legacy `enable_alignment`/`disable_alignment`)
+ * therefore no longer pass through the aux-control deployment gate. Only the
+ * LED (GPIO6) retains aux gating because it still has real ownership
+ * semantics with the Integrate service path.
+ */
+static bool laser_controller_comms_is_led_control_command(const char *command)
 {
     return command != NULL &&
-           (strcmp(command, "operate.set_alignment") == 0 ||
-            strcmp(command, "operate.set_led") == 0 ||
-            strcmp(command, "enable_alignment") == 0 ||
-            strcmp(command, "disable_alignment") == 0);
+           strcmp(command, "operate.set_led") == 0;
 }
 
 static bool laser_controller_comms_runtime_mode_is_modulated_host(
@@ -1700,9 +1987,23 @@ static bool laser_controller_comms_is_service_mutation_command(const char *comma
             strcmp(command, "haptic_debug_fire") == 0 ||
             strcmp(command, "i2c_write") == 0 ||
             strcmp(command, "spi_write") == 0 ||
-            strcmp(command, "set_interlocks_disabled") == 0);
+            strcmp(command, "set_interlocks_disabled") == 0 ||
+            strcmp(command, "service.usb_debug_mock_enable") == 0 ||
+            strcmp(command, "service.usb_debug_mock_disable") == 0 ||
+            strcmp(command, "integrate.rgb_led.set") == 0 ||
+            strcmp(command, "integrate.rgb_led.clear") == 0 ||
+            strcmp(command, "integrate.tof.set_calibration") == 0);
 }
 
+/*
+ * "driver_standby_effective" is a BACKWARD-COMPATIBLE bool for legacy status
+ * readers. It reports TRUE whenever the driver is NOT in OPERATE mode — i.e.
+ * either shutdown (SBDN driven LOW) or standby (Hi-Z). Returns FALSE only
+ * when SBDN is explicitly HIGH.
+ *
+ * New consumers should read `status->outputs.sbdn_state` directly to
+ * distinguish OFF vs STANDBY vs ON.
+ */
 static bool laser_controller_comms_driver_standby_effective(
     const laser_controller_runtime_status_t *status)
 {
@@ -1710,7 +2011,9 @@ static bool laser_controller_comms_driver_standby_effective(
         laser_controller_comms_find_gpio_pin(status, LASER_CONTROLLER_GPIO_LD_SBDN);
 
     if (pin == NULL) {
-        return status != NULL ? status->outputs.assert_driver_standby : true;
+        return status != NULL &&
+               status->outputs.sbdn_state !=
+                   LASER_CONTROLLER_SBDN_STATE_ON;
     }
 
     if (pin->override_active &&
@@ -1722,7 +2025,13 @@ static bool laser_controller_comms_driver_standby_effective(
         return !pin->level_high;
     }
 
-    return status->outputs.assert_driver_standby;
+    /*
+     * Pin is in Hi-Z or undriven. Treat as "standby effective" — the
+     * driver is not in OPERATE because it has no logic-high on SBDN. The
+     * enum on the status struct distinguishes STANDBY (intended Hi-Z) from
+     * OFF (driven low).
+     */
+    return status->outputs.sbdn_state != LASER_CONTROLLER_SBDN_STATE_ON;
 }
 
 static const laser_controller_board_gpio_pin_readback_t *
@@ -2201,6 +2510,7 @@ static void laser_controller_comms_write_snapshot_json(
         status->inputs.tec_temp_good ? 0U : 1U);
 
     laser_controller_comms_write_button_state_json(buffer, status);
+    laser_controller_comms_write_button_board_json(buffer, status);
     laser_controller_comms_write_peripheral_readback_json(buffer, status);
     laser_controller_comms_write_gpio_inspector_json(buffer, status);
 
@@ -2209,7 +2519,7 @@ static void laser_controller_comms_write_snapshot_json(
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        "\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"horizonThresholdDeg\":%.2f,\"horizonHysteresisDeg\":%.2f,\"tofMinRangeM\":%.3f,\"tofMaxRangeM\":%.3f,\"tofHysteresisM\":%.3f,\"imuStaleMs\":%lu,\"tofStaleMs\":%lu,\"railGoodTimeoutMs\":%lu,\"lambdaDriftLimitNm\":%.2f,\"lambdaDriftHysteresisNm\":%.2f,\"lambdaDriftHoldMs\":%lu,\"ldOvertempLimitC\":%.2f,\"tecTempAdcTripV\":%.3f,\"tecTempAdcHysteresisV\":%.3f,\"tecTempAdcHoldMs\":%lu,\"tecMinCommandC\":%.2f,\"tecMaxCommandC\":%.2f,\"tecReadyToleranceC\":%.2f,\"maxLaserCurrentA\":%.2f,\"offCurrentThresholdA\":%.2f,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f},",
+        "\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"horizonThresholdDeg\":%.2f,\"horizonHysteresisDeg\":%.2f,\"tofMinRangeM\":%.3f,\"tofMaxRangeM\":%.3f,\"tofHysteresisM\":%.3f,\"imuStaleMs\":%lu,\"tofStaleMs\":%lu,\"railGoodTimeoutMs\":%lu,\"lambdaDriftLimitNm\":%.2f,\"lambdaDriftHysteresisNm\":%.2f,\"lambdaDriftHoldMs\":%lu,\"ldOvertempLimitC\":%.2f,\"tecTempAdcTripV\":%.3f,\"tecTempAdcHysteresisV\":%.3f,\"tecTempAdcHoldMs\":%lu,\"tecMinCommandC\":%.2f,\"tecMaxCommandC\":%.2f,\"tecReadyToleranceC\":%.2f,\"maxLaserCurrentA\":%.2f,\"offCurrentThresholdA\":%.2f,\"maxTofLedDutyCyclePct\":%u,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f},",
         status->decision.allow_alignment ? "true" : "false",
         status->decision.allow_nir ? "true" : "false",
         status->decision.horizon_blocked ? "true" : "false",
@@ -2236,6 +2546,7 @@ static void laser_controller_comms_write_snapshot_json(
         status->config.thresholds.tec_ready_tolerance_c,
         status->config.thresholds.max_laser_current_a,
         status->config.thresholds.off_current_threshold_a,
+        (unsigned)status->config.thresholds.max_tof_led_duty_cycle_pct,
         actual_lambda_nm,
         status->bench.target_lambda_nm,
         lambda_drift_nm,
@@ -2311,7 +2622,7 @@ static void laser_controller_comms_write_snapshot_json(
         laser_controller_service_dac_sync_mode_name(status->bringup.dac_sync_mode));
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        ",\"imuOdrHz\":%lu,\"imuAccelRangeG\":%lu,\"imuGyroRangeDps\":%lu,\"imuGyroEnabled\":%s,\"imuLpf2Enabled\":%s,\"imuTimestampEnabled\":%s,\"imuBduEnabled\":%s,\"imuIfIncEnabled\":%s,\"imuI2cDisabled\":%s,\"tofMinRangeM\":%.3f,\"tofMaxRangeM\":%.3f,\"tofStaleTimeoutMs\":%lu,\"pdProfiles\":[",
+        ",\"imuOdrHz\":%lu,\"imuAccelRangeG\":%lu,\"imuGyroRangeDps\":%lu,\"imuGyroEnabled\":%s,\"imuLpf2Enabled\":%s,\"imuTimestampEnabled\":%s,\"imuBduEnabled\":%s,\"imuIfIncEnabled\":%s,\"imuI2cDisabled\":%s,\"tofMinRangeM\":%.3f,\"tofMaxRangeM\":%.3f,\"tofStaleTimeoutMs\":%lu,\"tofCalibration\":{\"distanceMode\":\"%s\",\"timingBudgetMs\":%lu,\"roiWidthSpads\":%u,\"roiHeightSpads\":%u,\"roiCenterSpad\":%u,\"offsetMm\":%ld,\"xtalkCps\":%lu,\"xtalkEnabled\":%s},\"pdProfiles\":[",
         (unsigned long)status->bringup.imu_odr_hz,
         (unsigned long)status->bringup.imu_accel_range_g,
         (unsigned long)status->bringup.imu_gyro_range_dps,
@@ -2323,7 +2634,18 @@ static void laser_controller_comms_write_snapshot_json(
         status->bringup.imu_i2c_disabled ? "true" : "false",
         status->bringup.tof_min_range_m,
         status->bringup.tof_max_range_m,
-        (unsigned long)status->bringup.tof_stale_timeout_ms);
+        (unsigned long)status->bringup.tof_stale_timeout_ms,
+        status->bringup.tof_calibration.distance_mode ==
+            LASER_CONTROLLER_TOF_DISTANCE_MODE_SHORT ? "short" :
+        status->bringup.tof_calibration.distance_mode ==
+            LASER_CONTROLLER_TOF_DISTANCE_MODE_MEDIUM ? "medium" : "long",
+        (unsigned long)status->bringup.tof_calibration.timing_budget_ms,
+        (unsigned)status->bringup.tof_calibration.roi_width_spads,
+        (unsigned)status->bringup.tof_calibration.roi_height_spads,
+        (unsigned)status->bringup.tof_calibration.roi_center_spad,
+        (long)status->bringup.tof_calibration.offset_mm,
+        (unsigned long)status->bringup.tof_calibration.xtalk_cps,
+        status->bringup.tof_calibration.xtalk_enabled ? "true" : "false");
     for (size_t index = 0U;
          index < LASER_CONTROLLER_SERVICE_PD_PROFILE_COUNT;
          ++index) {
@@ -2549,7 +2871,7 @@ static void laser_controller_comms_write_command_snapshot_json(
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        "\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"horizonThresholdDeg\":%.2f,\"horizonHysteresisDeg\":%.2f,\"tofMinRangeM\":%.3f,\"tofMaxRangeM\":%.3f,\"tofHysteresisM\":%.3f,\"imuStaleMs\":%lu,\"tofStaleMs\":%lu,\"railGoodTimeoutMs\":%lu,\"lambdaDriftLimitNm\":%.2f,\"lambdaDriftHysteresisNm\":%.2f,\"lambdaDriftHoldMs\":%lu,\"ldOvertempLimitC\":%.2f,\"tecTempAdcTripV\":%.3f,\"tecTempAdcHysteresisV\":%.3f,\"tecTempAdcHoldMs\":%lu,\"tecMinCommandC\":%.2f,\"tecMaxCommandC\":%.2f,\"tecReadyToleranceC\":%.2f,\"maxLaserCurrentA\":%.2f,\"offCurrentThresholdA\":%.2f,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f},",
+        "\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"horizonThresholdDeg\":%.2f,\"horizonHysteresisDeg\":%.2f,\"tofMinRangeM\":%.3f,\"tofMaxRangeM\":%.3f,\"tofHysteresisM\":%.3f,\"imuStaleMs\":%lu,\"tofStaleMs\":%lu,\"railGoodTimeoutMs\":%lu,\"lambdaDriftLimitNm\":%.2f,\"lambdaDriftHysteresisNm\":%.2f,\"lambdaDriftHoldMs\":%lu,\"ldOvertempLimitC\":%.2f,\"tecTempAdcTripV\":%.3f,\"tecTempAdcHysteresisV\":%.3f,\"tecTempAdcHoldMs\":%lu,\"tecMinCommandC\":%.2f,\"tecMaxCommandC\":%.2f,\"tecReadyToleranceC\":%.2f,\"maxLaserCurrentA\":%.2f,\"offCurrentThresholdA\":%.2f,\"maxTofLedDutyCyclePct\":%u,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f},",
         status->decision.allow_alignment ? "true" : "false",
         status->decision.allow_nir ? "true" : "false",
         status->decision.horizon_blocked ? "true" : "false",
@@ -2576,6 +2898,7 @@ static void laser_controller_comms_write_command_snapshot_json(
         status->config.thresholds.tec_ready_tolerance_c,
         status->config.thresholds.max_laser_current_a,
         status->config.thresholds.off_current_threshold_a,
+        (unsigned)status->config.thresholds.max_tof_led_duty_cycle_pct,
         actual_lambda_nm,
         status->bench.target_lambda_nm,
         lambda_drift_nm,
@@ -2747,6 +3070,7 @@ static void laser_controller_comms_write_live_telemetry_json(
         status->inputs.tec_telemetry_valid ? "true" : "false");
 
     laser_controller_comms_write_button_state_json(buffer, status);
+    laser_controller_comms_write_button_board_json(buffer, status);
     laser_controller_comms_write_bench_json(buffer, status);
     laser_controller_comms_buffer_append_raw(buffer, ",");
 
@@ -2955,6 +3279,7 @@ static void laser_controller_comms_write_live_snapshot_json(
     laser_controller_comms_write_haptic_readback_json(buffer, status);
     laser_controller_comms_write_gpio_inspector_json(buffer, status);
     laser_controller_comms_write_button_state_json(buffer, status);
+    laser_controller_comms_write_button_board_json(buffer, status);
     laser_controller_comms_write_bench_json(buffer, status);
     laser_controller_comms_buffer_append_raw(buffer, ",");
 
@@ -3585,7 +3910,7 @@ static void laser_controller_comms_emit_bench_status_response(
     if (include_safety) {
         laser_controller_comms_buffer_append_fmt(
             &buffer,
-            ",\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"horizonThresholdDeg\":%.2f,\"horizonHysteresisDeg\":%.2f,\"tofMinRangeM\":%.3f,\"tofMaxRangeM\":%.3f,\"tofHysteresisM\":%.3f,\"imuStaleMs\":%lu,\"tofStaleMs\":%lu,\"railGoodTimeoutMs\":%lu,\"lambdaDriftLimitNm\":%.2f,\"lambdaDriftHysteresisNm\":%.2f,\"lambdaDriftHoldMs\":%lu,\"ldOvertempLimitC\":%.2f,\"tecTempAdcTripV\":%.3f,\"tecTempAdcHysteresisV\":%.3f,\"tecTempAdcHoldMs\":%lu,\"tecMinCommandC\":%.2f,\"tecMaxCommandC\":%.2f,\"tecReadyToleranceC\":%.2f,\"maxLaserCurrentA\":%.2f,\"offCurrentThresholdA\":%.2f,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f}",
+            ",\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"horizonThresholdDeg\":%.2f,\"horizonHysteresisDeg\":%.2f,\"tofMinRangeM\":%.3f,\"tofMaxRangeM\":%.3f,\"tofHysteresisM\":%.3f,\"imuStaleMs\":%lu,\"tofStaleMs\":%lu,\"railGoodTimeoutMs\":%lu,\"lambdaDriftLimitNm\":%.2f,\"lambdaDriftHysteresisNm\":%.2f,\"lambdaDriftHoldMs\":%lu,\"ldOvertempLimitC\":%.2f,\"tecTempAdcTripV\":%.3f,\"tecTempAdcHysteresisV\":%.3f,\"tecTempAdcHoldMs\":%lu,\"tecMinCommandC\":%.2f,\"tecMaxCommandC\":%.2f,\"tecReadyToleranceC\":%.2f,\"maxLaserCurrentA\":%.2f,\"offCurrentThresholdA\":%.2f,\"maxTofLedDutyCyclePct\":%u,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f}",
             status->decision.allow_alignment ? "true" : "false",
             status->decision.allow_nir ? "true" : "false",
             status->decision.horizon_blocked ? "true" : "false",
@@ -3612,6 +3937,7 @@ static void laser_controller_comms_emit_bench_status_response(
             status->config.thresholds.tec_ready_tolerance_c,
             status->config.thresholds.max_laser_current_a,
             status->config.thresholds.off_current_threshold_a,
+            (unsigned)status->config.thresholds.max_tof_led_duty_cycle_pct,
             actual_lambda_nm,
             status->bench.target_lambda_nm,
             lambda_drift_nm,
@@ -4260,6 +4586,305 @@ static void laser_controller_comms_handle_command_line(const char *line)
         return;
     }
 
+    /*
+     * USB-Debug Mock — explicit opt-in only. Hard-isolated per AGENT.md.
+     * The mock substitutes synthesized rail PGOOD and TEC/LD telemetry
+     * inside read_inputs so the GUI / state machine / protocol paths can
+     * be exercised end-to-end from a USB-only session where TEC/LD rails
+     * physically cannot come up. The mock NEVER drives any GPIO and
+     * auto-disables the moment real PD power is detected.
+     */
+    if (strcmp(command, "service.usb_debug_mock_enable") == 0) {
+        if (!laser_controller_comms_service_mode_active(&status)) {
+            laser_controller_comms_emit_error_response(
+                id,
+                "Enter service mode before enabling the USB debug mock.");
+            return;
+        }
+        if (status.power_tier != LASER_CONTROLLER_POWER_TIER_PROGRAMMING_ONLY) {
+            laser_controller_comms_emit_error_response(
+                id,
+                "USB debug mock only engages when power_tier is programming_only. "
+                "Real bench power is currently negotiated.");
+            return;
+        }
+        if (status.fault_latched) {
+            laser_controller_comms_emit_error_response(
+                id,
+                "Clear the latched fault before enabling the USB debug mock.");
+            return;
+        }
+        const esp_err_t err = laser_controller_usb_debug_mock_request_enable(
+            true,
+            status.power_tier,
+            now_ms);
+        if (err != ESP_OK) {
+            laser_controller_comms_emit_error_response(
+                id,
+                "USB debug mock enable rejected (guard re-check failed).");
+            return;
+        }
+        laser_controller_comms_refresh_status_after_mutation(&status, 25U);
+        laser_controller_comms_emit_io_status_response(
+            id,
+            &status,
+            true,
+            false,
+            false,
+            true,
+            true);
+        return;
+    }
+
+    if (strcmp(command, "service.usb_debug_mock_disable") == 0) {
+        /*
+         * Disable is always accepted. No service-mode requirement so the
+         * operator can bail out of mock mode even if service-mode exit
+         * already happened (which itself auto-disables, but belt-and-
+         * suspenders).
+         */
+        laser_controller_usb_debug_mock_request_disable(
+            "operator request",
+            now_ms);
+        laser_controller_comms_refresh_status_after_mutation(&status, 25U);
+        laser_controller_comms_emit_io_status_response(
+            id,
+            &status,
+            true,
+            false,
+            false,
+            true,
+            true);
+        return;
+    }
+
+    /*
+     * Integrate-test override of the button-board RGB status LED. Service
+     * mode + no deployment + no fault latch. Watchdog-bounded — firmware
+     * reverts to its computed state after the hold window expires.
+     * Four-place sync target: types.ts, mock-transport.ts, protocol-spec.md.
+     */
+    if (strcmp(command, "integrate.rgb_led.set") == 0) {
+        if (!laser_controller_comms_service_mode_active(&status)) {
+            laser_controller_comms_emit_error_response(
+                id,
+                "Enter service mode before driving the RGB LED test.");
+            return;
+        }
+        if (status.deployment.active) {
+            laser_controller_comms_emit_error_response(
+                id,
+                "Exit deployment mode before driving the RGB LED test.");
+            return;
+        }
+        if (status.fault_latched) {
+            laser_controller_comms_emit_error_response(
+                id,
+                "Clear the latched fault before driving the RGB LED test.");
+            return;
+        }
+        uint32_t r = 0U;
+        uint32_t g = 0U;
+        uint32_t b = 0U;
+        bool blink = false;
+        uint32_t hold_ms = 5000U;
+        if (!laser_controller_comms_extract_uint(line, "\"r\":", &r) ||
+            !laser_controller_comms_extract_uint(line, "\"g\":", &g) ||
+            !laser_controller_comms_extract_uint(line, "\"b\":", &b)) {
+            laser_controller_comms_emit_error_response(
+                id,
+                "Missing r/g/b RGB arguments (0..255).");
+            return;
+        }
+        (void)laser_controller_comms_extract_bool(line, "\"blink\":", &blink);
+        (void)laser_controller_comms_extract_uint(line, "\"hold_ms\":", &hold_ms);
+        if (r > 255U || g > 255U || b > 255U) {
+            laser_controller_comms_emit_error_response(
+                id,
+                "RGB component out of range (0..255).");
+            return;
+        }
+        if (hold_ms == 0U) {
+            hold_ms = 5000U;
+        } else if (hold_ms > 30000U) {
+            hold_ms = 30000U;
+        }
+        const esp_err_t err = laser_controller_app_set_rgb_test(
+            (uint8_t)r, (uint8_t)g, (uint8_t)b, blink, hold_ms);
+        if (err != ESP_OK) {
+            laser_controller_comms_emit_error_response(
+                id,
+                "RGB LED test rejected (guard re-check failed).");
+            return;
+        }
+        laser_controller_comms_refresh_status_after_mutation(&status, 25U);
+        laser_controller_comms_emit_io_status_response(
+            id,
+            &status,
+            true,
+            false,
+            false,
+            true,
+            true);
+        return;
+    }
+
+    if (strcmp(command, "integrate.rgb_led.clear") == 0) {
+        const esp_err_t err = laser_controller_app_clear_rgb_test();
+        if (err != ESP_OK) {
+            laser_controller_comms_emit_error_response(
+                id,
+                "RGB LED test clear rejected.");
+            return;
+        }
+        laser_controller_comms_refresh_status_after_mutation(&status, 25U);
+        laser_controller_comms_emit_io_status_response(
+            id,
+            &status,
+            true,
+            false,
+            false,
+            true,
+            true);
+        return;
+    }
+
+    /*
+     * ToF VL53L1X calibration + ROI. Service-mode-only, no deployment,
+     * no fault latched. All fields are optional; unspecified fields
+     * retain their current value. Writes persist to the dedicated
+     * "tof_cal" NVS blob AND are applied to the VL53L1X immediately.
+     * Fields:
+     *   distance_mode : "short" | "medium" | "long"
+     *   timing_budget_ms : 20 | 33 | 50 | 100 | 200
+     *   roi_width_spads, roi_height_spads : 4..16
+     *   roi_center_spad : 0..255 (default 199)
+     *   offset_mm : signed distance offset correction
+     *   xtalk_cps : unsigned crosstalk compensation counts/sec
+     *   xtalk_enabled : bool — apply/ignore xtalk
+     *
+     * See docs/protocol-spec.md "ToF calibration" section.
+     */
+    if (strcmp(command, "integrate.tof.set_calibration") == 0) {
+        if (!laser_controller_comms_service_mode_active(&status)) {
+            laser_controller_comms_emit_error_response(
+                id,
+                "Enter service mode before updating ToF calibration.");
+            return;
+        }
+        if (status.deployment.active) {
+            laser_controller_comms_emit_error_response(
+                id,
+                "Exit deployment mode before updating ToF calibration.");
+            return;
+        }
+        if (status.fault_latched) {
+            laser_controller_comms_emit_error_response(
+                id,
+                "Clear the latched fault before updating ToF calibration.");
+            return;
+        }
+
+        laser_controller_tof_calibration_t cal;
+        laser_controller_service_get_tof_calibration(&cal);
+
+        if (laser_controller_comms_extract_string(
+                line,
+                "\"distance_mode\":\"",
+                text_arg,
+                sizeof(text_arg))) {
+            if (strcmp(text_arg, "short") == 0) {
+                cal.distance_mode = LASER_CONTROLLER_TOF_DISTANCE_MODE_SHORT;
+            } else if (strcmp(text_arg, "medium") == 0) {
+                cal.distance_mode = LASER_CONTROLLER_TOF_DISTANCE_MODE_MEDIUM;
+            } else if (strcmp(text_arg, "long") == 0) {
+                cal.distance_mode = LASER_CONTROLLER_TOF_DISTANCE_MODE_LONG;
+            } else {
+                laser_controller_comms_emit_error_response(
+                    id,
+                    "Unsupported distance_mode. Use short | medium | long.");
+                return;
+            }
+        }
+
+        uint32_t u_arg = 0U;
+        if (laser_controller_comms_extract_uint(
+                line, "\"timing_budget_ms\":", &u_arg)) {
+            cal.timing_budget_ms = u_arg;
+        }
+        if (laser_controller_comms_extract_uint(
+                line, "\"roi_width_spads\":", &u_arg)) {
+            cal.roi_width_spads = (uint8_t)u_arg;
+        }
+        if (laser_controller_comms_extract_uint(
+                line, "\"roi_height_spads\":", &u_arg)) {
+            cal.roi_height_spads = (uint8_t)u_arg;
+        }
+        if (laser_controller_comms_extract_uint(
+                line, "\"roi_center_spad\":", &u_arg)) {
+            cal.roi_center_spad = (uint8_t)u_arg;
+        }
+        /*
+         * offset_mm is signed; comms.c only has extract_uint / extract_float,
+         * so read as float and cast. Range is clamped in board.c.
+         */
+        float offset_f = (float)cal.offset_mm;
+        if (laser_controller_comms_extract_float(
+                line, "\"offset_mm\":", &offset_f)) {
+            if (offset_f > 2000.0f) offset_f = 2000.0f;
+            if (offset_f < -2000.0f) offset_f = -2000.0f;
+            cal.offset_mm = (int32_t)offset_f;
+        }
+        if (laser_controller_comms_extract_uint(
+                line, "\"xtalk_cps\":", &u_arg)) {
+            cal.xtalk_cps = u_arg;
+        }
+        bool xtalk_enabled = cal.xtalk_enabled;
+        if (laser_controller_comms_extract_bool(
+                line, "\"xtalk_enabled\":", &xtalk_enabled)) {
+            cal.xtalk_enabled = xtalk_enabled;
+        }
+
+        const esp_err_t persist_err = laser_controller_service_set_tof_calibration(
+            &cal, now_ms);
+        if (persist_err != ESP_OK) {
+            laser_controller_comms_emit_error_response(
+                id,
+                "ToF calibration values failed validation (range / mode).");
+            return;
+        }
+
+        const esp_err_t apply_err =
+            laser_controller_board_tof_apply_calibration(&cal);
+        if (apply_err != ESP_OK) {
+            laser_controller_logger_logf(
+                now_ms,
+                "tof",
+                "calibration persisted but hardware apply failed: %s",
+                esp_err_to_name(apply_err));
+            /*
+             * Persistence succeeded — firmware will reapply on next ToF
+             * init. Return a soft success with an informative note so
+             * the operator knows to re-probe.
+             */
+        }
+
+        laser_controller_logger_log(
+            now_ms,
+            "tof",
+            "calibration updated (persisted to tof_cal NVS blob).");
+        laser_controller_comms_refresh_status_after_mutation(&status, 25U);
+        laser_controller_comms_emit_io_status_response(
+            id,
+            &status,
+            true,
+            false,
+            false,
+            true,
+            true);
+        return;
+    }
+
     if (strcmp(command, "get_bringup_profile") == 0) {
         (void)laser_controller_app_copy_status(&status);
         laser_controller_comms_emit_full_status_response(id, &status);
@@ -4375,19 +5000,28 @@ static void laser_controller_comms_handle_command_line(const char *line)
         return;
     }
 
-    if (laser_controller_comms_is_aux_control_command(command) &&
+    /*
+     * Green alignment commands are intentionally NOT gated here. Per user
+     * directive, the green laser has no software interlock; only hardware
+     * rail availability gates it.
+     *
+     * LED (GPIO6) still requires deployment active + not-running because
+     * the service-vs-runtime ownership story needs deployment to be the
+     * stable context where runtime owns the sideband.
+     */
+    if (laser_controller_comms_is_led_control_command(command) &&
         !status.deployment.active) {
         laser_controller_comms_emit_error_response(
             id,
-            "Enter deployment mode before using Operate aux controls.");
+            "Enter deployment mode before changing the GPIO6 LED request.");
         return;
     }
 
-    if (laser_controller_comms_is_aux_control_command(command) &&
+    if (laser_controller_comms_is_led_control_command(command) &&
         status.deployment.running) {
         laser_controller_comms_emit_error_response(
             id,
-            "Wait for the deployment checklist to stop before changing green or GPIO6 LED requests.");
+            "Wait for the deployment checklist to stop before changing the GPIO6 LED request.");
         return;
     }
 
@@ -4418,6 +5052,20 @@ static void laser_controller_comms_handle_command_line(const char *line)
         }
 
         if (strcmp(text_arg, "binary_trigger") == 0) {
+            /*
+             * Binary-trigger mode requires the button board MCP23017 to
+             * be reachable on the shared I2C bus — otherwise the trigger
+             * input is unobservable and the safety decision cannot read
+             * stage state. AGENT.md previously blocked this mode entirely;
+             * as of 2026-04-15 the gate is the live MCP23017 reachability
+             * status from the board layer.
+             */
+            if (!status.inputs.button.board_reachable) {
+                laser_controller_comms_emit_error_response(
+                    id,
+                    "Button board (MCP23017 @ 0x20) is not reachable. Confirm the J2 connector and re-check before selecting binary_trigger.");
+                return;
+            }
             runtime_mode = LASER_CONTROLLER_RUNTIME_MODE_BINARY_TRIGGER;
         } else if (strcmp(text_arg, "modulated_host") == 0) {
             runtime_mode = LASER_CONTROLLER_RUNTIME_MODE_MODULATED_HOST;
@@ -4893,6 +5541,16 @@ static void laser_controller_comms_handle_command_line(const char *line)
         }
         if (laser_controller_comms_extract_float(line, "\"off_current_threshold_a\":", &value_f)) {
             policy.thresholds.off_current_threshold_a = value_f;
+        }
+        {
+            uint32_t max_led_duty = 0U;
+            if (laser_controller_comms_extract_uint(
+                    line, "\"max_tof_led_duty_cycle_pct\":", &max_led_duty)) {
+                if (max_led_duty > 100U) {
+                    max_led_duty = 100U;
+                }
+                policy.thresholds.max_tof_led_duty_cycle_pct = max_led_duty;
+            }
         }
 
         if (laser_controller_app_set_runtime_safety_policy(&policy) != ESP_OK) {

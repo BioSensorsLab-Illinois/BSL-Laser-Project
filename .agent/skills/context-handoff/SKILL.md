@@ -1,3 +1,8 @@
+---
+name: context-handoff
+description: Required when context is tight or a session is ending mid-initiative. Updates Status.md + ExecPlan.md + AGENT.md so a fresh agent can resume from disk alone, without chat memory. Trigger on session-end signals, context compaction, approaching context limits, handoff requests, or mid-initiative stopping points. The docs are the memory — never panic-summarize into chat.
+---
+
 # context-handoff
 
 Use this skill when context is getting tight or the session must hand work to a fresh agent.

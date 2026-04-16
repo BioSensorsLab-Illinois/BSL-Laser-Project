@@ -120,3 +120,13 @@ Those three passes are the minimum automated gate for the powered-ready recovery
 4. Calibration write/read/CRC path verified.
 5. Fault recovery policy reviewed and documented.
 6. Independent safety-path audit completed.
+
+## Button Board Validation (added 2026-04-15)
+
+Three new scenarios to be added to `host-console/scripts/live_controller_validation.py` and exercised on the live bench once the button board is mounted. Treat these as required-before-clinical for the binary-trigger path.
+
+- **`button-trigger-pass`** — Confirm `MCP23017` probes at `0x20`, `INTA` fires on physical press of each of the four buttons (verified against `buttons.isrFireCount` and the four `*Pressed` fields), `operate.set_mode binary_trigger` is accepted, stage1 enables green + the front LED at 20 %, side1/side2 step the LED in 10 % increments, stage1+stage2 fires NIR, an interlock during NIR latches `buttonBoard.triggerLockout`, and lockout clears when both stages are released and not before.
+- **`rgb-led-pass`** — Service mode + no deployment. Cycle through `integrate.rgb_led.set` with each of: solid red, solid green, solid blue, flashing red, flashing orange. Visual confirm each color and that the flash period is ~1 s with ~50 % duty. Confirm `integrate.rgb_led.clear` reverts to firmware-computed state.
+- **`sbdn-lp-good-pass`** — Force the new `LD_LP_GOOD_TIMEOUT` path by physically opening LD_LPGD before deployment, then run the deployment checklist. Confirm the new `lp_good_check` step fails after ~1 s, that the primary failure code is `ld_lp_good_timeout`, that the fault is `system_major`-classed, and that the RGB status LED switches to flash-red.
+
+The mandatory three (`aux-control-pass`, `ready-runtime-pass`, `fault-edge-pass`) are unchanged and must be re-run after the firmware image lands on the bench. None of these scenarios are exercised against the mock — they require real bench power.

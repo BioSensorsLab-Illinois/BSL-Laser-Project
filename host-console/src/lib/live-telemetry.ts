@@ -114,6 +114,10 @@ export function makeRealtimeTelemetryFromSnapshot(
       tempAdcVoltageV: snapshot.safety.tempAdcVoltageV,
     },
     buttons: { ...snapshot.buttons },
+    buttonBoard: {
+      ...snapshot.buttonBoard,
+      rgb: { ...snapshot.buttonBoard.rgb },
+    },
     bringup: {
       serviceModeRequested: snapshot.bringup.serviceModeRequested,
       serviceModeActive: snapshot.bringup.serviceModeActive,
@@ -134,6 +138,7 @@ export function makeRealtimeTelemetryFromSnapshot(
       latchedClass: snapshot.fault.latchedClass,
       activeCount: snapshot.fault.activeCount,
       tripCounter: snapshot.fault.tripCounter,
+      triggerDiag: snapshot.fault.triggerDiag ?? null,
     },
   }
 }
@@ -176,6 +181,14 @@ export function mergeRealtimeTelemetryIntoSnapshot(
       ...telemetry.safety,
     },
     buttons: { ...snapshot.buttons, ...telemetry.buttons },
+    buttonBoard: {
+      ...snapshot.buttonBoard,
+      ...telemetry.buttonBoard,
+      rgb: {
+        ...snapshot.buttonBoard.rgb,
+        ...(telemetry.buttonBoard?.rgb ?? {}),
+      },
+    },
     bringup: {
       ...snapshot.bringup,
       serviceModeRequested: telemetry.bringup.serviceModeRequested,
@@ -225,6 +238,14 @@ function mergeRealtimeTelemetry(
     bench: {
       ...current.bench,
       ...(patch.bench ?? {}),
+      hostControlReadiness: {
+        ...current.bench.hostControlReadiness,
+        ...(patch.bench?.hostControlReadiness ?? {}),
+      },
+      usbDebugMock: {
+        ...current.bench.usbDebugMock,
+        ...(patch.bench?.usbDebugMock ?? {}),
+      },
     },
     rails: {
       ld: {
@@ -259,6 +280,14 @@ function mergeRealtimeTelemetry(
     buttons: {
       ...current.buttons,
       ...(patch.buttons ?? {}),
+    },
+    buttonBoard: {
+      ...current.buttonBoard,
+      ...(patch.buttonBoard ?? {}),
+      rgb: {
+        ...current.buttonBoard.rgb,
+        ...(patch.buttonBoard?.rgb ?? {}),
+      },
     },
     bringup: {
       ...current.bringup,

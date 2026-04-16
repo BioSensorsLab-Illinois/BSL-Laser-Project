@@ -355,6 +355,47 @@ export function InspectorRail({
             </dd>
           </div>
         </dl>
+        {/*
+          Trip cause — rendered only when the firmware captured an
+          at-trip diagnostic frame. Currently fires for LD_OVERTEMP. The
+          values are frozen at trip time so operators can tell a false
+          trip (tight rail-settle timers, unstable voltage) from a real
+          overtemp.
+        */}
+        {snapshot.fault.triggerDiag !== null && (
+          <div className="trip-cause">
+            <div className="trip-cause__head">
+              <strong>Trip cause</strong>
+              <span>{snapshot.fault.triggerDiag.code}</span>
+            </div>
+            <p className="trip-cause__expr">{snapshot.fault.triggerDiag.expr}</p>
+            <dl className="trip-cause__facts">
+              <div>
+                <dt>Measured</dt>
+                <dd>
+                  {snapshot.fault.triggerDiag.measuredC.toFixed(1)} °C ·{' '}
+                  {snapshot.fault.triggerDiag.measuredVoltageV.toFixed(3)} V
+                </dd>
+              </div>
+              <div>
+                <dt>Limit</dt>
+                <dd>{snapshot.fault.triggerDiag.limitC.toFixed(1)} °C</dd>
+              </div>
+              <div>
+                <dt>LD rail stable</dt>
+                <dd>
+                  {(snapshot.fault.triggerDiag.ldPgoodForMs / 1000).toFixed(1)} s
+                </dd>
+              </div>
+              <div>
+                <dt>SBDN not-OFF</dt>
+                <dd>
+                  {(snapshot.fault.triggerDiag.sbdnNotOffForMs / 1000).toFixed(1)} s
+                </dd>
+              </div>
+            </dl>
+          </div>
+        )}
       </section>
 
       <section className={deviceLinkLost ? 'inspector-block offline-dim' : 'inspector-block'}>

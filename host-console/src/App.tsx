@@ -280,6 +280,34 @@ function App() {
           </div>
         </header>
 
+        {/*
+         * USB-Debug Mock app-wide banner. Rendered whenever the firmware (or
+         * mock transport) reports `bench.usbDebugMock.active`. Required by
+         * AGENT.md "USB-Only Debug Power" — every TEC/LD readout below this
+         * banner is synthesized while the mock is active.
+         */}
+        {liveSnapshot.bench.usbDebugMock.active && (
+          <div className="usb-debug-mock-banner" role="status" aria-live="polite">
+            <strong>USB DEBUG MOCK ACTIVE</strong>
+            <span>
+              Telemetry below is synthesized — TEC and LD rails are NOT
+              actually powered. Only use for online testing on a USB-only
+              session. Real PD power will auto-disable the mock and latch a
+              SYSTEM_MAJOR fault.
+            </span>
+          </div>
+        )}
+        {liveSnapshot.bench.usbDebugMock.pdConflictLatched && (
+          <div className="usb-debug-mock-banner is-critical" role="alert">
+            <strong>USB DEBUG MOCK PD-CONFLICT LATCHED</strong>
+            <span>
+              The mock auto-disabled because real PD power was detected.
+              Clear faults from the System or Integrate workspace before
+              re-enabling.
+            </span>
+          </div>
+        )}
+
         <StatusRail snapshot={liveSnapshot} telemetryStore={telemetryStore} />
 
         <div className="console-page">
