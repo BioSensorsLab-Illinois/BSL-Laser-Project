@@ -136,6 +136,8 @@ export function makeRealtimeTelemetryFromSnapshot(
       activeClass: snapshot.fault.activeClass,
       latchedCode: snapshot.fault.latchedCode,
       latchedClass: snapshot.fault.latchedClass,
+      activeReason: snapshot.fault.activeReason,
+      latchedReason: snapshot.fault.latchedReason,
       activeCount: snapshot.fault.activeCount,
       tripCounter: snapshot.fault.tripCounter,
       triggerDiag: snapshot.fault.triggerDiag ?? null,

@@ -1248,6 +1248,13 @@ export function BringupWorkbench({
   const [spiValue, setSpiValue] = useState(initialStoredState.spiValue)
   const [operation, setOperation] = useState<BringupOperation | null>(null)
   const [pdNvmConfirmOpen, setPdNvmConfirmOpen] = useState(false)
+  /*
+   * Confirmation gates for any PD-chip write (2026-04-16 user directive:
+   * NO auto writes; must request approval). Both Apply and Save trigger
+   * a STUSB4500 soft-reset that momentarily drops USB-C power.
+   */
+  const [pdApplyConfirmOpen, setPdApplyConfirmOpen] = useState(false)
+  const [pdSaveFirmwareConfirmOpen, setPdSaveFirmwareConfirmOpen] = useState(false)
   const [hapticPattern, setHapticPattern] = useState<HapticPatternDraft>(
     makeDefaultHapticPatternDraft,
   )
@@ -2545,6 +2552,7 @@ export function BringupWorkbench({
   }
 
   async function applyPdProfile() {
+    setPdApplyConfirmOpen(false)
     await runCommandSequence(
       'Apply PD runtime PDOs',
       'USB-PD runtime PDOs applied, renegotiation requested, and live readback refreshed.',
@@ -2607,6 +2615,7 @@ export function BringupWorkbench({
   }
 
   async function savePdProfileToFirmware() {
+    setPdSaveFirmwareConfirmOpen(false)
     await runCommandSequence(
       form.pdFirmwarePlanEnabled
         ? 'Save firmware PDO plan'
@@ -5649,8 +5658,10 @@ async function setLdSbdnMode(mode: LdSbdnMode) {
           </div>
           <p className="panel-note">
             Edit the runtime PDO plan you want the firmware to write into the STUSB4500.
-            PDO1 stays at 5 V as the fallback object. PDO3 is the highest-priority
-            request, PDO2 is the middle request, and PDO1 is the last fallback.
+            PDO1 is the mandatory 5 V fallback — the STUSB4500 hardware fixes its
+            voltage at 5 V (only the current is programmable). PDO3 is the
+            highest-priority request, PDO2 is the middle request, and PDO1 is the
+            last-resort fallback.
           </p>
           <p className="inline-help">
             Applying PDOs can trigger immediate USB-PD renegotiation. If this eval board
@@ -5743,7 +5754,7 @@ async function setLdSbdnMode(mode: LdSbdnMode) {
                         label="Voltage"
                         help={
                           index === 0
-                            ? 'PDO1 is fixed to 5 V by STUSB4500 hardware.'
+                            ? 'STUSB4500 hardware fixes PDO1 at 5 V regardless of what you write — the chip enforces the USB-PD initial-negotiation voltage internally. Only PDO1 current is adjustable.'
                             : 'Choose a standard fixed-voltage PDO target. This editor intentionally limits you to the common fixed-voltage set.'
                         }
                       />
@@ -5752,7 +5763,7 @@ async function setLdSbdnMode(mode: LdSbdnMode) {
                         disabled={index === 0}
                         title={
                           index === 0
-                            ? 'PDO1 voltage is fixed at 5 V.'
+                            ? 'PDO1 voltage is fixed at 5 V by STUSB4500 hardware — only the current is programmable.'
                             : `Choose the requested voltage for ${pdObjectLabel(index)}.`
                         }
                         onChange={(event) =>
@@ -5901,10 +5912,8 @@ async function setLdSbdnMode(mode: LdSbdnMode) {
               type="button"
               className="action-button is-inline is-accent"
               disabled={writesDisabled}
-              title="Write the requested runtime PDOs into the STUSB4500 and update firmware power thresholds."
-              onClick={() => {
-                void applyPdProfile()
-              }}
+              title="Write the requested runtime PDOs into the STUSB4500 and update firmware power thresholds. Triggers a USB-PD renegotiation."
+              onClick={() => setPdApplyConfirmOpen(true)}
             >
               Apply runtime PDOs
             </button>
@@ -5912,10 +5921,8 @@ async function setLdSbdnMode(mode: LdSbdnMode) {
               type="button"
               className="action-button is-inline"
               disabled={writesDisabled}
-              title="Verify the requested PDOs by applying them, refreshing live STUSB readback, then saving the validated plan into controller firmware."
-              onClick={() => {
-                void savePdProfileToFirmware()
-              }}
+              title="Verify the requested PDOs by applying them, refreshing live STUSB readback, then saving the validated plan into controller firmware. Triggers a USB-PD renegotiation."
+              onClick={() => setPdSaveFirmwareConfirmOpen(true)}
             >
               Save PDO plan to firmware
             </button>
@@ -7057,6 +7064,40 @@ async function setLdSbdnMode(mode: LdSbdnMode) {
           onCancel={() => setPdNvmConfirmOpen(false)}
           onConfirm={() => {
             void burnPdProfileToNvm()
+          }}
+        />
+      ) : null}
+      {pdApplyConfirmOpen ? (
+        <ConfirmActionDialog
+          title="Apply STUSB4500 runtime PDOs"
+          detail="Writes the requested PDO plan into STUSB4500 runtime registers and triggers a USB-PD renegotiation. USB-C power will momentarily drop while the contract is re-established."
+          confirmLabel="Apply runtime PDOs"
+          tone="warning"
+          bullets={[
+            'Renegotiation drops USB-C power for ~100 ms — anything that depends on uninterrupted bus power may reset.',
+            'Runtime-only — the next STUSB power cycle reverts to NVM defaults unless you also burn to NVM.',
+            'Invoked by operator action only; firmware does NOT auto-write PD chip.',
+          ]}
+          onCancel={() => setPdApplyConfirmOpen(false)}
+          onConfirm={() => {
+            void applyPdProfile()
+          }}
+        />
+      ) : null}
+      {pdSaveFirmwareConfirmOpen ? (
+        <ConfirmActionDialog
+          title="Save PDO plan to firmware"
+          detail="Applies the requested PDO plan via STUSB4500 runtime registers (USB-PD renegotiation), verifies live readback, then persists the plan into controller NVS."
+          confirmLabel="Save PDO plan"
+          tone="warning"
+          bullets={[
+            'Renegotiation drops USB-C power for ~100 ms during the apply step.',
+            'Persisted plan survives power cycles. Firmware no longer auto-reconciles — the saved plan is informational unless you re-apply explicitly.',
+            'Invoked by operator action only; firmware does NOT auto-write PD chip.',
+          ]}
+          onCancel={() => setPdSaveFirmwareConfirmOpen(false)}
+          onConfirm={() => {
+            void savePdProfileToFirmware()
           }}
         />
       ) : null}

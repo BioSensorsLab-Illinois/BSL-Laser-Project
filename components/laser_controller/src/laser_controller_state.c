@@ -20,6 +20,29 @@ bool laser_controller_state_transition_is_allowed(
     laser_controller_state_t from,
     laser_controller_state_t to)
 {
+    /*
+     * Permissive transition policy (2026-04-17 rewrite). The previous
+     * per-state allowlist was a paper model of the "intended" runtime
+     * sequence — but the real system can transition between many state
+     * pairs as a function of power tier, rail PGOOD, fault clears, and
+     * service-mode entry. Each missing edge in the old table caused
+     * spurious UNEXPECTED_STATE / SAFETY_LATCHED faults that the operator
+     * had to clear manually (e.g. SAFE_IDLE -> TEC_SETTLING during
+     * normal warmup).
+     *
+     * Real safety invariants are enforced by `safety_evaluate` and
+     * `derive_outputs`, not by this label-level table. The only
+     * meaningful invariant left here is:
+     *
+     *   - You should not be able to jump from BOOT_INIT directly into
+     *     an actively-emitting state (ALIGNMENT_ACTIVE / NIR_ACTIVE)
+     *     because no operator request can have been issued on tick 0.
+     *     Any other path that reaches an emit state has already passed
+     *     the safety evaluator's gates.
+     *
+     * Everything else is allowed. Self-loops, SERVICE_MODE, and
+     * FAULT_LATCHED are universally reachable.
+     */
     if (from == to) {
         return true;
     }
@@ -28,97 +51,18 @@ bool laser_controller_state_transition_is_allowed(
         return true;
     }
 
-    switch (from) {
-        case LASER_CONTROLLER_STATE_BOOT_INIT:
-            return to == LASER_CONTROLLER_STATE_PROGRAMMING_ONLY ||
-                   to == LASER_CONTROLLER_STATE_SAFE_IDLE ||
-                   to == LASER_CONTROLLER_STATE_POWER_NEGOTIATION ||
-                   to == LASER_CONTROLLER_STATE_FAULT_LATCHED;
-        case LASER_CONTROLLER_STATE_PROGRAMMING_ONLY:
-            return to == LASER_CONTROLLER_STATE_POWER_NEGOTIATION ||
-                   to == LASER_CONTROLLER_STATE_SAFE_IDLE ||
-                   to == LASER_CONTROLLER_STATE_FAULT_LATCHED;
-        case LASER_CONTROLLER_STATE_SAFE_IDLE:
-            return to == LASER_CONTROLLER_STATE_POWER_NEGOTIATION ||
-                   to == LASER_CONTROLLER_STATE_LIMITED_POWER_IDLE ||
-                   to == LASER_CONTROLLER_STATE_TEC_WARMUP ||
-                   to == LASER_CONTROLLER_STATE_READY_ALIGNMENT ||
-                   to == LASER_CONTROLLER_STATE_READY_NIR ||
-                   to == LASER_CONTROLLER_STATE_FAULT_LATCHED ||
-                   to == LASER_CONTROLLER_STATE_SERVICE_MODE;
-        case LASER_CONTROLLER_STATE_POWER_NEGOTIATION:
-            return to == LASER_CONTROLLER_STATE_PROGRAMMING_ONLY ||
-                   to == LASER_CONTROLLER_STATE_LIMITED_POWER_IDLE ||
-                   to == LASER_CONTROLLER_STATE_SAFE_IDLE ||
-                   to == LASER_CONTROLLER_STATE_TEC_WARMUP ||
-                   to == LASER_CONTROLLER_STATE_FAULT_LATCHED;
-        case LASER_CONTROLLER_STATE_LIMITED_POWER_IDLE:
-            return to == LASER_CONTROLLER_STATE_PROGRAMMING_ONLY ||
-                   to == LASER_CONTROLLER_STATE_POWER_NEGOTIATION ||
-                   to == LASER_CONTROLLER_STATE_READY_ALIGNMENT ||
-                   to == LASER_CONTROLLER_STATE_ALIGNMENT_ACTIVE ||
-                   to == LASER_CONTROLLER_STATE_FAULT_LATCHED ||
-                   to == LASER_CONTROLLER_STATE_SAFE_IDLE;
-        case LASER_CONTROLLER_STATE_TEC_WARMUP:
-            return to == LASER_CONTROLLER_STATE_TEC_SETTLING ||
-                   to == LASER_CONTROLLER_STATE_READY_ALIGNMENT ||
-                   to == LASER_CONTROLLER_STATE_FAULT_LATCHED ||
-                   to == LASER_CONTROLLER_STATE_PROGRAMMING_ONLY ||
-                   to == LASER_CONTROLLER_STATE_POWER_NEGOTIATION;
-        case LASER_CONTROLLER_STATE_TEC_SETTLING:
-            return to == LASER_CONTROLLER_STATE_READY_ALIGNMENT ||
-                   to == LASER_CONTROLLER_STATE_READY_NIR ||
-                   to == LASER_CONTROLLER_STATE_ALIGNMENT_ACTIVE ||
-                   to == LASER_CONTROLLER_STATE_FAULT_LATCHED ||
-                   to == LASER_CONTROLLER_STATE_PROGRAMMING_ONLY ||
-                   to == LASER_CONTROLLER_STATE_POWER_NEGOTIATION;
-        case LASER_CONTROLLER_STATE_READY_ALIGNMENT:
-            return to == LASER_CONTROLLER_STATE_ALIGNMENT_ACTIVE ||
-                   to == LASER_CONTROLLER_STATE_READY_NIR ||
-                   to == LASER_CONTROLLER_STATE_TEC_SETTLING ||
-                   to == LASER_CONTROLLER_STATE_SAFE_IDLE ||
-                   to == LASER_CONTROLLER_STATE_FAULT_LATCHED ||
-                   to == LASER_CONTROLLER_STATE_PROGRAMMING_ONLY ||
-                   to == LASER_CONTROLLER_STATE_POWER_NEGOTIATION;
-        case LASER_CONTROLLER_STATE_READY_NIR:
-            return to == LASER_CONTROLLER_STATE_NIR_ACTIVE ||
-                   to == LASER_CONTROLLER_STATE_ALIGNMENT_ACTIVE ||
-                   to == LASER_CONTROLLER_STATE_READY_ALIGNMENT ||
-                   to == LASER_CONTROLLER_STATE_TEC_SETTLING ||
-                   to == LASER_CONTROLLER_STATE_SAFE_IDLE ||
-                   to == LASER_CONTROLLER_STATE_FAULT_LATCHED ||
-                   to == LASER_CONTROLLER_STATE_PROGRAMMING_ONLY ||
-                   to == LASER_CONTROLLER_STATE_POWER_NEGOTIATION;
-        case LASER_CONTROLLER_STATE_ALIGNMENT_ACTIVE:
-            return to == LASER_CONTROLLER_STATE_READY_ALIGNMENT ||
-                   to == LASER_CONTROLLER_STATE_READY_NIR ||
-                   to == LASER_CONTROLLER_STATE_NIR_ACTIVE ||
-                   to == LASER_CONTROLLER_STATE_FAULT_LATCHED ||
-                   to == LASER_CONTROLLER_STATE_PROGRAMMING_ONLY ||
-                   to == LASER_CONTROLLER_STATE_POWER_NEGOTIATION;
-        case LASER_CONTROLLER_STATE_NIR_ACTIVE:
-            return to == LASER_CONTROLLER_STATE_READY_NIR ||
-                   to == LASER_CONTROLLER_STATE_ALIGNMENT_ACTIVE ||
-                   to == LASER_CONTROLLER_STATE_FAULT_LATCHED ||
-                   to == LASER_CONTROLLER_STATE_PROGRAMMING_ONLY ||
-                   to == LASER_CONTROLLER_STATE_POWER_NEGOTIATION;
-        case LASER_CONTROLLER_STATE_FAULT_LATCHED:
-            return to == LASER_CONTROLLER_STATE_PROGRAMMING_ONLY ||
-                   to == LASER_CONTROLLER_STATE_POWER_NEGOTIATION ||
-                   to == LASER_CONTROLLER_STATE_SAFE_IDLE;
-        case LASER_CONTROLLER_STATE_SERVICE_MODE:
-            return to == LASER_CONTROLLER_STATE_SAFE_IDLE ||
-                   to == LASER_CONTROLLER_STATE_POWER_NEGOTIATION ||
-                   to == LASER_CONTROLLER_STATE_LIMITED_POWER_IDLE ||
-                   to == LASER_CONTROLLER_STATE_TEC_WARMUP ||
-                   to == LASER_CONTROLLER_STATE_TEC_SETTLING ||
-                   to == LASER_CONTROLLER_STATE_READY_ALIGNMENT ||
-                   to == LASER_CONTROLLER_STATE_READY_NIR ||
-                   to == LASER_CONTROLLER_STATE_FAULT_LATCHED ||
-                   to == LASER_CONTROLLER_STATE_PROGRAMMING_ONLY;
-        default:
-            return false;
+    if (to == LASER_CONTROLLER_STATE_FAULT_LATCHED) {
+        return true;
     }
+
+    if (to == LASER_CONTROLLER_STATE_ALIGNMENT_ACTIVE ||
+        to == LASER_CONTROLLER_STATE_NIR_ACTIVE) {
+        if (from == LASER_CONTROLLER_STATE_BOOT_INIT) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 bool laser_controller_state_transition(

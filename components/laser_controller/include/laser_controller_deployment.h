@@ -69,6 +69,18 @@ typedef struct {
     laser_controller_nm_t target_lambda_nm;
 } laser_controller_deployment_target_t;
 
+/*
+ * `laser_controller_deployment_ready_truth_t` — live snapshot of the
+ * ready-posture observables, refreshed every tick while
+ * `deployment.active` is true. NOT frozen at READY_POSTURE pass — the
+ * fields are published for host diagnostics and the operator expects
+ * them to reflect the current hardware state, not a stale snapshot.
+ *
+ * The READY_POSTURE step itself reads `sbdn_high`, `pcn_low`, and
+ * `driver_loop_good` to qualify its advance, but those fields stay
+ * correct across ticks because they mirror the committed
+ * `last_outputs` / `last_inputs`, not a one-shot capture.
+ */
 typedef struct {
     bool tec_rail_pgood_raw;
     bool tec_rail_pgood_filtered;

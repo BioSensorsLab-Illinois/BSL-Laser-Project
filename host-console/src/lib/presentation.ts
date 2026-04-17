@@ -144,6 +144,24 @@ export function computePowerHeadroomPercent(snapshot: DeviceSnapshot): number {
   return clampPercent((estimate.pdHeadroomW / snapshot.pd.negotiatedPowerW) * 100)
 }
 
+/*
+ * Power usage as a percentage of the negotiated PD budget. Inverse of
+ * `computePowerHeadroomPercent`. Used by the StatusRail "Power usage"
+ * tag so the progress bar fills as the device draws more power
+ * (intuitive direction). Includes NIR + TEC + green alignment + ToF
+ * LED draws (2026-04-16 user spec).
+ */
+export function computePowerUsagePercent(snapshot: DeviceSnapshot): number {
+  if (!snapshot.pd.contractValid || snapshot.pd.negotiatedPowerW <= 0) {
+    return 0
+  }
+
+  const estimate = deriveBenchEstimate(snapshot)
+  return clampPercent(
+    (estimate.totalEstimatedInputPowerW / snapshot.pd.negotiatedPowerW) * 100,
+  )
+}
+
 export function computeDistanceWindowPercent(snapshot: DeviceSnapshot): number {
   const distance = getTofDisplayDistanceM(snapshot)
 

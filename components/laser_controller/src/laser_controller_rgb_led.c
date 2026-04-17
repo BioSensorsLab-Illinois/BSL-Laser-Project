@@ -90,6 +90,28 @@
  *   PWM2 = G (OUT2)
  */
 
+/*
+ * Per-channel brightness scaling (2026-04-17 user directive).
+ * The RGB die in the button-board module has very unequal native
+ * efficiency: at the same PWM duty, red emits much less perceived
+ * brightness than green/blue. Without scaling, "red" looks dim,
+ * "blue" overwhelms, and mixed colors (orange, white) read as cyan.
+ *
+ * Scale each channel by these percentages before writing PWM. Red is
+ * the limiter so it stays at 100; green and blue are dimmed to roughly
+ * match red's perceived brightness. These values are reasonable
+ * starting points — tune by eye against the bench unit if needed.
+ */
+#define TLC59116_RED_SCALE_PCT     100U
+#define TLC59116_GREEN_SCALE_PCT    45U
+#define TLC59116_BLUE_SCALE_PCT     35U
+
+static uint8_t laser_controller_rgb_led_scale(uint8_t value, uint32_t scale_pct)
+{
+    const uint32_t scaled = ((uint32_t)value * scale_pct) / 100U;
+    return (uint8_t)(scaled > 255U ? 255U : scaled);
+}
+
 static esp_err_t laser_controller_rgb_led_write_reg(uint8_t reg, uint8_t value)
 {
     const uint8_t tx[2] = { reg, value };
@@ -263,6 +285,19 @@ esp_err_t laser_controller_rgb_led_apply(
         effective.g = 0U;
         effective.b = 0U;
         effective.blink = false;
+    } else {
+        /*
+         * Apply per-channel scaling so red, green, and blue read with
+         * roughly matched perceived brightness on the actual button-board
+         * RGB die. App-level color choices (e.g. orange = 255,140,0) are
+         * pre-tuned for the post-scale output. (2026-04-17)
+         */
+        effective.r = laser_controller_rgb_led_scale(
+            effective.r, TLC59116_RED_SCALE_PCT);
+        effective.g = laser_controller_rgb_led_scale(
+            effective.g, TLC59116_GREEN_SCALE_PCT);
+        effective.b = laser_controller_rgb_led_scale(
+            effective.b, TLC59116_BLUE_SCALE_PCT);
     }
 
     /* Dirty-compare: skip bus traffic when nothing changed. */

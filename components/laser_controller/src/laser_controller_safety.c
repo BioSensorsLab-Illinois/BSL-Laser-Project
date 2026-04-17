@@ -188,21 +188,19 @@ void laser_controller_safety_evaluate(
     decision->request_nir = snapshot->host_request_nir;
 
     /*
-     * Button-driven requests are active ONLY in BINARY_TRIGGER runtime mode.
-     * In MODULATED_HOST the host is the sole source of NIR requests; button
-     * state is still read and published for telemetry, but does not drive
-     * decisions. This matches the documented nir_blocked_reason taxonomy
-     * and the user's 2026-04-15 directive that binary_trigger is the
-     * button-control operator mode.
+     * Buttons are the primary post-deployment trigger surface (2026-04-17
+     * user directive). Effective whenever deployment is ready_idle and
+     * the board is reachable, regardless of the runtime_mode toggle.
+     * The toggle still gates the host-side `requested_nir` path so that
+     * `operate.set_output` only takes effect in MODULATED_HOST mode.
      *
-     * `allow_missing_buttons` is honored even in BINARY_TRIGGER so service
-     * mode can exercise the rest of the runtime even when the button board
-     * is absent.
+     * `allow_missing_buttons` is honored so service mode can exercise the
+     * rest of the runtime even when the button board is absent.
      */
     const bool buttons_effective =
         !snapshot->allow_missing_buttons &&
-        snapshot->runtime_mode ==
-            LASER_CONTROLLER_RUNTIME_MODE_BINARY_TRIGGER &&
+        snapshot->deployment_active &&
+        snapshot->deployment_ready_idle &&
         hw->button.board_reachable;
 
     if (buttons_effective) {
@@ -347,19 +345,33 @@ void laser_controller_safety_evaluate(
         }
     }
 
-    if (!snapshot->service_mode_requested &&
-        !snapshot->service_mode_active &&
-        hw->ld_rail_pgood &&
-        !snapshot->driver_operate_expected &&
-        !snapshot->ready_idle_bias_allowed &&
-        hw->measured_laser_current_a > config->thresholds.off_current_threshold_a &&
-        !decision->request_nir) {
-        laser_controller_set_fault(
-            decision,
-            LASER_CONTROLLER_FAULT_UNEXPECTED_CURRENT,
-            LASER_CONTROLLER_FAULT_CLASS_SYSTEM_MAJOR,
-            "current present while nir not requested");
-    }
+    /*
+     * UNEXPECTED_CURRENT supervision — REMOVED 2026-04-16 per user
+     * directive ("this shouldn't be a thing at all").
+     *
+     * Rationale: the LIO current-sense line is fundamentally
+     * unreliable for this heuristic.
+     *   - When SBDN=OFF the pin floats and reads arbitrary residual.
+     *   - When SBDN=STANDBY or ON with PCN low (LISL idle bias), real
+     *     bias current up to ~0.3 A is expected and normal.
+     *   - When SBDN=ON with PCN high, the driver is operating and
+     *     current is the entire point.
+     * That leaves no situation where "current while NIR not
+     * requested" reliably indicates a fault vs. a legitimate bias or
+     * a noise floor.
+     *
+     * Primary protection against a stuck-on laser driver remains:
+     *   - Hardware SBDN=OFF fast-shutdown (pulled low on any
+     *     SYSTEM_MAJOR fault, see laser_controller_app.c).
+     *   - LD_OVERTEMP detection (below) still fires if the driver
+     *     actually runs away and heats up.
+     *   - Rail-PGOOD watchdogs and TEC-before-LD sequencing.
+     *   - Per-command current clamps at the DAC limit.
+     *
+     * If the heuristic is ever re-added, it MUST be gated on SBDN
+     * committed OFF with a much higher threshold AND an N-tick
+     * hysteresis.
+     */
 
     /*
      * LD_OVERTEMP gate: only evaluate when both the LD rail has been up
@@ -406,6 +418,17 @@ void laser_controller_safety_evaluate(
         }
     }
 
+    /*
+     * LD_LOOP_BAD is an operational indicator, not a latched safety
+     * interlock (user directive 2026-04-16). When driver_loop_good
+     * drops during runtime, NIR is immediately disabled via the auto-
+     * clear interlock path. When loop_good returns, NIR re-enables
+     * without requiring manual clear_faults.
+     *
+     * Deployment checklist validation (app.c ready_posture step) still
+     * uses LD_LOOP_BAD as a deployment failure — that path is separate
+     * and unchanged.
+     */
     if (!interlocks_disabled &&
         hw->ld_rail_pgood &&
         snapshot->driver_operate_expected &&
@@ -413,7 +436,7 @@ void laser_controller_safety_evaluate(
         laser_controller_set_fault(
             decision,
             LASER_CONTROLLER_FAULT_LD_LOOP_BAD,
-            LASER_CONTROLLER_FAULT_CLASS_SAFETY_LATCHED,
+            LASER_CONTROLLER_FAULT_CLASS_INTERLOCK_AUTO_CLEAR,
             "laser driver loop not good");
     }
 
@@ -468,17 +491,24 @@ void laser_controller_safety_evaluate(
         decision->request_nir &&
         decision->allow_nir;
     /*
-     * Three-state SBDN semantics (user directive 2026-04-14, verified against
-     * ATLS6A214 datasheet):
-     *   - NIR requested and allowed  → OPERATE, drive HIGH.
-     *   - NIR not requested or not allowed → STANDBY (Hi-Z, 2.25 V via
-     *     R27/R28 divider). Driver is idle and ready to re-enter operate in
-     *     20 ms without going through full shutdown cycle.
+     * SBDN policy (user directive 2026-04-17, supersedes the 2026-04-14
+     * three-state policy):
+     *   - In deployment + ready_idle + no fault → drive HIGH always.
+     *     Driver stays armed throughout deployment; PCN selects low (LISL,
+     *     idle-bias) vs high (LISH, full) current. NIR firing flips PCN
+     *     HIGH; no SBDN re-arming penalty.
+     *   - Outside deployment (boot, post-exit, no power) → STANDBY (Hi-Z,
+     *     2.25 V via R27/R28 divider). Driver idle, low quiescent.
      *   - The caller (app.c run_fast_cycle) overrides with OFF on any
-     *     SYSTEM_MAJOR fault / interlock hold, so this branch never leaks a
-     *     STANDBY through a fault state.
+     *     SYSTEM_MAJOR fault / interlock-hold so this branch never leaks
+     *     a STANDBY or HIGH through a fault. After fault clears, the next
+     *     tick re-evaluates and SBDN goes back to HIGH automatically.
      */
-    decision->sbdn_state = decision->nir_output_enable
-        ? LASER_CONTROLLER_SBDN_STATE_ON
-        : LASER_CONTROLLER_SBDN_STATE_STANDBY;
+    if (snapshot->deployment_active &&
+        snapshot->deployment_ready_idle &&
+        !decision->fault_present) {
+        decision->sbdn_state = LASER_CONTROLLER_SBDN_STATE_ON;
+    } else {
+        decision->sbdn_state = LASER_CONTROLLER_SBDN_STATE_STANDBY;
+    }
 }

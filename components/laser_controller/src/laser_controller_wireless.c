@@ -16,6 +16,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/portmacro.h"
 #include "lwip/ip4_addr.h"
+#include "lwip/sockets.h"
 #include "nvs.h"
 
 #include "laser_controller_comms.h"
@@ -23,16 +24,32 @@
 #define LASER_CONTROLLER_WIRELESS_AP_SSID          "BSL-HTLS-Bench"
 #define LASER_CONTROLLER_WIRELESS_AP_PASSWORD      "bslbench2026"
 #define LASER_CONTROLLER_WIRELESS_AP_CHANNEL       6
-#define LASER_CONTROLLER_WIRELESS_MAX_CLIENTS      1
+/*
+ * AP max_connection bumped 1 -> 4 (2026-04-16): refresh-driven
+ * re-association overlap was rejecting the new association before the
+ * old one fully tore down, leaving the GUI unable to reconnect.
+ */
+#define LASER_CONTROLLER_WIRELESS_MAX_CLIENTS      4
 #define LASER_CONTROLLER_WIRELESS_WS_URI           "/ws"
 #define LASER_CONTROLLER_WIRELESS_AP_WS_URL        "ws://192.168.4.1/ws"
-#define LASER_CONTROLLER_WIRELESS_CLIENT_SLOTS     2
+/*
+ * CLIENT_SLOTS bumped 2 -> 4 (2026-04-16): two stale refreshes used
+ * to fill both slots with dead FDs; new connections still work via
+ * LRU eviction but the broadcast loop wasted time on the dead FDs
+ * until CLIENT_DROP_FAILURES accumulated. Headroom plus the new
+ * close callback (registered in start_http_server) keep slots clean.
+ */
+#define LASER_CONTROLLER_WIRELESS_CLIENT_SLOTS     4
 #define LASER_CONTROLLER_WIRELESS_MAX_FRAME_LEN    768U
 #define LASER_CONTROLLER_WIRELESS_NVS_NAMESPACE    "laser_wifi"
 #define LASER_CONTROLLER_WIRELESS_NVS_KEY          "config"
 #define LASER_CONTROLLER_WIRELESS_CONFIG_VERSION   1U
 #define LASER_CONTROLLER_WIRELESS_PASSWORD_LEN     65U
-#define LASER_CONTROLLER_WIRELESS_CLIENT_DROP_FAILURES 4U
+/*
+ * Drop threshold tightened 4 -> 2 (2026-04-16): defense in depth in
+ * case the close callback doesn't fire (e.g. on TCP RST without FIN).
+ */
+#define LASER_CONTROLLER_WIRELESS_CLIENT_DROP_FAILURES 2U
 
 typedef struct {
     uint32_t version;
@@ -59,9 +76,9 @@ static bool s_station_connecting;
 static bool s_station_connected;
 static laser_controller_wireless_mode_t s_mode =
     LASER_CONTROLLER_WIRELESS_MODE_SOFTAP;
-static int s_client_fds[LASER_CONTROLLER_WIRELESS_CLIENT_SLOTS] = { -1, -1 };
-static uint8_t s_client_send_failures[LASER_CONTROLLER_WIRELESS_CLIENT_SLOTS] = { 0U, 0U };
-static uint32_t s_client_generations[LASER_CONTROLLER_WIRELESS_CLIENT_SLOTS] = { 0U, 0U };
+static int s_client_fds[LASER_CONTROLLER_WIRELESS_CLIENT_SLOTS] = { -1, -1, -1, -1 };
+static uint8_t s_client_send_failures[LASER_CONTROLLER_WIRELESS_CLIENT_SLOTS] = { 0U, 0U, 0U, 0U };
+static uint32_t s_client_generations[LASER_CONTROLLER_WIRELESS_CLIENT_SLOTS] = { 0U, 0U, 0U, 0U };
 static uint32_t s_client_generation_counter;
 static char s_active_ssid[33] = LASER_CONTROLLER_WIRELESS_AP_SSID;
 static char s_station_ssid[33];
@@ -651,6 +668,29 @@ static esp_err_t laser_controller_wireless_meta_handler(httpd_req_t *req)
     return httpd_resp_sendstr(req, response);
 }
 
+/*
+ * httpd close callback. Fires when ESP-IDF tears down a session — TCP
+ * FIN, RST, lru-purge, or explicit close. Without this, dead WS FDs
+ * stayed in s_client_fds[] until CLIENT_DROP_FAILURES sends accumulated
+ * (~seconds), which broke page-refresh and multi-tab use.
+ *
+ * IMPORTANT: we deliberately do NOT call `close(sockfd)` here. Earlier
+ * iterations did, per ESP-IDF docs ("the callback owns closing the
+ * socket"). In practice, calling close() raced with kernel FD reuse:
+ * a fresh WS connection landed on the same FD number while our close
+ * was in flight, causing the new session's first frame to fail and the
+ * GUI to hang on "Waiting for controller firmware handshake…". The
+ * httpd's `lru_purge_enable=true` and the kernel TCP layer reap the
+ * socket on their own; explicit close() was strictly harmful here.
+ * (2026-04-17)
+ */
+static void laser_controller_wireless_session_closed(
+    httpd_handle_t hd, int sockfd)
+{
+    (void)hd;
+    laser_controller_wireless_remove_client(sockfd);
+}
+
 static void laser_controller_wireless_start_http_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
@@ -672,8 +712,14 @@ static void laser_controller_wireless_start_http_server(void)
         return;
     }
 
-    config.max_open_sockets = 4;
+    /*
+     * max_open_sockets bumped 4 -> 7 (2026-04-16): the ESP-IDF default
+     * cap is 7. Reaching the previous limit during a refresh-storm left
+     * httpd unable to accept the new TCP connection until lru-purge ran.
+     */
+    config.max_open_sockets = 7;
     config.lru_purge_enable = true;
+    config.close_fn = laser_controller_wireless_session_closed;
 
     if (httpd_start(&s_server, &config) != ESP_OK) {
         ESP_LOGE(TAG, "http server start failed");

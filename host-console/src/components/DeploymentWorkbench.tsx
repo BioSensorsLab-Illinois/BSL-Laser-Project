@@ -48,6 +48,7 @@ type SafetyDraft = {
   tecMaxCommandC: string
   tecReadyToleranceC: string
   maxLaserCurrentA: string
+  lioVoltageOffsetV: string
 }
 
 const deploymentStepDetails: Record<
@@ -125,6 +126,7 @@ function makeSafetyDraft(snapshot: DeviceSnapshot): SafetyDraft {
     tecMaxCommandC: formatNumber(snapshot.safety.tecMaxCommandC, 1),
     tecReadyToleranceC: formatNumber(snapshot.safety.tecReadyToleranceC, 2),
     maxLaserCurrentA: formatNumber(snapshot.safety.maxLaserCurrentA, 2),
+    lioVoltageOffsetV: formatNumber(snapshot.safety.lioVoltageOffsetV, 4),
   }
 }
 
@@ -319,6 +321,10 @@ export function DeploymentWorkbench({
         max_laser_current_a: parseNumber(
           safetyDraft.maxLaserCurrentA,
           liveSnapshot.safety.maxLaserCurrentA,
+        ),
+        lio_voltage_offset_v: parseNumber(
+          safetyDraft.lioVoltageOffsetV,
+          liveSnapshot.safety.lioVoltageOffsetV,
         ),
       },
       { timeoutMs: 3500 },
@@ -577,6 +583,7 @@ export function DeploymentWorkbench({
               ['TEC max command (C)', 'tecMaxCommandC'],
               ['TEC ready tolerance (C)', 'tecReadyToleranceC'],
               ['Max laser current (A)', 'maxLaserCurrentA'],
+              ['LD LIO offset (V)', 'lioVoltageOffsetV'],
             ] as Array<[string, keyof SafetyDraft]>
           ).map(([label, key]) => (
             <label key={key} className="field">

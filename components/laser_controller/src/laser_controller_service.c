@@ -27,6 +27,16 @@
 #define LASER_CONTROLLER_SERVICE_TOF_CAL_VERSION 1U
 #define LASER_CONTROLLER_SERVICE_PROFILE_VER   6U
 #define LASER_CONTROLLER_SERVICE_PROFILE_VER_MIN 3U
+/*
+ * Dedicated NVS u32 (milliamps, current_a × 1000) for the persisted
+ * deployment-default NIR current. Separate from the main profile blob
+ * so adding it doesn't require a version bump + migration chain.
+ * Saved by `operate.save_deployment_defaults` (operator button) and on
+ * the auto-save path; loaded on boot to seed the bench storage so the
+ * 5-second-headless auto-deploy fires at the operator's last-saved
+ * current. Range: 0..6000 mA. (2026-04-16 user feature.)
+ */
+#define LASER_CONTROLLER_SERVICE_DEPLOY_CURRENT_NVS_KEY "deploy_iA_x1k"
 #define LASER_CONTROLLER_SERVICE_DAC_MAX_V     2.5f
 #define LASER_CONTROLLER_SERVICE_DEFAULT_TEC_CHANNEL_V 0.821104f
 #define LASER_CONTROLLER_SERVICE_TOF_ILLUMINATION_PWM_HZ 20000U
@@ -453,6 +463,29 @@ static void laser_controller_service_normalize_pd_profiles(
     const laser_controller_service_pd_profile_t *profiles,
     laser_controller_service_pd_profile_t *normalized_profiles)
 {
+    /*
+     * PDO1 constraints — STUSB4500 hardware limitation:
+     *
+     *   The STUSB4500 datasheet fixes PDO1 at 5 V per USB-PD sink
+     *   specification. The chip enforces this internally even when
+     *   DPM_PDO1_0 is written with a different voltage — the chip
+     *   ignores the voltage field on PDO1 and always presents 5 V
+     *   during initial negotiation. Only the OPERATING CURRENT on
+     *   PDO1 is programmable.
+     *
+     *   `enabled` must stay TRUE — the STUSB4500 requires PDO1 as the
+     *   fallback profile and refuses to run without it.
+     *
+     * So we:
+     *   - force voltage to 5.0 V (matches chip behavior),
+     *   - honor operator-provided current (preserving the 0.5–5 A
+     *     usable range that the chip supports), defaulting to 3.0 A
+     *     when no profile was supplied or the value is zero.
+     *
+     * Attempt at 2026-04-16 to make PDO1 voltage editable was backed
+     * out — per user test the change had no effect because the chip
+     * silently rejects it.
+     */
     if (normalized_profiles == NULL) {
         return;
     }
@@ -2133,6 +2166,71 @@ static bool laser_controller_service_load_tof_calibration_locked(
     return true;
 }
 
+/*
+ * Persisted deployment-default NIR current (2026-04-16 user feature).
+ * Stored as u32 milliamps in its own NVS key — separate from the main
+ * service profile blob to avoid disturbing the v3..v6 migration chain.
+ * Range clamp 0..6000 mA at save; load returns 0.0 if the key is
+ * missing (clean device) or out of range (corruption).
+ */
+esp_err_t laser_controller_service_save_deployment_current_a(
+    laser_controller_amps_t current_a)
+{
+    nvs_handle_t handle = 0;
+    uint32_t milliamps;
+
+    if (current_a < 0.0f) {
+        current_a = 0.0f;
+    }
+    if (current_a > 6.0f) {
+        current_a = 6.0f;
+    }
+    milliamps = (uint32_t)(current_a * 1000.0f + 0.5f);
+
+    esp_err_t err = nvs_open(
+        LASER_CONTROLLER_SERVICE_NVS_NAMESPACE,
+        NVS_READWRITE,
+        &handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_u32(
+        handle,
+        LASER_CONTROLLER_SERVICE_DEPLOY_CURRENT_NVS_KEY,
+        milliamps);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return err;
+}
+
+laser_controller_amps_t laser_controller_service_load_deployment_current_a(void)
+{
+    nvs_handle_t handle = 0;
+    uint32_t milliamps = 0U;
+
+    esp_err_t err = nvs_open(
+        LASER_CONTROLLER_SERVICE_NVS_NAMESPACE,
+        NVS_READONLY,
+        &handle);
+    if (err != ESP_OK) {
+        return 0.0f;
+    }
+    err = nvs_get_u32(
+        handle,
+        LASER_CONTROLLER_SERVICE_DEPLOY_CURRENT_NVS_KEY,
+        &milliamps);
+    nvs_close(handle);
+    if (err != ESP_OK) {
+        return 0.0f;
+    }
+    if (milliamps > 6000U) {
+        return 0.0f;
+    }
+    return (laser_controller_amps_t)milliamps / 1000.0f;
+}
+
 void laser_controller_service_get_tof_calibration(
     laser_controller_tof_calibration_t *out)
 {
@@ -2279,7 +2377,7 @@ esp_err_t laser_controller_service_set_pd_config(
     laser_controller_service_touch_profile_locked();
     laser_controller_service_write_action_locked(
         err == ESP_OK ?
-            "USB-PD runtime PDOs applied. PDO1 is kept at 5 V fallback and thresholds are updated." :
+            "USB-PD runtime PDOs applied. PDO1 voltage is fixed at 5 V by STUSB4500; PDO1 current and full PDO2/PDO3 fields honor operator input." :
             "USB-PD thresholds saved, but the STUSB4500 runtime PDO write did not complete.",
         now_ms);
     laser_controller_service_copy_text(

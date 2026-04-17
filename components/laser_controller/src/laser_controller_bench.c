@@ -129,7 +129,13 @@ void laser_controller_bench_init_defaults(void)
     portENTER_CRITICAL(&s_bench_lock);
     memset(&s_bench_status, 0, sizeof(s_bench_status));
     s_bench_status.target_mode = LASER_CONTROLLER_BENCH_TARGET_MODE_LAMBDA;
-    s_bench_status.runtime_mode = LASER_CONTROLLER_RUNTIME_MODE_MODULATED_HOST;
+    /*
+     * Default runtime_mode is BINARY_TRIGGER (2026-04-17 user directive):
+     * the main button is the primary post-deployment trigger surface,
+     * so the device boots in button-control mode. The toggle stays in
+     * the GUI for switching to host control during bench testing.
+     */
+    s_bench_status.runtime_mode = LASER_CONTROLLER_RUNTIME_MODE_BINARY_TRIGGER;
     s_bench_status.illumination_frequency_hz =
         LASER_CONTROLLER_BENCH_DEFAULT_LED_PWM_HZ;
     s_bench_status.modulation_frequency_hz = LASER_CONTROLLER_BENCH_DEFAULT_PWM_HZ;

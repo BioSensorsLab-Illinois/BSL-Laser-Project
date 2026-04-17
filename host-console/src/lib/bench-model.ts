@@ -10,6 +10,13 @@ export const LASER_FORWARD_VOLTAGE_V = 3
 export const LASER_FULL_OPTICAL_POWER_W = 5
 export const DRIVER_EFFICIENCY = 0.9
 export const TEC_EFFICIENCY = 0.9
+/* Green alignment laser is a fixed-current driver — ~0.4 W input
+ * whenever the green-enable line is asserted (user spec 2026-04-16). */
+export const GREEN_ALIGNMENT_POWER_W = 0.4
+/* ToF-board front LED: ~3 W at 50 % PWM duty → linear 6 W at 100 %
+ * (user spec 2026-04-16). Scales linearly with the active duty
+ * because the LED driver is a buck-set-current PWM. */
+export const TOF_LED_POWER_AT_FULL_W = 6.0
 
 export interface BenchEstimate {
   commandedOpticalPowerW: number
@@ -19,6 +26,8 @@ export interface BenchEstimate {
   tecElectricalPowerW: number
   tecInputPowerW: number
   tecCoolingPowerW: number
+  greenAlignmentInputPowerW: number
+  tofLedInputPowerW: number
   totalEstimatedInputPowerW: number
   pdHeadroomW: number
   targetTempC: number
@@ -116,7 +125,33 @@ export function deriveBenchEstimate(snapshot: DeviceSnapshot): BenchEstimate {
   const tecElectricalPowerW = Math.abs(snapshot.tec.currentA * snapshot.tec.voltageV)
   const tecInputPowerW = tecElectricalPowerW > 0 ? tecElectricalPowerW / TEC_EFFICIENCY : 0
   const tecCoolingPowerW = tecElectricalPowerW * TEC_EFFICIENCY
-  const totalEstimatedInputPowerW = laserInputPowerW + tecInputPowerW
+  /*
+   * Green alignment input power: fixed 0.4 W whenever the alignment
+   * line is asserted. Constant per the alignment driver datasheet
+   * (user spec 2026-04-16).
+   */
+  const greenAlignmentInputPowerW = snapshot.laser.alignmentEnabled
+    ? GREEN_ALIGNMENT_POWER_W
+    : 0
+  /*
+   * ToF-board front LED draw. Brightness source-of-truth: when the
+   * deployment-armed path owns the LED (button_runtime publishes
+   * ledOwned = true), use buttonBoard.ledBrightnessPct; otherwise
+   * fall back to the bench `illuminationDutyCyclePct`. Linear power
+   * scaling: 0 % → 0 W, 50 % → 3 W, 100 % → 6 W (user spec).
+   */
+  const ledDutyPct = snapshot.buttonBoard.ledOwned
+    ? snapshot.buttonBoard.ledBrightnessPct
+    : bench.illuminationEnabled
+      ? bench.illuminationDutyCyclePct
+      : 0
+  const tofLedInputPowerW =
+    (clamp(ledDutyPct, 0, 100) / 100) * TOF_LED_POWER_AT_FULL_W
+  const totalEstimatedInputPowerW =
+    laserInputPowerW +
+    tecInputPowerW +
+    greenAlignmentInputPowerW +
+    tofLedInputPowerW
   const pdHeadroomW = snapshot.pd.negotiatedPowerW - totalEstimatedInputPowerW
   const targetTempC =
     bench.targetMode === 'lambda'
@@ -135,6 +170,8 @@ export function deriveBenchEstimate(snapshot: DeviceSnapshot): BenchEstimate {
     tecElectricalPowerW,
     tecInputPowerW,
     tecCoolingPowerW,
+    greenAlignmentInputPowerW,
+    tofLedInputPowerW,
     totalEstimatedInputPowerW,
     pdHeadroomW,
     targetTempC,

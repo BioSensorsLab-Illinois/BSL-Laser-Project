@@ -297,6 +297,17 @@ void laser_controller_service_set_runtime_target(
     laser_controller_celsius_t target_temp_c,
     laser_controller_nm_t target_lambda_nm,
     laser_controller_time_ms_t now_ms);
+/*
+ * Persist / load the deployment-default NIR current. Stored in its own
+ * NVS u32 key (mA). Save returns ESP_OK on success or the NVS error.
+ * Load returns 0.0 if the key is missing (clean device) so the bench
+ * boots safe-zero unless explicitly saved by the operator.
+ * (2026-04-16 user feature: 5-second-headless auto-deploy + GUI
+ * "Save deployment defaults" button.)
+ */
+esp_err_t laser_controller_service_save_deployment_current_a(
+    laser_controller_amps_t current_a);
+laser_controller_amps_t laser_controller_service_load_deployment_current_a(void);
 esp_err_t laser_controller_service_set_tof_illumination(
     bool enabled,
     uint32_t duty_cycle_pct,

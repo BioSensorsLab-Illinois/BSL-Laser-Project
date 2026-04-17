@@ -10,7 +10,7 @@ import {
   computeDistanceWindowPercent,
   computePitchMarginDeg,
   computePitchMarginPercent,
-  computePowerHeadroomPercent,
+  computePowerUsagePercent,
   computeTecSettlePercent,
   formatEnumLabel,
   formatHorizonConditionDetail,
@@ -133,7 +133,7 @@ export function StatusRail({ snapshot, telemetryStore }: StatusRailProps) {
     true,
   )
   const estimate = deriveBenchEstimate(liveSnapshot)
-  const powerPercent = computePowerHeadroomPercent(liveSnapshot)
+  const powerPercent = computePowerUsagePercent(liveSnapshot)
   const distancePercent = computeDistanceWindowPercent(liveSnapshot)
   const pitchPercent = computePitchMarginPercent(liveSnapshot)
   const pitchMarginDeg = computePitchMarginDeg(liveSnapshot)
@@ -179,11 +179,18 @@ export function StatusRail({ snapshot, telemetryStore }: StatusRailProps) {
   const stats = [
     {
       key: 'power',
-      label: 'Power headroom',
+      label: 'Power usage',
       icon: PlugZap,
-      value: pdAvailability.available ? `${formatNumber(estimate.pdHeadroomW, 1)} W` : pdAvailability.value,
+      /*
+       * 2026-04-16 user spec: show "used / total" with the bar filling
+       * as draw climbs. `totalEstimatedInputPowerW` now sums NIR + TEC
+       * + green alignment + ToF LED (see bench-model.ts).
+       */
+      value: pdAvailability.available
+        ? `${formatNumber(estimate.totalEstimatedInputPowerW, 1)} / ${formatNumber(liveSnapshot.pd.negotiatedPowerW, 1)} W`
+        : pdAvailability.value,
       detail: pdAvailability.available
-        ? `${formatEnumLabel(liveSnapshot.session.powerTier)} from ${formatNumber(liveSnapshot.pd.negotiatedPowerW, 1)} W`
+        ? `${formatEnumLabel(liveSnapshot.session.powerTier)} · ${formatNumber(estimate.pdHeadroomW, 1)} W headroom`
         : pdAvailability.detail,
       progress: pdAvailability.available ? powerPercent : 0,
       tone:
@@ -191,9 +198,9 @@ export function StatusRail({ snapshot, telemetryStore }: StatusRailProps) {
           ? 'steady'
           : !liveSnapshot.pd.contractValid || liveSnapshot.pd.negotiatedPowerW <= 0
             ? 'critical'
-            : powerPercent < 18
+            : powerPercent > 82
               ? 'critical'
-              : powerPercent < 40
+              : powerPercent > 60
                 ? 'warning'
                 : 'steady',
       disabled: !pdAvailability.available,

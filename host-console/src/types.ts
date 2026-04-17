@@ -479,6 +479,16 @@ export interface ButtonBoardStatus {
   ledOwned: boolean
   triggerLockout: boolean
   triggerPhase: TriggerPhase
+  /*
+   * Diagnostic string from firmware explaining WHY the button-driven
+   * NIR path is currently blocked. Always non-empty: "none" if NIR
+   * can fire on stage1+stage2, otherwise a token like
+   * "fault: tof_out_of_range", "lockout-latched",
+   * "deployment-not-ready-idle", "ld-rail-not-good", etc. Surfaced in
+   * the Operate-page trigger card so the operator sees WHY the laser
+   * doesn't fire instead of guessing. (Added 2026-04-16.)
+   */
+  nirButtonBlockReason: string
 }
 
 export interface DacPeripheralReadback {
@@ -624,6 +634,14 @@ export interface FaultSummary {
   activeClass: string
   latchedCode: string
   latchedClass: string
+  /*
+   * Detail strings populated by firmware `record_fault` (added
+   * 2026-04-16). Empty string when no detail is present. Used by the
+   * Operate page fault banner to surface WHY a fault tripped — e.g.
+   * "illegal state transition X -> Y blocked" for UNEXPECTED_STATE.
+   */
+  activeReason: string
+  latchedReason: string
   activeCount: number
   tripCounter: number
   lastFaultAtIso: string | null
@@ -704,6 +722,8 @@ export interface RealtimeFaultSummary {
   activeClass: string
   latchedCode: string
   latchedClass: string
+  activeReason: string
+  latchedReason: string
   activeCount: number
   tripCounter: number
   triggerDiag: FaultTriggerDiag | null
@@ -769,6 +789,14 @@ export interface SafetyStatus {
    * 2026-04-15. Editable via `integrate.set_safety` while in service mode.
    */
   maxTofLedDutyCyclePct: number
+  /*
+   * LD LIO ADC voltage calibration offset (volts). Added to the IIR-
+   * filtered ADC sample before deriving measured laser current. User-
+   * observed bias was +70 mV; default 0.07 V (2026-04-17). Adjustable
+   * via the safety form to match per-unit divider tolerance. Validation
+   * clamps to ±0.5 V — beyond that is a wiring fault, not calibration.
+   */
+  lioVoltageOffsetV: number
   actualLambdaNm: number
   targetLambdaNm: number
   lambdaDriftNm: number

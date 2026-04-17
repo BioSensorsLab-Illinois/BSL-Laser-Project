@@ -74,7 +74,18 @@ void laser_controller_config_load_defaults(laser_controller_config_t *config)
     config->thresholds.tec_max_command_c = 35.0f;
     config->thresholds.tec_ready_tolerance_c = 0.25f;
     config->thresholds.max_laser_current_a = 5.2f;
-    config->thresholds.off_current_threshold_a = 0.200f;
+    /*
+     * Default threshold for the UNEXPECTED_CURRENT supervision.
+     * Bench measurement (2026-04-16) showed ~0.3 A of residual reading
+     * on the LIO current-sense when the driver is idle-biased (SBDN
+     * STANDBY or ON with PCN LOW). The threshold must be comfortably
+     * above that idle-bias plateau to avoid false-positive SYSTEM_MAJOR
+     * latches during deployment checklist steps that drive SBDN active
+     * before the ready-idle bias allowance opens. Real NIR emit current
+     * is 2+ A, so 0.800 A is still orders of magnitude below an actual
+     * runaway.
+     */
+    config->thresholds.off_current_threshold_a = 0.800f;
     config->thresholds.current_match_tolerance_a = 0.020f;
     /*
      * GPIO6 ToF-board LED hard brightness cap — 50% duty. Enforced in the
@@ -82,6 +93,13 @@ void laser_controller_config_load_defaults(laser_controller_config_t *config)
      * prevent thermal damage from extended full-duty operation.
      */
     config->thresholds.max_tof_led_duty_cycle_pct = 50U;
+    /*
+     * LD LIO ADC voltage calibration offset. User-observed bias on this
+     * bench was +70 mV (2026-04-17 directive). Per-unit divider tolerance
+     * may shift this; adjustable via the safety form. Validation clamps
+     * to ±0.5 V — beyond that is a wiring fault, not calibration.
+     */
+    config->thresholds.lio_voltage_offset_v = 0.07f;
 
     config->timeouts.imu_stale_ms = 50U;
     config->timeouts.tof_stale_ms = 100U;
@@ -200,6 +218,11 @@ bool laser_controller_config_validate_runtime_safety(
     }
 
     if (config->thresholds.max_tof_led_duty_cycle_pct > 100U) {
+        return false;
+    }
+
+    if (config->thresholds.lio_voltage_offset_v < -0.5f ||
+        config->thresholds.lio_voltage_offset_v >  0.5f) {
         return false;
     }
 

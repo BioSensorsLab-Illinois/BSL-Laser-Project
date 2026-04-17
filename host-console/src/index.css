@@ -5797,7 +5797,12 @@ code {
 
 .operate-v3__toolbar {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  /*
+   * Auto-fit so adding a 5th button (Save deployment defaults) doesn't
+   * squeeze the others. Each cell auto-sizes between 140 px min and
+   * 1 fr max. (2026-04-16: was hard-coded `repeat(4, minmax(0, 1fr))`.)
+   */
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
   gap: 8px;
   margin-top: 12px;
 }
@@ -5828,9 +5833,16 @@ code {
   color: var(--text-soft);
 }
 
+.operate-v3__fault-reason {
+  /* Reason string from firmware. Slightly stronger than the surrounding
+   * meta spans so the operator's eye lands on the WHY first. */
+  color: var(--text);
+  font-weight: 500;
+}
+
 .operate-v3__body {
   display: grid;
-  grid-template-columns: minmax(220px, 240px) minmax(0, 1fr);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 16px;
   align-items: start;
 }
@@ -5841,15 +5853,16 @@ code {
   }
 }
 
-.operate-v3__rail {
-  position: sticky;
-  top: 0;
-}
-
-.operate-v3__main {
+.operate-v3__main-left,
+.operate-v3__main-right {
   display: grid;
   gap: 16px;
-  min-width: 0;
+  align-content: start;
+}
+
+/* Ready truth + Causal log span both columns below the left/right pair. */
+.operate-v3__body > .panel-section {
+  grid-column: 1 / -1;
 }
 
 .operate-v3__steps {

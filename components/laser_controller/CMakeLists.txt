@@ -7,6 +7,15 @@ set(BSL_SIGNATURE_PROTOCOL_VERSION "host-v1")
 set(BSL_SIGNATURE_HARDWARE_SCOPE "main-controller")
 set(BSL_SIGNATURE_FIRMWARE_VERSION "${project_ver}")
 set(BSL_SIGNATURE_BOARD_NAME "${idf_target}")
+# 2026-04-16: capture compile time at build, not configure time, so the
+# host-console can actually tell which binary is on the device.
+# `string(TIMESTAMP …)` only fires at CMake configure — incremental
+# `idf.py build`s would bake the same stale timestamp forever, which
+# misled triage by making the firmware look older than it was.
+# Convention: -fmacro-prefix-map and __DATE__/__TIME__ are translation-unit
+# specific, so we still seed the configure-time string here as a fallback,
+# then the autogen .c.in file gets its own update by re-configuring whenever
+# any tracked source changes (added below via add_custom_command).
 string(TIMESTAMP BSL_SIGNATURE_BUILD_UTC "%Y-%m-%dT%H:%M:%SZ" UTC)
 set(
     BSL_SIGNATURE_PAYLOAD
@@ -57,3 +66,15 @@ idf_component_register(
 )
 
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wall -Wextra -Werror)
+
+# Force the firmware signature autogen .c to recompile on every build so
+# the embedded __DATE__ __TIME__ macros capture the actual compile time.
+# Without this, ninja's incremental build skips the recompile because the
+# source content didn't change, leaving build_utc stale across edits.
+# (2026-04-16 — context: triage was misled by a 12-hour-stale build_utc.)
+add_custom_target(bsl_signature_touch ALL
+    COMMAND ${CMAKE_COMMAND} -E touch_nocreate "${BSL_SIGNATURE_SOURCE}"
+    DEPENDS "${BSL_SIGNATURE_SOURCE}"
+    COMMENT "Refresh BSL firmware signature compile-time timestamp"
+)
+add_dependencies(${COMPONENT_LIB} bsl_signature_touch)

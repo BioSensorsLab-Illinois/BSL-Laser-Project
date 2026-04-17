@@ -391,7 +391,7 @@ export class MockTransport implements DeviceTransport {
     targetTempC: 58.7,
     targetLambdaNm: 786.1,
     targetMode: 'lambda',
-    runtimeMode: 'modulated_host',
+    runtimeMode: 'binary_trigger',
     firmwareVersion: 'laser-fw-0.2.0-bench',
     activeFault: 'none',
     faultLatched: false,
@@ -450,6 +450,7 @@ export class MockTransport implements DeviceTransport {
       maxLaserCurrentA: 5.2,
       offCurrentThresholdA: 0.2,
       maxTofLedDutyCyclePct: 50,
+      lioVoltageOffsetV: 0.07,
       actualLambdaNm: 786.1,
       targetLambdaNm: 786.1,
       lambdaDriftNm: 0,
@@ -2346,6 +2347,17 @@ export class MockTransport implements DeviceTransport {
         ledOwned: this.state.buttonLedOwned,
         triggerLockout: this.state.buttonNirLockout,
         triggerPhase: mockTriggerPhase(this.state),
+        nirButtonBlockReason: !this.state.deployment.active
+          ? 'deployment-not-active'
+          : !this.state.deployment.ready
+            ? 'deployment-not-ready'
+            : !this.state.deployment.readyIdle
+              ? 'deployment-not-ready-idle'
+              : this.state.faultLatched
+                ? `fault: ${this.state.activeFault}`
+                : this.state.buttonNirLockout
+                  ? 'lockout-latched'
+                  : 'none',
       },
       peripherals: {
         dac: {
@@ -2504,6 +2516,8 @@ export class MockTransport implements DeviceTransport {
         activeClass: this.state.faultLatched ? 'system_major' : 'none',
         latchedCode: this.state.faultLatched ? activeFaultCode : 'none',
         latchedClass: this.state.faultLatched ? 'system_major' : 'none',
+        activeReason: '',
+        latchedReason: '',
         activeCount: this.state.faultCount,
         tripCounter: this.state.tripCounter,
         lastFaultAtIso: this.state.lastFaultAtIso,

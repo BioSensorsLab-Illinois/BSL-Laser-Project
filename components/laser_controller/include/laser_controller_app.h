@@ -25,6 +25,14 @@ typedef struct {
     laser_controller_fault_class_t active_fault_class;
     laser_controller_fault_code_t latched_fault_code;
     laser_controller_fault_class_t latched_fault_class;
+    /*
+     * Last fault detail strings (populated by record_fault). Surfaced
+     * to the host so the operator sees WHY a fault tripped — previously
+     * `unexpected_state (safety_latched)` had no actionable detail.
+     * (2026-04-16)
+     */
+    char active_fault_reason[80];
+    char latched_fault_reason[80];
     uint32_t active_fault_count;
     uint32_t trip_counter;
     laser_controller_time_ms_t last_fault_ms;
@@ -46,6 +54,15 @@ typedef struct {
         uint32_t led_brightness_pct;
         bool led_owned;
         bool rgb_test_active;
+        /*
+         * Why button-driven NIR is currently blocked. Populated by
+         * `apply_button_board_policy` after every tick's safety
+         * decision. Set to "none" when stage1+stage2 would fire NIR
+         * (or already are firing). Surfaced in the GUI Operate-page
+         * trigger card so the operator sees WHY the laser doesn't
+         * fire, instead of guessing. (2026-04-16 audit/refactor.)
+         */
+        char nir_block_reason[40];
     } button_runtime;
     /*
      * Diagnostic payload captured on the RISING EDGE of a fault. Currently
@@ -100,3 +117,24 @@ esp_err_t laser_controller_app_set_runtime_power_policy(
 esp_err_t laser_controller_app_set_rgb_test(
     uint8_t r, uint8_t g, uint8_t b, bool blink, uint32_t hold_ms);
 esp_err_t laser_controller_app_clear_rgb_test(void);
+
+/*
+ * Set the post-deployment front-LED brightness percent (0..100). Shared
+ * source-of-truth for both side-button stepping and the GUI Operate-page
+ * slider — calling this keeps the displayed value and the actual LED
+ * brightness in sync. Clamped to [0, 100] AND to the configured
+ * max_tof_led_duty_cycle_pct cap. (2026-04-17)
+ */
+esp_err_t laser_controller_app_set_button_led_brightness(uint32_t pct);
+
+/*
+ * Headless auto-deploy support (2026-04-16 user feature).
+ *
+ * `note_host_activity()` is called by the comms layer at the top of
+ * `laser_controller_comms_receive_line` for every inbound command,
+ * regardless of source (USB serial, WiFi WS, mock). The control task
+ * uses the timestamp to decide whether to fire the 5-second-after-boot
+ * auto-enter-deployment flow. Once any host command arrives, the
+ * auto-deploy is suppressed for the entire boot session.
+ */
+void laser_controller_app_note_host_activity(void);

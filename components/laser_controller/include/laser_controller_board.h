@@ -237,6 +237,27 @@ esp_err_t laser_controller_board_configure_pd_debug(
 esp_err_t laser_controller_board_burn_pd_nvm(
     const laser_controller_service_pd_profile_t *profiles,
     size_t profile_count);
+/*
+ * Hard rule (2026-04-16 user directive): NO PD chip writes are allowed
+ * unless an operator-initiated authorization window is currently open.
+ * Calling either of the two write functions above without an active
+ * authorization returns ESP_ERR_INVALID_STATE — guarantees no firmware
+ * code path can ever silently renegotiate USB-PD. The comms-layer
+ * handlers for `pd_debug_config`, `pd_save_firmware_plan`, and
+ * `pd_burn_nvm` open this window with the appropriate hold time
+ * immediately before invoking the write. Window auto-expires; nothing
+ * in the auto-loop can re-open it.
+ */
+void laser_controller_board_authorize_pd_write_window(uint32_t hold_ms);
+/*
+ * Stop any active LEDC PWM on PCN and drive the GPIO LOW (LISL idle bias).
+ * Required at the start of `run_deployment_sequence` so the checklist
+ * starts from a known PCN=LOW state regardless of what the runtime was
+ * doing before. Without this, a previous modulation cycle leaves LEDC
+ * still owning the GPIO and `gpio_set_level` writes from the safe-output
+ * path don't actually drive the pin. (2026-04-16 user directive.)
+ */
+void laser_controller_board_force_pcn_low(void);
 void laser_controller_board_force_pd_refresh(void);
 void laser_controller_board_force_pd_refresh_with_source(
     laser_controller_pd_snapshot_source_t source);

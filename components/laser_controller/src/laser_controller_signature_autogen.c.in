@@ -11,7 +11,16 @@ const laser_controller_firmware_signature_t g_laser_controller_firmware_signatur
         .protocol_version = "@BSL_SIGNATURE_PROTOCOL_VERSION@",
         .hardware_scope = "@BSL_SIGNATURE_HARDWARE_SCOPE@",
         .firmware_version = "@BSL_SIGNATURE_FIRMWARE_VERSION@",
-        .build_utc = "@BSL_SIGNATURE_BUILD_UTC@",
+        /*
+         * Compile-time timestamp via __DATE__ __TIME__ (2026-04-16 fix).
+         * Previously this was the CMake configure-time @BSL_SIGNATURE_BUILD_UTC@,
+         * which froze on the first configure and never updated on subsequent
+         * `idf.py build`s — making it impossible to tell from the host console
+         * whether the binary on the device matched recent edits.
+         * Format: "MMM DD YYYY HH:MM:SS" (preprocessor format, not ISO8601).
+         * The host parses both formats tolerantly.
+         */
+        .build_utc = __DATE__ " " __TIME__,
         .payload_sha256_hex = "@BSL_SIGNATURE_PAYLOAD_SHA256@",
         .end_magic = LASER_CONTROLLER_FIRMWARE_SIGNATURE_END_MAGIC,
         .reserved = {0U, 0U, 0U},

@@ -49,8 +49,20 @@ typedef struct {
     bool last_distance_blocked;
     bool last_lambda_drift_blocked;
     bool last_tec_temp_adc_blocked;
+    /*
+     * `driver_operate_expected` is still consumed by the LD_LOOP_BAD
+     * check (see laser_controller_safety.c): that check only fires
+     * when SBDN=ON AND PCN=HIGH (full operate) AND LPGD is low, which
+     * is when loop-bad actually indicates a fault. In idle-bias
+     * (SBDN=ON, PCN=LOW) LPGD may legitimately be off and the check
+     * must be suppressed.
+     *
+     * 2026-04-16/17: the `ready_idle_bias_allowed` and
+     * `sbdn_currently_off` fields that previously lived here have
+     * been removed along with the UNEXPECTED_CURRENT check they
+     * fed — neither has any remaining reader.
+     */
     bool driver_operate_expected;
-    bool ready_idle_bias_allowed;
     laser_controller_power_tier_t power_tier;
     laser_controller_nm_t target_lambda_nm;
     laser_controller_nm_t actual_lambda_nm;

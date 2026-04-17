@@ -521,6 +521,7 @@ function makeSeedSnapshot(): DeviceSnapshot {
       ledOwned: false,
       triggerLockout: false,
       triggerPhase: 'off',
+      nirButtonBlockReason: 'deployment-not-active',
     },
     peripherals: {
       dac: {
@@ -611,6 +612,7 @@ function makeSeedSnapshot(): DeviceSnapshot {
       maxLaserCurrentA: 5,
       offCurrentThresholdA: 0.2,
       maxTofLedDutyCyclePct: 50,
+      lioVoltageOffsetV: 0.07,
       actualLambdaNm: 785,
       targetLambdaNm: 785,
       lambdaDriftNm: 0,
@@ -661,6 +663,8 @@ function makeSeedSnapshot(): DeviceSnapshot {
       activeClass: 'none',
       latchedCode: 'none',
       latchedClass: 'none',
+      activeReason: '',
+      latchedReason: '',
       activeCount: 0,
       tripCounter: 0,
       lastFaultAtIso: null,

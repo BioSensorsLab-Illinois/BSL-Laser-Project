@@ -333,6 +333,20 @@ static uint32_t s_tof_sideband_applied_frequency_hz;
 static laser_controller_pd_snapshot_t s_pd_snapshot;
 static bool s_pd_refresh_allowed;
 static laser_controller_pd_snapshot_source_t s_pd_refresh_requested_source;
+/*
+ * 2026-04-16 HARD RULE: NO PD chip writes without operator approval.
+ * `s_pd_write_authorization_until_ms` is set non-zero by an operator-
+ * initiated comms handler immediately before calling a PD-write function
+ * (`configure_pd_debug` or `burn_pd_nvm`). The write check rejects with
+ * ESP_ERR_INVALID_STATE if the window isn't open OR has expired. The
+ * window auto-expires; nothing in the control loop can re-open it.
+ * This means no firmware path — including future regressions — can
+ * silently renegotiate USB-PD or burn NVM.
+ *
+ * Volatile because the comms task writes and the control task reads
+ * without locks (single-word atomic on ESP32-S3).
+ */
+static volatile laser_controller_time_ms_t s_pd_write_authorization_until_ms;
 static float s_last_ld_voltage_v = -1.0f;
 static float s_last_tec_voltage_v = -1.0f;
 static laser_controller_board_imu_runtime_t s_imu_runtime;
@@ -3570,6 +3584,14 @@ static void laser_controller_board_normalize_pd_profiles(
         0,
         sizeof(*normalized_profiles) * LASER_CONTROLLER_SERVICE_PD_PROFILE_COUNT);
 
+    /*
+     * PDO1 is the USB-PD fallback / safe profile. The STUSB4500 fixes
+     * PDO1 voltage at 5 V at the hardware level — writing a different
+     * voltage has no effect because the chip enforces the USB-PD
+     * initial-negotiation voltage internally. Only the OPERATING
+     * CURRENT is programmable. `enabled` must stay TRUE because the
+     * chip refuses to run without a fallback profile.
+     */
     normalized_profiles[0].enabled = true;
     normalized_profiles[0].voltage_v = 5.0f;
     normalized_profiles[0].current_a =
@@ -4452,8 +4474,17 @@ void laser_controller_board_read_inputs(
         if (laser_controller_board_read_adc_voltage(ADC_CHANNEL_1, &voltage_v) == ESP_OK) {
             const float filtered_v = laser_controller_adc_filter_update(
                 &s_adc_filter_ld_current_v, voltage_v);
-            inputs->laser_current_monitor_voltage_v = filtered_v;
-            inputs->measured_laser_current_a = 2.4f * filtered_v;
+            /*
+             * Apply per-unit LIO voltage calibration offset (Bug 5 fix
+             * 2026-04-17). User reported the raw readback was ~70 mV
+             * lower than the actual driver LIO pin voltage; offset is a
+             * config field with default 0.07 V and ±0.5 V validation.
+             */
+            const float corrected_v =
+                filtered_v + (config != NULL ?
+                    (float)config->thresholds.lio_voltage_offset_v : 0.0f);
+            inputs->laser_current_monitor_voltage_v = corrected_v;
+            inputs->measured_laser_current_a = 2.4f * corrected_v;
         }
     } else {
         inputs->driver_loop_good = false;
@@ -4682,10 +4713,41 @@ esp_err_t laser_controller_board_i2c_write_read(
         rx_len);
 }
 
+/*
+ * 2026-04-16 HARD RULE enforcement helpers: see header comment on
+ * `laser_controller_board_authorize_pd_write_window`.
+ */
+void laser_controller_board_authorize_pd_write_window(uint32_t hold_ms)
+{
+    const laser_controller_time_ms_t now = laser_controller_board_uptime_ms();
+    s_pd_write_authorization_until_ms = now + hold_ms;
+}
+
+static bool laser_controller_board_pd_write_authorized(void)
+{
+    const laser_controller_time_ms_t now = laser_controller_board_uptime_ms();
+    return s_pd_write_authorization_until_ms != 0U &&
+           now <= s_pd_write_authorization_until_ms;
+}
+
 esp_err_t laser_controller_board_configure_pd_debug(
     const laser_controller_service_pd_profile_t *profiles,
     size_t profile_count)
 {
+    /*
+     * 2026-04-16 HARD RULE: only proceed if the operator-initiated
+     * authorization window is open. Comms task arms the window via
+     * `laser_controller_board_authorize_pd_write_window()` immediately
+     * before invoking this function. Any other caller (e.g. a future
+     * regression that adds a control-loop auto-write) hits this gate
+     * and returns ESP_ERR_INVALID_STATE without writing anything.
+     */
+    if (!laser_controller_board_pd_write_authorized()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    /* Consume the authorization on first use so a second write needs a
+     * fresh operator click. */
+    s_pd_write_authorization_until_ms = 0U;
     laser_controller_service_pd_profile_t
         normalized_profiles[LASER_CONTROLLER_SERVICE_PD_PROFILE_COUNT];
     uint8_t encoded_profile_count = 1U;
@@ -4801,6 +4863,15 @@ esp_err_t laser_controller_board_burn_pd_nvm(
     const laser_controller_service_pd_profile_t *profiles,
     size_t profile_count)
 {
+    /*
+     * 2026-04-16 HARD RULE: same authorization gate as configure_pd_debug.
+     * NVM burn is the most destructive PD operation (changes startup
+     * defaults), so this gate is doubly important.
+     */
+    if (!laser_controller_board_pd_write_authorized()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_pd_write_authorization_until_ms = 0U;
     uint8_t current_map[LASER_CONTROLLER_STUSB_NVM_BANK_COUNT]
                        [LASER_CONTROLLER_STUSB_NVM_BANK_SIZE] = { { 0 } };
     uint8_t target_map[LASER_CONTROLLER_STUSB_NVM_BANK_COUNT]
@@ -4904,6 +4975,18 @@ void laser_controller_board_force_pd_refresh(void)
 {
     laser_controller_board_force_pd_refresh_with_source(
         LASER_CONTROLLER_PD_SNAPSHOT_SOURCE_INTEGRATE_REFRESH);
+}
+
+/*
+ * Public PCN low-drive helper (2026-04-16 user directive). Stops the
+ * LEDC PWM channel if active and drives the GPIO low. Used by the
+ * deployment-checklist start path so the chip enters the sequence from
+ * a clean LISL idle posture even if the runtime was modulating PCN
+ * just before.
+ */
+void laser_controller_board_force_pcn_low(void)
+{
+    laser_controller_board_disable_pcn_pwm_and_drive(true);
 }
 
 void laser_controller_board_force_pd_refresh_with_source(

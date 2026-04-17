@@ -44,6 +44,15 @@ typedef struct {
      * 50 (user directive 2026-04-15).
      */
     uint32_t max_tof_led_duty_cycle_pct;
+    /*
+     * Calibration offset for the LD LIO ADC voltage readback (volts).
+     * Added to the IIR-filtered ADC sample before deriving measured
+     * laser current. User-observed bias on this bench was +70 mV;
+     * default 0.07 V (2026-04-17). Adjustable via the safety form to
+     * match per-unit divider tolerance. Validation clamps to ±0.5 V —
+     * larger offsets indicate a wiring fault, not calibration.
+     */
+    laser_controller_volts_t lio_voltage_offset_v;
 } laser_controller_safety_thresholds_t;
 
 typedef struct {

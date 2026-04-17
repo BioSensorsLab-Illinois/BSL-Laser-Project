@@ -791,7 +791,8 @@ static void laser_controller_comms_write_button_board_json(
         "\"rgb\":{\"r\":%u,\"g\":%u,\"b\":%u,"
         "\"blink\":%s,\"enabled\":%s,\"testActive\":%s},"
         "\"ledBrightnessPct\":%u,\"ledOwned\":%s,"
-        "\"triggerLockout\":%s,\"triggerPhase\":\"%s\"},",
+        "\"triggerLockout\":%s,\"triggerPhase\":\"%s\","
+        "\"nirButtonBlockReason\":",
         (unsigned)LASER_CONTROLLER_BUTTON_MCP23017_I2C_ADDR,
         (unsigned)LASER_CONTROLLER_BUTTON_TLC59116_I2C_ADDR,
         bb->reachable ? "true" : "false",
@@ -812,6 +813,16 @@ static void laser_controller_comms_write_button_board_json(
         status->button_runtime.led_owned ? "true" : "false",
         status->button_runtime.nir_lockout ? "true" : "false",
         laser_controller_comms_trigger_phase(status));
+    /*
+     * 2026-04-16: append the diagnostic block-reason as a JSON-escaped
+     * string so the operator can see WHY a button press isn't firing
+     * NIR. Always non-empty (e.g. "none" if NIR is fireable, otherwise
+     * a token like "fault: tof_out_of_range" or "lockout-latched").
+     */
+    laser_controller_comms_write_escaped_string(
+        buffer,
+        status->button_runtime.nir_block_reason);
+    laser_controller_comms_buffer_append_raw(buffer, "},");
 }
 
 /*
@@ -1015,6 +1026,20 @@ static void laser_controller_comms_write_fault_json(
     laser_controller_comms_write_escaped_string(
         buffer,
         laser_controller_fault_class_name(status->latched_fault_class));
+    /*
+     * Reason strings (added 2026-04-16). Surfaces the fault detail that
+     * record_fault captured — e.g. "illegal state transition X -> Y
+     * blocked" for UNEXPECTED_STATE. Tolerant parser on the host side
+     * treats missing fields as empty.
+     */
+    laser_controller_comms_buffer_append_raw(buffer, ",\"activeReason\":");
+    laser_controller_comms_write_escaped_string(
+        buffer,
+        status->active_fault_reason);
+    laser_controller_comms_buffer_append_raw(buffer, ",\"latchedReason\":");
+    laser_controller_comms_write_escaped_string(
+        buffer,
+        status->latched_fault_reason);
 
     /*
      * Trigger diagnostic frame — currently populated only for LD_OVERTEMP
@@ -2519,7 +2544,7 @@ static void laser_controller_comms_write_snapshot_json(
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        "\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"horizonThresholdDeg\":%.2f,\"horizonHysteresisDeg\":%.2f,\"tofMinRangeM\":%.3f,\"tofMaxRangeM\":%.3f,\"tofHysteresisM\":%.3f,\"imuStaleMs\":%lu,\"tofStaleMs\":%lu,\"railGoodTimeoutMs\":%lu,\"lambdaDriftLimitNm\":%.2f,\"lambdaDriftHysteresisNm\":%.2f,\"lambdaDriftHoldMs\":%lu,\"ldOvertempLimitC\":%.2f,\"tecTempAdcTripV\":%.3f,\"tecTempAdcHysteresisV\":%.3f,\"tecTempAdcHoldMs\":%lu,\"tecMinCommandC\":%.2f,\"tecMaxCommandC\":%.2f,\"tecReadyToleranceC\":%.2f,\"maxLaserCurrentA\":%.2f,\"offCurrentThresholdA\":%.2f,\"maxTofLedDutyCyclePct\":%u,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f},",
+        "\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"horizonThresholdDeg\":%.2f,\"horizonHysteresisDeg\":%.2f,\"tofMinRangeM\":%.3f,\"tofMaxRangeM\":%.3f,\"tofHysteresisM\":%.3f,\"imuStaleMs\":%lu,\"tofStaleMs\":%lu,\"railGoodTimeoutMs\":%lu,\"lambdaDriftLimitNm\":%.2f,\"lambdaDriftHysteresisNm\":%.2f,\"lambdaDriftHoldMs\":%lu,\"ldOvertempLimitC\":%.2f,\"tecTempAdcTripV\":%.3f,\"tecTempAdcHysteresisV\":%.3f,\"tecTempAdcHoldMs\":%lu,\"tecMinCommandC\":%.2f,\"tecMaxCommandC\":%.2f,\"tecReadyToleranceC\":%.2f,\"maxLaserCurrentA\":%.2f,\"offCurrentThresholdA\":%.2f,\"maxTofLedDutyCyclePct\":%u,\"lioVoltageOffsetV\":%.4f,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f},",
         status->decision.allow_alignment ? "true" : "false",
         status->decision.allow_nir ? "true" : "false",
         status->decision.horizon_blocked ? "true" : "false",
@@ -2547,6 +2572,7 @@ static void laser_controller_comms_write_snapshot_json(
         status->config.thresholds.max_laser_current_a,
         status->config.thresholds.off_current_threshold_a,
         (unsigned)status->config.thresholds.max_tof_led_duty_cycle_pct,
+        (double)status->config.thresholds.lio_voltage_offset_v,
         actual_lambda_nm,
         status->bench.target_lambda_nm,
         lambda_drift_nm,
@@ -2871,7 +2897,7 @@ static void laser_controller_comms_write_command_snapshot_json(
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        "\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"horizonThresholdDeg\":%.2f,\"horizonHysteresisDeg\":%.2f,\"tofMinRangeM\":%.3f,\"tofMaxRangeM\":%.3f,\"tofHysteresisM\":%.3f,\"imuStaleMs\":%lu,\"tofStaleMs\":%lu,\"railGoodTimeoutMs\":%lu,\"lambdaDriftLimitNm\":%.2f,\"lambdaDriftHysteresisNm\":%.2f,\"lambdaDriftHoldMs\":%lu,\"ldOvertempLimitC\":%.2f,\"tecTempAdcTripV\":%.3f,\"tecTempAdcHysteresisV\":%.3f,\"tecTempAdcHoldMs\":%lu,\"tecMinCommandC\":%.2f,\"tecMaxCommandC\":%.2f,\"tecReadyToleranceC\":%.2f,\"maxLaserCurrentA\":%.2f,\"offCurrentThresholdA\":%.2f,\"maxTofLedDutyCyclePct\":%u,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f},",
+        "\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"horizonThresholdDeg\":%.2f,\"horizonHysteresisDeg\":%.2f,\"tofMinRangeM\":%.3f,\"tofMaxRangeM\":%.3f,\"tofHysteresisM\":%.3f,\"imuStaleMs\":%lu,\"tofStaleMs\":%lu,\"railGoodTimeoutMs\":%lu,\"lambdaDriftLimitNm\":%.2f,\"lambdaDriftHysteresisNm\":%.2f,\"lambdaDriftHoldMs\":%lu,\"ldOvertempLimitC\":%.2f,\"tecTempAdcTripV\":%.3f,\"tecTempAdcHysteresisV\":%.3f,\"tecTempAdcHoldMs\":%lu,\"tecMinCommandC\":%.2f,\"tecMaxCommandC\":%.2f,\"tecReadyToleranceC\":%.2f,\"maxLaserCurrentA\":%.2f,\"offCurrentThresholdA\":%.2f,\"maxTofLedDutyCyclePct\":%u,\"lioVoltageOffsetV\":%.4f,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f},",
         status->decision.allow_alignment ? "true" : "false",
         status->decision.allow_nir ? "true" : "false",
         status->decision.horizon_blocked ? "true" : "false",
@@ -2899,6 +2925,7 @@ static void laser_controller_comms_write_command_snapshot_json(
         status->config.thresholds.max_laser_current_a,
         status->config.thresholds.off_current_threshold_a,
         (unsigned)status->config.thresholds.max_tof_led_duty_cycle_pct,
+        (double)status->config.thresholds.lio_voltage_offset_v,
         actual_lambda_nm,
         status->bench.target_lambda_nm,
         lambda_drift_nm,
@@ -3566,6 +3593,19 @@ static void laser_controller_comms_emit_faults_response(
     laser_controller_comms_write_escaped_string(
         &buffer,
         laser_controller_fault_code_name(status->active_fault_code));
+    /*
+     * Reason strings (added 2026-04-16) — see write_fault_json for the
+     * canonical comment. Tolerant parser on the host treats absent
+     * fields as empty.
+     */
+    laser_controller_comms_buffer_append_raw(&buffer, ",\"activeReason\":");
+    laser_controller_comms_write_escaped_string(
+        &buffer,
+        status->active_fault_reason);
+    laser_controller_comms_buffer_append_raw(&buffer, ",\"latchedReason\":");
+    laser_controller_comms_write_escaped_string(
+        &buffer,
+        status->latched_fault_reason);
     laser_controller_comms_buffer_append_fmt(
         &buffer,
         ",\"activeCount\":%lu,\"tripCounter\":%lu}}\n",
@@ -3910,7 +3950,7 @@ static void laser_controller_comms_emit_bench_status_response(
     if (include_safety) {
         laser_controller_comms_buffer_append_fmt(
             &buffer,
-            ",\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"horizonThresholdDeg\":%.2f,\"horizonHysteresisDeg\":%.2f,\"tofMinRangeM\":%.3f,\"tofMaxRangeM\":%.3f,\"tofHysteresisM\":%.3f,\"imuStaleMs\":%lu,\"tofStaleMs\":%lu,\"railGoodTimeoutMs\":%lu,\"lambdaDriftLimitNm\":%.2f,\"lambdaDriftHysteresisNm\":%.2f,\"lambdaDriftHoldMs\":%lu,\"ldOvertempLimitC\":%.2f,\"tecTempAdcTripV\":%.3f,\"tecTempAdcHysteresisV\":%.3f,\"tecTempAdcHoldMs\":%lu,\"tecMinCommandC\":%.2f,\"tecMaxCommandC\":%.2f,\"tecReadyToleranceC\":%.2f,\"maxLaserCurrentA\":%.2f,\"offCurrentThresholdA\":%.2f,\"maxTofLedDutyCyclePct\":%u,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f}",
+            ",\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"horizonThresholdDeg\":%.2f,\"horizonHysteresisDeg\":%.2f,\"tofMinRangeM\":%.3f,\"tofMaxRangeM\":%.3f,\"tofHysteresisM\":%.3f,\"imuStaleMs\":%lu,\"tofStaleMs\":%lu,\"railGoodTimeoutMs\":%lu,\"lambdaDriftLimitNm\":%.2f,\"lambdaDriftHysteresisNm\":%.2f,\"lambdaDriftHoldMs\":%lu,\"ldOvertempLimitC\":%.2f,\"tecTempAdcTripV\":%.3f,\"tecTempAdcHysteresisV\":%.3f,\"tecTempAdcHoldMs\":%lu,\"tecMinCommandC\":%.2f,\"tecMaxCommandC\":%.2f,\"tecReadyToleranceC\":%.2f,\"maxLaserCurrentA\":%.2f,\"offCurrentThresholdA\":%.2f,\"maxTofLedDutyCyclePct\":%u,\"lioVoltageOffsetV\":%.4f,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f}",
             status->decision.allow_alignment ? "true" : "false",
             status->decision.allow_nir ? "true" : "false",
             status->decision.horizon_blocked ? "true" : "false",
@@ -3938,6 +3978,7 @@ static void laser_controller_comms_emit_bench_status_response(
             status->config.thresholds.max_laser_current_a,
             status->config.thresholds.off_current_threshold_a,
             (unsigned)status->config.thresholds.max_tof_led_duty_cycle_pct,
+            (double)status->config.thresholds.lio_voltage_offset_v,
             actual_lambda_nm,
             status->bench.target_lambda_nm,
             lambda_drift_nm,
@@ -4508,16 +4549,21 @@ static void laser_controller_comms_handle_command_line(const char *line)
     }
 
     if (strcmp(command, "clear_faults") == 0) {
-        if (status.deployment.active) {
+        /*
+         * Loosened 2026-04-16: clear_faults previously required both
+         * !deployment.active AND service_mode_active, forcing operators
+         * through a 5-step exit-deploy / enter-service / clear /
+         * exit-service / re-enter-deploy dance for a single fault clear.
+         * Clearing the latch is idempotent — if the underlying condition
+         * persists, the safety evaluator re-latches on the next 5 ms tick.
+         * Only mid-emission clearing is hazardous (would reset the gating
+         * mid-fire), so refuse only in NIR_ACTIVE / ALIGNMENT_ACTIVE.
+         */
+        if (status.state == LASER_CONTROLLER_STATE_NIR_ACTIVE ||
+            status.state == LASER_CONTROLLER_STATE_ALIGNMENT_ACTIVE) {
             laser_controller_comms_emit_error_response(
                 id,
-                "Deployment mode locks fault-clear actions. Exit deployment mode first.");
-            return;
-        }
-        if (!laser_controller_comms_service_mode_active(&status)) {
-            laser_controller_comms_emit_error_response(
-                id,
-                "Enter service mode before clearing latched faults.");
+                "Cannot clear faults while NIR or alignment is emitting. Stop the output first.");
             return;
         }
 
@@ -4778,12 +4824,12 @@ static void laser_controller_comms_handle_command_line(const char *line)
                 "Exit deployment mode before updating ToF calibration.");
             return;
         }
-        if (status.fault_latched) {
-            laser_controller_comms_emit_error_response(
-                id,
-                "Clear the latched fault before updating ToF calibration.");
-            return;
-        }
+        /*
+         * fault_latched gate removed 2026-04-16: ToF calibration is
+         * config-only (writes NVS + in-memory cal). No hardware
+         * actuation. Refusing under fault left operators unable to
+         * adjust ToF cal in service mode after a transient fault.
+         */
 
         laser_controller_tof_calibration_t cal;
         laser_controller_service_get_tof_calibration(&cal);
@@ -5098,13 +5144,23 @@ static void laser_controller_comms_handle_command_line(const char *line)
         return;
     }
 
-    if ((strcmp(command, "set_laser_power") == 0 ||
-         strcmp(command, "set_max_current") == 0 ||
-         strcmp(command, "operate.set_output") == 0 ||
-         strcmp(command, "laser_output_enable") == 0 ||
+    /*
+     * 2026-04-16: only the legacy direct-enable commands remain mode-gated.
+     * The value setters (`operate.set_output`, `operate.set_modulation`,
+     * `set_laser_power`, `set_max_current`) just stage stored values that
+     * the buttons (binary_trigger mode) and the host (modulated_host mode)
+     * both use. The actual hardware drive is gated downstream:
+     *   - `host_request_nir` in safety.c requires runtime_mode == MODULATED_HOST
+     *     before bench.requested_nir can fire NIR.
+     *   - Buttons fire NIR via the binary-trigger path only when buttons are
+     *     effective (deployment_ready_idle && board_reachable).
+     * Allowing stored-value commits in any mode lets the operator pre-stage
+     * the current setpoint that the buttons will fire at, without flipping
+     * to host mode just to move a slider.
+     */
+    if ((strcmp(command, "laser_output_enable") == 0 ||
          strcmp(command, "laser_output_disable") == 0 ||
-         strcmp(command, "configure_modulation") == 0 ||
-         strcmp(command, "operate.set_modulation") == 0) &&
+         strcmp(command, "configure_modulation") == 0) &&
         !laser_controller_comms_runtime_mode_is_modulated_host(&status)) {
         laser_controller_comms_emit_error_response(
             id,
@@ -5181,6 +5237,13 @@ static void laser_controller_comms_handle_command_line(const char *line)
             duty_cycle_pct,
             frequency_hz,
             now_ms);
+        /*
+         * Mirror the brightness into the deployment-armed LED source of
+         * truth so the GUI slider and side buttons converge on a single
+         * value (Bug 1 fix 2026-04-17). The bench storage above is kept
+         * for its `enabled` toggle and for non-deployment ownership.
+         */
+        (void)laser_controller_app_set_button_led_brightness(duty_cycle_pct);
         laser_controller_logger_logf(
             now_ms,
             "bench",
@@ -5213,6 +5276,68 @@ static void laser_controller_comms_handle_command_line(const char *line)
             "operate output -> enabled=%d current=%.3f A",
             enabled,
             current_a);
+        laser_controller_comms_refresh_status_after_mutation(&status, 25U);
+        laser_controller_comms_emit_bench_status_response(
+            id,
+            &status,
+            false,
+            true,
+            true);
+        return;
+    }
+
+    /*
+     * 2026-04-16 user feature: explicit "save current bench settings as
+     * deployment defaults" — the operator clicks a button on the Operate
+     * page and we persist the current NIR current + TEC temp/lambda to
+     * NVS. On the next power-up these become the values the headless
+     * 5-second auto-deploy will run with.
+     *
+     * Persists three things:
+     *   - bench.high_state_current_a → NVS u32 (mA)
+     *   - bench.target_temp_c / target_lambda_nm → service profile slot
+     *     via service_set_runtime_target (already auto-saved on slider
+     *     commit; we re-save here as a defensive flush)
+     *   - service profile blob (force flush)
+     */
+    if (strcmp(command, "operate.save_deployment_defaults") == 0) {
+        /*
+         * 2026-04-17 audit fix: refuse while the checklist is running.
+         * Mid-checklist the bench fields may reflect values the
+         * operator is in the middle of adjusting, not a deliberate
+         * deployment default. The operator can save defaults either
+         * before running the checklist (from ready_idle of the prior
+         * cycle) or after it passes.
+         */
+        if (status.deployment.active && status.deployment.running) {
+            laser_controller_comms_emit_error_response(
+                id,
+                "Cannot save deployment defaults while the checklist is running.");
+            return;
+        }
+        const esp_err_t cur_err = laser_controller_service_save_deployment_current_a(
+            status.bench.high_state_current_a);
+        if (cur_err != ESP_OK) {
+            laser_controller_comms_emit_error_response(
+                id,
+                "Could not save NIR current to NVS — controller storage error.");
+            return;
+        }
+        laser_controller_service_set_runtime_target(
+            status.bench.target_mode,
+            status.bench.target_temp_c,
+            status.bench.target_lambda_nm,
+            now_ms);
+        laser_controller_service_save_profile(now_ms);
+        laser_controller_logger_logf(
+            now_ms,
+            "service",
+            "deployment defaults saved: current=%.3f A target=%s temp=%.2f C lambda=%.2f nm",
+            status.bench.high_state_current_a,
+            status.bench.target_mode == LASER_CONTROLLER_BENCH_TARGET_MODE_LAMBDA ?
+                "lambda" : "temp",
+            status.bench.target_temp_c,
+            status.bench.target_lambda_nm);
         laser_controller_comms_refresh_status_after_mutation(&status, 25U);
         laser_controller_comms_emit_bench_status_response(
             id,
@@ -5256,6 +5381,13 @@ static void laser_controller_comms_handle_command_line(const char *line)
             "service",
             "pd debug power policy accepted");
 
+        /*
+         * 2026-04-16 HARD RULE: open the operator-authorization window
+         * immediately before the PD write. The board layer rejects
+         * writes that arrive without an open window. 2 s is generous
+         * — the I2C transaction completes in < 50 ms.
+         */
+        laser_controller_board_authorize_pd_write_window(2000U);
         pd_err = laser_controller_service_set_pd_config(
             &power_policy,
             profiles,
@@ -5328,6 +5460,10 @@ static void laser_controller_comms_handle_command_line(const char *line)
             return;
         }
 
+        /*
+         * 2026-04-16 HARD RULE: open authorization window before PD write.
+         */
+        laser_controller_board_authorize_pd_write_window(2000U);
         pd_err = laser_controller_service_set_pd_config(
             &power_policy,
             profiles,
@@ -5408,6 +5544,13 @@ static void laser_controller_comms_handle_command_line(const char *line)
             return;
         }
 
+        /*
+         * 2026-04-16 HARD RULE: NVM burn flow performs TWO PD writes
+         * back-to-back (validate runtime PDOs via apply, then burn NVM).
+         * Each write consumes the authorization window; arm fresh before
+         * each call.
+         */
+        laser_controller_board_authorize_pd_write_window(2000U);
         pd_err = laser_controller_service_set_pd_config(
             &power_policy,
             profiles,
@@ -5438,6 +5581,9 @@ static void laser_controller_comms_handle_command_line(const char *line)
             return;
         }
 
+        /* HARD RULE: re-arm window for the NVM burn. NVM burn takes
+         * longer than runtime PDO write — give it 15 s headroom. */
+        laser_controller_board_authorize_pd_write_window(15000U);
         pd_err = laser_controller_service_burn_pd_nvm(
             profiles,
             LASER_CONTROLLER_SERVICE_PD_PROFILE_COUNT,
@@ -5551,6 +5697,10 @@ static void laser_controller_comms_handle_command_line(const char *line)
                 }
                 policy.thresholds.max_tof_led_duty_cycle_pct = max_led_duty;
             }
+        }
+        if (laser_controller_comms_extract_float(
+                line, "\"lio_voltage_offset_v\":", &value_f)) {
+            policy.thresholds.lio_voltage_offset_v = value_f;
         }
 
         if (laser_controller_app_set_runtime_safety_policy(&policy) != ESP_OK) {
@@ -6647,6 +6797,15 @@ void laser_controller_comms_receive_line(const char *line)
     if (line == NULL || line[0] == '\0' || s_command_queue == NULL) {
         return;
     }
+
+    /*
+     * 2026-04-16 user feature: stamp host-activity at the *very* top so
+     * the headless auto-deploy state machine in app.c run_fast_cycle is
+     * suppressed the moment any inbound command arrives — including
+     * background probes (get_status, ping). Suppression is sticky for
+     * the whole boot session.
+     */
+    laser_controller_app_note_host_activity();
 
     if (laser_controller_comms_extract_root_uint(line, "\"id\":", &id) &&
         id == 0U &&

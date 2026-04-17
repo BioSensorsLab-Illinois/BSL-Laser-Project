@@ -180,8 +180,18 @@ export function OperateConsole({
   const liveRequestedCurrent = formatNumber(bench.requestedCurrentA, 2)
   const liveModulationFrequency = String(bench.modulationFrequencyHz)
   const liveModulationDuty = String(bench.modulationDutyCyclePct)
+  /*
+   * LED brightness comes from the firmware's button_runtime channel
+   * (which is the shared source-of-truth for both side buttons and the
+   * GUI slider since 2026-04-17). This makes the slider reflect side-
+   * button adjustments AND avoids the snap-back bug where the slider
+   * value diverged from the actual LED brightness when deployment-armed.
+   * Falls back to bench storage when the button board telemetry is stale.
+   */
   const liveLedBrightness = String(
-    bench.requestedLedDutyCyclePct || bench.illuminationDutyCyclePct,
+    liveSnapshot.buttonBoard.ledBrightnessPct ||
+      bench.requestedLedDutyCyclePct ||
+      bench.illuminationDutyCyclePct,
   )
 
   const [targetDraft, setTargetDraft] = useState(() => ({
@@ -228,7 +238,9 @@ export function OperateConsole({
       100,
       parseNumber(
         ledBrightnessPct,
-        bench.requestedLedDutyCyclePct || bench.illuminationDutyCyclePct,
+        liveSnapshot.buttonBoard.ledBrightnessPct ||
+          bench.requestedLedDutyCyclePct ||
+          bench.illuminationDutyCyclePct,
       ),
     ),
   )
@@ -349,7 +361,26 @@ export function OperateConsole({
   }
 
   function commitRuntimeTarget(source: 'temp' | 'lambda' = targetDraft.source) {
-    if (!readyIdle) return
+    /*
+     * Allow runtime setpoint commits anytime the controller is connected,
+     * regardless of deployment state (2026-04-17 user directive). The
+     * firmware persists `runtime_target_*` to NVS via the service profile
+     * and reloads on boot, so adjustments out-of-deployment survive
+     * power cycles.
+     *
+     * 2026-04-16 user directive: the typed setpoint must stay in the
+     * input field even if the firmware has not yet echoed it back in
+     * telemetry. Previously a `.finally()` cleared `dirty`, which then
+     * fell the displayed value back to `liveRuntimeTempC` — if the
+     * firmware's live telemetry was still the previous value (or zero
+     * on a cold boot), the user saw their input "snap back" and
+     * concluded the control was dead. Now the draft is kept sticky:
+     * the value the user typed remains displayed until they type
+     * another value. This lets the user tune + save deployment
+     * parameters without the field ghosting back to zero between
+     * commits.
+     */
+    if (!connected) return
 
     const tempC = clampTecTempC(parseNumber(runtimeTempC, liveSnapshot.tec.targetTempC))
     const lambdaNm = clampTecWavelengthNm(
@@ -371,13 +402,27 @@ export function OperateConsole({
       source === 'lambda'
         ? { target_mode: 'lambda', lambda_nm: lambdaNm }
         : { target_mode: 'temp', temp_c: tempC },
-    ).finally(() => {
-      setTargetDraft((current) => ({ ...current, dirty: false }))
-    })
+    )
   }
 
   function commitRequestedCurrent() {
-    if (!nirEnabled) return
+    /*
+     * Allow current-setpoint commits anytime connected. The firmware's
+     * `operate.set_output` accepts the request and stores it without
+     * triggering hardware unless `enabled` is also flipped — and we
+     * preserve the existing `enabled` value in the args, so this commit
+     * never enables NIR by itself. (2026-04-16)
+     *
+     * 2026-04-16 user directive: once the operator types a current
+     * value and commits it, the displayed value must stay at what they
+     * typed until they change it again. Previously `.finally()` cleared
+     * `dirty`, which caused the slider to snap back to `bench.requested
+     * CurrentA` — which could be zero or a stale value, making the
+     * operator think the field was dead. The draft now persists as the
+     * displayed value so saving deployment defaults (without actually
+     * firing NIR) is usable.
+     */
+    if (!connected) return
 
     setCurrentDraft({ dirty: true, value: formatNumber(requestedCurrentA, 2) })
     void issue(
@@ -386,13 +431,12 @@ export function OperateConsole({
         ? 'Update the live constant NIR current request.'
         : 'Update the stored constant NIR current while output stays off.',
       { enabled: bench.requestedNirEnabled, current_a: requestedCurrentA },
-    ).finally(() => {
-      setCurrentDraft((current) => ({ ...current, dirty: false }))
-    })
+    )
   }
 
   function commitModulation(nextEnabled = modulationEnabled) {
-    if (!nirEnabled) return
+    /* Modulation params are stored values; commit anytime connected. */
+    if (!connected) return
 
     const frequencyHz = Math.max(
       0,
@@ -592,12 +636,23 @@ export function OperateConsole({
           <button
             type="button"
             className="action-button is-inline"
-            disabled={!connected || !fault.latched}
+            /*
+             * Enable on EITHER an active or a latched fault. Was disabled
+             * unless `latched` — but the user reported a deadlock: trying
+             * to enter deployment was rejected by the firmware because of
+             * a transient fault that wasn't latched, and the Clear button
+             * was grayed out so they couldn't break the cycle.
+             * (2026-04-17)
+             */
+            disabled={
+              !connected ||
+              (!fault.latched && fault.activeCode === 'none')
+            }
             title={
               !connected
                 ? 'No controller connected.'
-                : !fault.latched
-                  ? 'No latched fault to clear.'
+                : !fault.latched && fault.activeCode === 'none'
+                  ? 'No active or latched fault to clear.'
                   : undefined
             }
             onClick={() =>
@@ -605,6 +660,30 @@ export function OperateConsole({
             }
           >
             Clear faults
+          </button>
+          {/*
+            * 2026-04-16 user feature: persist the current bench NIR
+            * current and TEC temp/lambda as the deployment defaults.
+            * On the next power-up the headless 5-second auto-deploy
+            * fires at these saved values. NVS write — operator action.
+            */}
+          <button
+            type="button"
+            className="action-button is-inline"
+            disabled={!connected}
+            title={
+              connected
+                ? 'Persist the current NIR current + TEC target as the deployment defaults. Next boot starts the 5-second auto-deploy at these values.'
+                : 'No controller connected.'
+            }
+            onClick={() =>
+              void issue(
+                'operate.save_deployment_defaults',
+                'Save the current NIR current and TEC target as the on-board deployment defaults (NVS).',
+              )
+            }
+          >
+            Save deployment defaults
           </button>
         </div>
 
@@ -620,6 +699,19 @@ export function OperateConsole({
                   ? `Latched: ${fault.latchedCode} (${fault.latchedClass})`
                   : `Active: ${fault.activeCode} (${fault.activeClass})`}
               </strong>
+              {/*
+                * Surface the firmware-supplied reason string so the operator
+                * can see WHY a fault tripped — added 2026-04-16 to address
+                * the "unexpected_state (safety_latched)" opacity bug. Falls
+                * back gracefully when older firmware omits the field.
+                */}
+              {(() => {
+                const reason = fault.latched
+                  ? fault.latchedReason
+                  : fault.activeReason
+                if (!reason || reason.length === 0) return null
+                return <span className="operate-v3__fault-reason"> — {reason}</span>
+              })()}
               {fault.latched &&
                 fault.activeCode !== 'none' &&
                 fault.activeCode !== fault.latchedCode && (
@@ -641,53 +733,52 @@ export function OperateConsole({
 
       {/* Two-column body ----------------------------------------------- */}
       <div className="operate-v3__body">
-        {/* Checklist rail (narrow) */}
-        <aside className="panel-section operate-v3__rail">
-          <div className="section-head">
-            <div>
-              <h3>Checklist</h3>
-              <p>25 °C deployment target. Rows advance live.</p>
-            </div>
-            <span
-              className={
-                deployment.running
-                  ? 'status-badge is-warn'
-                  : readyIdle
-                    ? 'status-badge is-on'
-                    : 'status-badge'
-              }
-            >
-              <Clock3 size={14} />
-              {activeStep ? activeStep.label : 'Waiting'}
-            </span>
-          </div>
-
-          <ol className="operate-v3__steps">
-            {deployment.steps.map((step, index) => (
-              <li
-                key={step.key}
-                className={`operate-v3__step ${stepTone(step.status)}`.trim()}
-                data-active={step.key === activeStep?.key}
+        {/* Left column: checklist + status + setpoint */}
+        <div className="operate-v3__main-left">
+          <aside className="panel-section">
+            <div className="section-head">
+              <div>
+                <h3>Checklist</h3>
+                <p>25 °C deployment target. Rows advance live.</p>
+              </div>
+              <span
+                className={
+                  deployment.running
+                    ? 'status-badge is-warn'
+                    : readyIdle
+                      ? 'status-badge is-on'
+                      : 'status-badge'
+                }
               >
-                <span className="operate-v3__step-index">{index + 1}</span>
-                <div>
-                  <strong>{step.label}</strong>
-                  <small>{step.status.replaceAll('_', ' ')}</small>
-                </div>
-              </li>
-            ))}
-          </ol>
-
-          {deployment.primaryFailureReason && (
-            <div className="inline-alert is-critical">
-              <strong>{deployment.primaryFailureCode}</strong>
-              <p>{deployment.primaryFailureReason}</p>
+                <Clock3 size={14} />
+                {activeStep ? activeStep.label : 'Waiting'}
+              </span>
             </div>
-          )}
-        </aside>
 
-        {/* Main stack */}
-        <div className="operate-v3__main">
+            <ol className="operate-v3__steps">
+              {deployment.steps.map((step, index) => (
+                <li
+                  key={step.key}
+                  className={`operate-v3__step ${stepTone(step.status)}`.trim()}
+                  data-active={step.key === activeStep?.key}
+                >
+                  <span className="operate-v3__step-index">{index + 1}</span>
+                  <div>
+                    <strong>{step.label}</strong>
+                    <small>{step.status.replaceAll('_', ' ')}</small>
+                  </div>
+                </li>
+              ))}
+            </ol>
+
+            {deployment.primaryFailureReason && (
+              <div className="inline-alert is-critical">
+                <strong>{deployment.primaryFailureCode}</strong>
+                <p>{deployment.primaryFailureReason}</p>
+              </div>
+            )}
+          </aside>
+
           {/* Deployment status card */}
           <section className="panel-section">
             <div className="section-head">
@@ -750,6 +841,10 @@ export function OperateConsole({
               <div>
                 <h3>Runtime setpoint</h3>
                 <p>Temperature and wavelength stay linked. Commit on slider release, blur, or Enter.</p>
+                <p className="inline-help">
+                  Buttons always control NIR after deployment. The toggle below adds a parallel
+                  host slider for bench testing.
+                </p>
               </div>
             </div>
 
@@ -815,7 +910,12 @@ export function OperateConsole({
               <p className="inline-help">{bench.runtimeModeLockReason}</p>
             )}
 
-            {runtimeMode === 'binary_trigger' && (
+            {/*
+              * Show the trigger card whenever the button board is reachable —
+              * buttons are now the post-deployment trigger surface regardless
+              * of the runtime_mode toggle (Bug 2 fix 2026-04-17).
+              */}
+            {liveSnapshot.buttonBoard.mcpReachable && (
               <TriggerControlCard snapshot={liveSnapshot} />
             )}
 
@@ -831,8 +931,8 @@ export function OperateConsole({
                     value={clampTecTempC(
                       parseNumber(runtimeTempC, liveSnapshot.tec.targetTempC),
                     )}
-                    disabled={!readyIdle}
-                    title={readyIdle ? undefined : 'Runtime setpoint is locked until deployment is ready-idle.'}
+                    disabled={!connected}
+                    title={connected ? undefined : 'No controller connected.'}
                     onChange={(event) => updateRuntimeTemp(event.target.value)}
                     onMouseUp={() => commitRuntimeTarget('temp')}
                     onTouchEnd={() => commitRuntimeTarget('temp')}
@@ -846,8 +946,8 @@ export function OperateConsole({
                     max="65"
                     step="0.1"
                     value={runtimeTempC}
-                    disabled={!readyIdle}
-                    title={readyIdle ? undefined : 'Runtime setpoint is locked until deployment is ready-idle.'}
+                    disabled={!connected}
+                    title={connected ? undefined : 'No controller connected.'}
                     onChange={(event) => updateRuntimeTemp(event.target.value)}
                     onBlur={() => commitRuntimeTarget('temp')}
                     onKeyDown={(event) => {
@@ -868,8 +968,8 @@ export function OperateConsole({
                     value={clampTecWavelengthNm(
                       parseNumber(runtimeLambdaNm, liveSnapshot.tec.targetLambdaNm),
                     )}
-                    disabled={!readyIdle}
-                    title={readyIdle ? undefined : 'Runtime setpoint is locked until deployment is ready-idle.'}
+                    disabled={!connected}
+                    title={connected ? undefined : 'No controller connected.'}
                     onChange={(event) => updateRuntimeLambda(event.target.value)}
                     onMouseUp={() => commitRuntimeTarget('lambda')}
                     onTouchEnd={() => commitRuntimeTarget('lambda')}
@@ -883,8 +983,8 @@ export function OperateConsole({
                     max="790"
                     step="0.1"
                     value={runtimeLambdaNm}
-                    disabled={!readyIdle}
-                    title={readyIdle ? undefined : 'Runtime setpoint is locked until deployment is ready-idle.'}
+                    disabled={!connected}
+                    title={connected ? undefined : 'No controller connected.'}
                     onChange={(event) => updateRuntimeLambda(event.target.value)}
                     onBlur={() => commitRuntimeTarget('lambda')}
                     onKeyDown={(event) => {
@@ -896,6 +996,10 @@ export function OperateConsole({
             </div>
           </section>
 
+          </div>
+
+          {/* Right column: NIR + Aux */}
+          <div className="operate-v3__main-right">
           {/* NIR output */}
           <section className="panel-section">
             <div className="section-head">
@@ -936,8 +1040,15 @@ export function OperateConsole({
                 max="5.2"
                 step="0.05"
                 value={requestedCurrentA}
-                disabled={!nirEnabled}
-                title={nirDisabledReason}
+                /*
+                 * 2026-04-16 user directive: NIR current setpoint is a
+                 * stored value, no hardware actuation. Allow editing
+                 * anytime the controller is connected — in or out of
+                 * deployment, regardless of `nirEnabled` (which gates
+                 * the actual Output on button).
+                 */
+                disabled={!connected}
+                title={connected ? undefined : 'No controller connected.'}
                 onChange={(event) => setCurrentDraft({ dirty: true, value: event.target.value })}
                 onMouseUp={commitRequestedCurrent}
                 onTouchEnd={commitRequestedCurrent}
@@ -953,8 +1064,8 @@ export function OperateConsole({
                   max="5.2"
                   step="0.05"
                   value={laserCurrentA}
-                  disabled={!nirEnabled}
-                  title={nirDisabledReason}
+                  disabled={!connected}
+                  title={connected ? undefined : 'No controller connected.'}
                   onChange={(event) => setCurrentDraft({ dirty: true, value: event.target.value })}
                   onBlur={commitRequestedCurrent}
                   onKeyDown={(event) => {
@@ -997,8 +1108,8 @@ export function OperateConsole({
                 <input
                   type="number"
                   value={modulationFrequencyHz}
-                  disabled={!nirEnabled}
-                  title={nirDisabledReason}
+                  disabled={!connected}
+                  title={connected ? undefined : 'No controller connected.'}
                   onChange={(event) =>
                     setModulationDraft((current) => ({
                       ...current,
@@ -1017,8 +1128,8 @@ export function OperateConsole({
                 <input
                   type="number"
                   value={modulationDutyPct}
-                  disabled={!nirEnabled}
-                  title={nirDisabledReason}
+                  disabled={!connected}
+                  title={connected ? undefined : 'No controller connected.'}
                   onChange={(event) =>
                     setModulationDraft((current) => ({
                       ...current,
@@ -1038,8 +1149,8 @@ export function OperateConsole({
               <input
                 type="checkbox"
                 checked={modulationEnabled}
-                disabled={!nirEnabled}
-                title={nirDisabledReason}
+                disabled={!connected}
+                title={connected ? undefined : 'No controller connected.'}
                 onChange={(event) => {
                   const nextEnabled = event.target.checked
                   setModulationDraft((current) => ({
@@ -1126,9 +1237,11 @@ export function OperateConsole({
                   <div>
                     <dt>Requested</dt>
                     <dd>
-                      {bench.requestedLedEnabled
-                        ? `${bench.requestedLedDutyCyclePct}%`
-                        : 'Off'}
+                      {liveSnapshot.buttonBoard.ledOwned
+                        ? `${liveSnapshot.buttonBoard.ledBrightnessPct}% (post-deployment)`
+                        : bench.requestedLedEnabled
+                          ? `${bench.requestedLedDutyCyclePct}%`
+                          : 'Off'}
                     </dd>
                   </div>
                   <div>
@@ -1204,6 +1317,9 @@ export function OperateConsole({
             </div>
           </section>
 
+          </div>
+
+          {/* Full-width below both columns */}
           {/* Ready truth */}
           <section className="panel-section">
             <div className="section-head">
@@ -1326,7 +1442,6 @@ export function OperateConsole({
               </article>
             </div>
           </section>
-        </div>
       </div>
     </section>
   )
@@ -1383,8 +1498,9 @@ function TriggerControlCard(props: { snapshot: DeviceSnapshot }) {
         <div>
           <h4>Trigger control</h4>
           <p>
-            Firmware-owned. Stage 1 enables green + LED at 20%. Stage 2 fires
-            NIR at the operate setpoint. Side 1 / Side 2 step LED brightness ±10%.
+            Firmware-owned. LED auto-enables at 20% on ready. Stage 1 enables
+            green alignment. Stage 2 fires NIR (PCN high, SBDN high). Side
+            buttons adjust LED brightness ±5% (capped at {snapshot.safety.maxTofLedDutyCyclePct}%).
           </p>
         </div>
         <div className="operate-trigger-card__phase">
@@ -1435,7 +1551,7 @@ function TriggerControlCard(props: { snapshot: DeviceSnapshot }) {
           }
           aria-pressed={buttons.side1Pressed}
         >
-          <span className="button-chip-label">Side 1 (+10%)</span>
+          <span className="button-chip-label">Side 1 (+5%)</span>
           <span className="button-chip-state">
             {buttons.side1Pressed ? 'PRESSED' : 'idle'}
           </span>
@@ -1448,7 +1564,7 @@ function TriggerControlCard(props: { snapshot: DeviceSnapshot }) {
           }
           aria-pressed={buttons.side2Pressed}
         >
-          <span className="button-chip-label">Side 2 (-10%)</span>
+          <span className="button-chip-label">Side 2 (-5%)</span>
           <span className="button-chip-state">
             {buttons.side2Pressed ? 'PRESSED' : 'idle'}
           </span>
@@ -1489,6 +1605,18 @@ function TriggerControlCard(props: { snapshot: DeviceSnapshot }) {
         <div>
           <dt>NIR lockout</dt>
           <dd>{board.triggerLockout ? 'LATCHED' : 'Clear'}</dd>
+        </div>
+        {/*
+          * 2026-04-16: surface the firmware-computed reason for why a
+          * stage1+stage2 press isn't firing NIR. "none" means the gauntlet
+          * is open; anything else identifies the gate that's blocking
+          * (e.g. "fault: tof_out_of_range", "lockout-latched",
+          * "ld-rail-not-good"). Replaces the previous "guess from chip
+          * states" debugging path.
+          */}
+        <div>
+          <dt>NIR block reason</dt>
+          <dd>{board.nirButtonBlockReason || 'unknown'}</dd>
         </div>
       </dl>
     </div>
