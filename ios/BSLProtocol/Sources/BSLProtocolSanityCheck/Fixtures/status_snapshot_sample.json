@@ -1,0 +1,127 @@
+{
+  "type": "event",
+  "event": "status_snapshot",
+  "timestamp_ms": 123456,
+  "payload": {
+    "session": { "uptimeSeconds": 123, "state": "SERVICE_MODE", "powerTier": "full" },
+    "rails": {
+      "ld": { "enabled": false, "pgood": false },
+      "tec": { "enabled": true, "pgood": true }
+    },
+    "imu": { "valid": true, "fresh": true },
+    "tof": { "valid": true, "fresh": true, "distanceM": 0.42 },
+    "laser": {
+      "nirEnabled": false,
+      "alignmentEnabled": false,
+      "measuredCurrentA": 0.0,
+      "commandedCurrentA": 0.0,
+      "loopGood": true,
+      "driverTempC": 29.4,
+      "driverStandby": true
+    },
+    "tec": {
+      "targetTempC": 25.0,
+      "targetLambdaNm": 785.0,
+      "actualLambdaNm": 784.7,
+      "tempGood": true,
+      "tempC": 24.98,
+      "currentA": 0.3,
+      "voltageV": 2.1,
+      "settlingSecondsRemaining": 0
+    },
+    "pd": {
+      "contractValid": true,
+      "negotiatedPowerW": 45.0,
+      "sourceVoltageV": 20.0,
+      "sourceCurrentA": 2.25
+    },
+    "bench": {
+      "requestedNirEnabled": false,
+      "requestedCurrentA": 1.5,
+      "requestedLedEnabled": true,
+      "requestedLedDutyCyclePct": 30,
+      "appliedLedOwner": "operate_runtime",
+      "appliedLedPinHigh": true,
+      "illuminationEnabled": true,
+      "illuminationDutyCyclePct": 30,
+      "hostControlReadiness": {
+        "nirBlockedReason": "deployment-off",
+        "ledBlockedReason": "none",
+        "sbdnState": "off"
+      },
+      "usbDebugMock": {
+        "active": false,
+        "pdConflictLatched": false,
+        "lastDisableReason": ""
+      }
+    },
+    "safety": {
+      "allowAlignment": true,
+      "allowNir": false,
+      "horizonBlocked": false,
+      "distanceBlocked": false,
+      "lambdaDriftBlocked": false,
+      "tecTempAdcBlocked": false,
+      "horizonThresholdDeg": 0.0,
+      "horizonHysteresisDeg": 3.0,
+      "tofMinRangeM": 0.2,
+      "tofMaxRangeM": 1.0,
+      "tofHysteresisM": 0.02,
+      "imuStaleMs": 50,
+      "tofStaleMs": 100,
+      "railGoodTimeoutMs": 250,
+      "lambdaDriftLimitNm": 5.0,
+      "lambdaDriftHysteresisNm": 0.5,
+      "lambdaDriftHoldMs": 2000,
+      "ldOvertempLimitC": 55.0,
+      "tecTempAdcTripV": 2.45,
+      "tecTempAdcHysteresisV": 0.05,
+      "tecTempAdcHoldMs": 2000,
+      "tecMinCommandC": 15.0,
+      "tecMaxCommandC": 35.0,
+      "tecReadyToleranceC": 0.25,
+      "maxLaserCurrentA": 4.5,
+      "offCurrentThresholdA": 0.2,
+      "maxTofLedDutyCyclePct": 50,
+      "lioVoltageOffsetV": 0.07,
+      "actualLambdaNm": 784.7,
+      "targetLambdaNm": 785.0,
+      "lambdaDriftNm": 0.3,
+      "tempAdcVoltageV": 1.115,
+      "interlocks": {
+        "horizonEnabled": true,
+        "distanceEnabled": true,
+        "lambdaDriftEnabled": true,
+        "tecTempAdcEnabled": true,
+        "imuInvalidEnabled": true,
+        "imuStaleEnabled": true,
+        "tofInvalidEnabled": true,
+        "tofStaleEnabled": true,
+        "ldOvertempEnabled": true,
+        "ldLoopBadEnabled": true,
+        "tofLowBoundOnly": false
+      }
+    },
+    "fault": {
+      "latched": false,
+      "activeCode": "none",
+      "activeClass": "none",
+      "latchedCode": "none",
+      "latchedClass": "none",
+      "activeReason": "",
+      "latchedReason": "",
+      "activeCount": 0,
+      "tripCounter": 0
+    },
+    "deployment": {
+      "active": false,
+      "running": false,
+      "ready": false,
+      "readyIdle": false,
+      "phase": "inactive",
+      "maxLaserCurrentA": 5.0,
+      "targetLambdaNm": 785.0,
+      "targetTempC": 25.0
+    }
+  }
+}

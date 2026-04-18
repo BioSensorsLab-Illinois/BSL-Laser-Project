@@ -1,0 +1,15 @@
+# Swift Package Manager build cache
+BSLProtocol/.build/
+BSLProtocol/.swiftpm/
+BSLProtocol/Package.resolved
+
+# XcodeGen output (regenerate with `xcodegen generate`)
+BSLRemote.xcodeproj/
+BSLRemote.xcworkspace/
+
+# Xcode user data
+*.xcuserdatad/
+xcuserdata/
+
+# macOS cruft
+.DS_Store
