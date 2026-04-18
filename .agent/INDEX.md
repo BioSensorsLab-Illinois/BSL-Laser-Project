@@ -208,7 +208,7 @@ Under [`docs/`](../docs/):
 [`.claude/settings.json`](../.claude/settings.json):
 
 - `env.MAX_THINKING_TOKENS=63999` — max extended-thinking budget per turn
-- `env.BSL_REPO_ROOT` — used by hooks and statusline
+- Repo root for hooks is resolved at runtime from `${CLAUDE_PROJECT_DIR}` (fallback: `BSL_REPO_ROOT`, then the hook script's own location) — no hardcoded user path
 - `outputStyle: "bsl-safety-critical"` — the safety-critical voice
 - `statusLine` — live fw/gui/bench state
 - Five hook event wirings

@@ -12,9 +12,9 @@ Your ONE job: run the three mandatory Powered Phase 2 scenarios and report resul
 
 ## Mandatory Reads
 
-1. `/Users/zz4/BSL/BSL-Laser/.agent/skills/powered-bench-validation/SKILL.md`
-2. `/Users/zz4/BSL/BSL-Laser/docs/validation-plan.md`
-3. `/Users/zz4/BSL/BSL-Laser/host-console/scripts/live_controller_validation.py` — the harness entry point
+1. `.agent/skills/powered-bench-validation/SKILL.md`
+2. `docs/validation-plan.md`
+3. `host-console/scripts/live_controller_validation.py` — the harness entry point
 
 ## Preflight
 

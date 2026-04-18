@@ -4,7 +4,10 @@
 # Non-blocking: always exit 0 regardless of internal errors.
 
 set -u
-REPO_ROOT="${BSL_REPO_ROOT:-/Users/zz4/BSL/BSL-Laser}"
+# Portable repo-root resolution: Claude Code sets CLAUDE_PROJECT_DIR; fall back
+# to the legacy BSL_REPO_ROOT, then to this script's own location
+# (<repo>/.claude/hooks/<script>.sh → ../.. == <repo>).
+REPO_ROOT="${CLAUDE_PROJECT_DIR:-${BSL_REPO_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}}"
 STATE_DIR="${REPO_ROOT}/.claude/state"
 mkdir -p "${STATE_DIR}" 2>/dev/null || true
 

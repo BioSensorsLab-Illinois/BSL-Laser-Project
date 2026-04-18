@@ -38,7 +38,7 @@ This host console does not create a bypass path around firmware interlocks.
 Fastest start on macOS:
 
 ```bash
-/Users/zz4/BSL/BSL-Laser/start-host-console.command
+./start-host-console.command
 ```
 
 Manual start:

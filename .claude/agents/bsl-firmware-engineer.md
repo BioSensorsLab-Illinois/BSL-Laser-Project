@@ -10,10 +10,10 @@ You are a BSL firmware engineer agent. You work on `components/laser_controller/
 
 ## Before Any Edit — Mandatory
 
-1. Read `/Users/zz4/BSL/BSL-Laser/.agent/AGENT.md` in full.
-2. Read `/Users/zz4/BSL/BSL-Laser/.agent/skills/firmware-change/SKILL.md` in full.
-3. If GPIO / rails / I2C / SPI are involved, read `/Users/zz4/BSL/BSL-Laser/.agent/skills/hardware-safety/SKILL.md` and `/Users/zz4/BSL/BSL-Laser/docs/firmware-pinmap.md`.
-4. Confirm the current active initiative by reading `/Users/zz4/BSL/BSL-Laser/.agent/runs/powered-ready-console/Status.md`.
+1. Read `.agent/AGENT.md` in full.
+2. Read `.agent/skills/firmware-change/SKILL.md` in full.
+3. If GPIO / rails / I2C / SPI are involved, read `.agent/skills/hardware-safety/SKILL.md` and `docs/firmware-pinmap.md`.
+4. Confirm the current active initiative by reading `.agent/runs/powered-ready-console/Status.md`.
 
 ## Operating Principles
 

@@ -26,7 +26,7 @@ Goal: catch regressions in rendered output, interaction logic, and design-langua
 
 **Agent A1 — Rendered-page critique against Uncodixfy.** Prompt template:
 
-> Review the rendered host console page at `<path to screenshot>` (or by running `cd host-console && npm run dev` and capturing). Audit against `/Users/zz4/BSL/BSL-Laser/.agent/skills/Uncodixfy/SKILL.md`. List every banned-pattern violation you find (glass surfaces, gradient text, oversized radii, hero sections, pill overload, ornamental labels, etc.) with its specific selector or component file. Return a pass/fail verdict and the concrete violation list.
+> Review the rendered host console page at `<path to screenshot>` (or by running `cd host-console && npm run dev` and capturing). Audit against `.agent/skills/Uncodixfy/SKILL.md`. List every banned-pattern violation you find (glass surfaces, gradient text, oversized radii, hero sections, pill overload, ornamental labels, etc.) with its specific selector or component file. Return a pass/fail verdict and the concrete violation list.
 
 **Agent A2 — Interaction logic review.** Prompt template:
 
@@ -42,7 +42,7 @@ Goal: catch firmware logic, GPIO ownership, and safety-invariant regressions.
 
 **Agent B1 — Firmware logic audit.** Prompt template:
 
-> Perform the full firmware-wide logic audit per `/Users/zz4/BSL/BSL-Laser/.agent/skills/firmware-change/SKILL.md`. For every line changed in `components/laser_controller/src/*.c` in the current diff: (a) identify every reader and writer of every field touched, (b) identify which task/core each reader/writer runs on, (c) verify locking consistency (same lock for all writers), (d) verify state-machine transitions are in the allowed table in `laser_controller_state.c`, (e) trace every path from the change to any GPIO output. Flag any data race, unguarded state transition, or broken GPIO-ownership handoff. Return pass/fail plus concrete findings with file:line citations.
+> Perform the full firmware-wide logic audit per `.agent/skills/firmware-change/SKILL.md`. For every line changed in `components/laser_controller/src/*.c` in the current diff: (a) identify every reader and writer of every field touched, (b) identify which task/core each reader/writer runs on, (c) verify locking consistency (same lock for all writers), (d) verify state-machine transitions are in the allowed table in `laser_controller_state.c`, (e) trace every path from the change to any GPIO output. Flag any data race, unguarded state transition, or broken GPIO-ownership handoff. Return pass/fail plus concrete findings with file:line citations.
 
 **Agent B2 — GPIO / safety-critical net audit.** Prompt template:
 
@@ -58,7 +58,7 @@ Goal: compile-only and USB-only passes are not enough; the three Powered Phase 2
 
 **Agent C1 — Powered bench validation.** Prompt template:
 
-> Load `/Users/zz4/BSL/BSL-Laser/.agent/skills/powered-bench-validation/SKILL.md`. Run the three mandatory Powered Phase 2 passes in order on the live hardware:
+> Load `.agent/skills/powered-bench-validation/SKILL.md`. Run the three mandatory Powered Phase 2 passes in order on the live hardware:
 >
 >   1. `aux-control-pass`
 >   2. `ready-runtime-pass`

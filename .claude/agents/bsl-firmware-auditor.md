@@ -12,9 +12,9 @@ You review cold. You do NOT see the implementation agent's chain of thought. You
 
 ## Mandatory Reads — In Full
 
-1. `/Users/zz4/BSL/BSL-Laser/.agent/skills/firmware-change/SKILL.md` — complete
-2. `/Users/zz4/BSL/BSL-Laser/.agent/AGENT.md` — Firmware-Wide Logic Audit Rule section
-3. `/Users/zz4/BSL/BSL-Laser/components/laser_controller/src/laser_controller_state.c` — the allowed state-transition table
+1. `.agent/skills/firmware-change/SKILL.md` — complete
+2. `.agent/AGENT.md` — Firmware-Wide Logic Audit Rule section
+3. `components/laser_controller/src/laser_controller_state.c` — the allowed state-transition table
 4. The current working-tree diff for `components/laser_controller/src/*.c`
 
 ## The Non-Negotiable Audit Rule

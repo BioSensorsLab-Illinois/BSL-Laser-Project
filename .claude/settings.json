@@ -3,13 +3,12 @@
   "env": {
     "MAX_THINKING_TOKENS": "63999",
     "BASH_DEFAULT_TIMEOUT_MS": "120000",
-    "BASH_MAX_TIMEOUT_MS": "600000",
-    "BSL_REPO_ROOT": "/Users/zz4/BSL/BSL-Laser"
+    "BASH_MAX_TIMEOUT_MS": "600000"
   },
   "outputStyle": "bsl-safety-critical",
   "statusLine": {
     "type": "command",
-    "command": "$BSL_REPO_ROOT/.claude/hooks/statusline.sh"
+    "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/statusline.sh"
   },
   "hooks": {
     "SessionStart": [
@@ -18,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "$BSL_REPO_ROOT/.claude/hooks/session-start-banner.sh"
+            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/session-start-banner.sh"
           }
         ]
       }
@@ -29,11 +28,11 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 $BSL_REPO_ROOT/.claude/hooks/pre-tool-use-firmware.py"
+            "command": "python3 ${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-tool-use-firmware.py"
           },
           {
             "type": "command",
-            "command": "python3 $BSL_REPO_ROOT/.claude/hooks/pre-tool-use-gui.py"
+            "command": "python3 ${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-tool-use-gui.py"
           }
         ]
       }
@@ -44,7 +43,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 $BSL_REPO_ROOT/.claude/hooks/post-tool-use-track.py"
+            "command": "python3 ${CLAUDE_PROJECT_DIR}/.claude/hooks/post-tool-use-track.py"
           }
         ]
       }
@@ -55,7 +54,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 $BSL_REPO_ROOT/.claude/hooks/user-prompt-reminder.py"
+            "command": "python3 ${CLAUDE_PROJECT_DIR}/.claude/hooks/user-prompt-reminder.py"
           }
         ]
       }
@@ -66,7 +65,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 $BSL_REPO_ROOT/.claude/hooks/stop-validation-check.py"
+            "command": "python3 ${CLAUDE_PROJECT_DIR}/.claude/hooks/stop-validation-check.py"
           }
         ]
       }
@@ -103,14 +102,14 @@
       "Bash(ls /dev/cu.*)",
       "Bash(ls -la*)",
       "Bash(pwd)",
-      "Bash(find /Users/zz4/BSL/BSL-Laser*)",
+      "Bash(find ${CLAUDE_PROJECT_DIR}*)",
       "Bash(chmod +x*)",
-      "Read(//Users/zz4/BSL/BSL-Laser/**)",
-      "Glob(//Users/zz4/BSL/BSL-Laser/**)",
-      "Grep(//Users/zz4/BSL/BSL-Laser/**)",
-      "Read(//Users/zz4/.claude/projects/-Users-zz4-BSL-BSL-Laser/**)",
-      "Read(//Users/zz4/.agents/skills/**)",
-      "Read(//Users/zz4/esp/**)"
+      "Read(${CLAUDE_PROJECT_DIR}/**)",
+      "Glob(${CLAUDE_PROJECT_DIR}/**)",
+      "Grep(${CLAUDE_PROJECT_DIR}/**)",
+      "Read(${HOME}/.claude/projects/**)",
+      "Read(${HOME}/.agents/skills/**)",
+      "Read(${HOME}/esp/**)"
     ],
     "deny": [
       "Bash(git push*)",

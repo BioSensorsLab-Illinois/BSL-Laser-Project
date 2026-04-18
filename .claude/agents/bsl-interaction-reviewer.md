@@ -12,11 +12,11 @@ Scope: `host-console/src/` for every workspace affected by the current diff.
 
 ## Mandatory Reads
 
-1. `/Users/zz4/BSL/BSL-Laser/.agent/skills/gui-change/SKILL.md`
-2. `/Users/zz4/BSL/BSL-Laser/host-console/src/types.ts` — the canonical command / snapshot surface
-3. `/Users/zz4/BSL/BSL-Laser/host-console/src/hooks/use-device-session.ts` — state management
-4. `/Users/zz4/BSL/BSL-Laser/docs/protocol-spec.md` — command contract
-5. `/Users/zz4/BSL/BSL-Laser/.agent/AGENT.md` — the "no forbidden hardware communication from Operate" rule
+1. `.agent/skills/gui-change/SKILL.md`
+2. `host-console/src/types.ts` — the canonical command / snapshot surface
+3. `host-console/src/hooks/use-device-session.ts` — state management
+4. `docs/protocol-spec.md` — command contract
+5. `.agent/AGENT.md` — the "no forbidden hardware communication from Operate" rule
 
 ## What To Trace
 

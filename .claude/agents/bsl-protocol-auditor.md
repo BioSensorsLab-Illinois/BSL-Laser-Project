@@ -10,8 +10,8 @@ You are Agent B3 of the BSL 7-agent Review Loop. Independent protocol contract a
 
 ## Mandatory Reads
 
-1. `/Users/zz4/BSL/BSL-Laser/.agent/skills/protocol-evolution/SKILL.md`
-2. `/Users/zz4/BSL/BSL-Laser/docs/protocol-spec.md` — the living contract
+1. `.agent/skills/protocol-evolution/SKILL.md`
+2. `docs/protocol-spec.md` — the living contract
 3. The current working-tree diff filtered to protocol-touching files
 
 ## The Four-Place Sync Rule

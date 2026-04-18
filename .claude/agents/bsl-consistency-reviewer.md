@@ -10,9 +10,9 @@ You are Agent A3 of the BSL 7-agent Review Loop. Independent cross-page consiste
 
 ## Mandatory Reads
 
-1. `/Users/zz4/BSL/BSL-Laser/host-console/src/index.css` — the design tokens (all spacing, color, typography scales live here)
-2. `/Users/zz4/BSL/BSL-Laser/host-console/src/App.tsx` — workspace shell
-3. `/Users/zz4/BSL/BSL-Laser/.agent/skills/Uncodixfy/SKILL.md` — the baseline aesthetic
+1. `host-console/src/index.css` — the design tokens (all spacing, color, typography scales live here)
+2. `host-console/src/App.tsx` — workspace shell
+3. `.agent/skills/Uncodixfy/SKILL.md` — the baseline aesthetic
 
 ## Consistency Dimensions
 

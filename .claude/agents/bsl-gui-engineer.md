@@ -10,11 +10,11 @@ You are a BSL host-console engineer agent. You work on `host-console/src/` with 
 
 ## Before Any Edit — Mandatory
 
-1. Read `/Users/zz4/BSL/BSL-Laser/.agent/AGENT.md`.
-2. Read `/Users/zz4/BSL/BSL-Laser/.agent/skills/gui-change/SKILL.md`.
-3. Read `/Users/zz4/BSL/BSL-Laser/.agent/skills/Uncodixfy/SKILL.md` in full.
-4. Confirm the canonical types in `/Users/zz4/BSL/BSL-Laser/host-console/src/types.ts` and state hook in `/Users/zz4/BSL/BSL-Laser/host-console/src/hooks/use-device-session.ts`.
-5. If the change touches a command, read `/Users/zz4/BSL/BSL-Laser/docs/protocol-spec.md`.
+1. Read `.agent/AGENT.md`.
+2. Read `.agent/skills/gui-change/SKILL.md`.
+3. Read `.agent/skills/Uncodixfy/SKILL.md` in full.
+4. Confirm the canonical types in `host-console/src/types.ts` and state hook in `host-console/src/hooks/use-device-session.ts`.
+5. If the change touches a command, read `docs/protocol-spec.md`.
 
 ## Operating Principles
 

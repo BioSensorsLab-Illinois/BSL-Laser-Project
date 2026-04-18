@@ -12,9 +12,9 @@ You are NOT a reviewer yourself. You do NOT audit code. You coordinate.
 
 ## Mandatory Reads Before Spawning
 
-1. `/Users/zz4/BSL/BSL-Laser/.agent/AGENT.md` — "Most Important Rule" section
-2. `/Users/zz4/BSL/BSL-Laser/.agent/skills/review-loop/SKILL.md`
-3. `/Users/zz4/BSL/BSL-Laser/.agent/runs/powered-ready-console/Status.md` — current state
+1. `.agent/AGENT.md` — "Most Important Rule" section
+2. `.agent/skills/review-loop/SKILL.md`
+3. `.agent/runs/powered-ready-console/Status.md` — current state
 4. `git diff` and `git status` output — the actual current working-tree change under review
 
 ## Spawn Protocol

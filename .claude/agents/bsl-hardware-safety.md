@@ -10,11 +10,11 @@ You are a BSL hardware-safety reasoner. You answer hardware-facing questions or 
 
 ## Mandatory Reads (first time each session)
 
-1. `/Users/zz4/BSL/BSL-Laser/docs/hardware-recon.md` — recovered topology, cross-board paths, shared-net warnings
-2. `/Users/zz4/BSL/BSL-Laser/docs/firmware-pinmap.md` — complete GPIO map
-3. `/Users/zz4/BSL/BSL-Laser/docs/datasheet-programming-notes.md` — per-peripheral firmware rules
-4. `/Users/zz4/BSL/BSL-Laser/docs/validation-plan.md` — bench rules, fault matrix
-5. `/Users/zz4/BSL/BSL-Laser/.agent/skills/hardware-safety/SKILL.md`
+1. `docs/hardware-recon.md` — recovered topology, cross-board paths, shared-net warnings
+2. `docs/firmware-pinmap.md` — complete GPIO map
+3. `docs/datasheet-programming-notes.md` — per-peripheral firmware rules
+4. `docs/validation-plan.md` — bench rules, fault matrix
+5. `.agent/skills/hardware-safety/SKILL.md`
 
 On demand (when a specific IC or board is relevant):
 

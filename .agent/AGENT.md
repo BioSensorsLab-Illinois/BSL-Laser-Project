@@ -322,12 +322,12 @@ The handoff docs are the memory. Hidden context is not.
 
 If anything hardware-facing is uncertain, check these first:
 
-- [docs/hardware-recon.md](/Users/zz4/BSL/BSL-Laser/docs/hardware-recon.md)
-- [docs/firmware-pinmap.md](/Users/zz4/BSL/BSL-Laser/docs/firmware-pinmap.md)
-- [docs/datasheet-programming-notes.md](/Users/zz4/BSL/BSL-Laser/docs/datasheet-programming-notes.md)
-- [docs/validation-plan.md](/Users/zz4/BSL/BSL-Laser/docs/validation-plan.md)
-- the PDFs in [docs/Datasheets](/Users/zz4/BSL/BSL-Laser/docs/Datasheets)
-- the PDFs and netlists in [docs/Schematics](/Users/zz4/BSL/BSL-Laser/docs/Schematics)
+- [docs/hardware-recon.md](docs/hardware-recon.md)
+- [docs/firmware-pinmap.md](docs/firmware-pinmap.md)
+- [docs/datasheet-programming-notes.md](docs/datasheet-programming-notes.md)
+- [docs/validation-plan.md](docs/validation-plan.md)
+- the PDFs in [docs/Datasheets](docs/Datasheets)
+- the PDFs and netlists in [docs/Schematics](docs/Schematics)
 
 ## Future Implementation Requirements To Preserve
 

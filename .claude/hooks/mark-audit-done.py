@@ -12,11 +12,19 @@ Usage:
     .claude/hooks/mark-audit-done.py powered
 """
 
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-REPO_ROOT = Path("/Users/zz4/BSL/BSL-Laser")
+# Portable repo-root resolution: prefer Claude Code's project dir, fall back
+# to the legacy BSL_REPO_ROOT env var, then to this hook's own location
+# (<repo>/.claude/hooks/<file>.py → parents[2] == <repo>).
+REPO_ROOT = Path(
+    os.environ.get("CLAUDE_PROJECT_DIR")
+    or os.environ.get("BSL_REPO_ROOT")
+    or Path(__file__).resolve().parents[2]
+)
 STATE_DIR = REPO_ROOT / ".claude" / "state"
 
 

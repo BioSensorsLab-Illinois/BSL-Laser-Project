@@ -10,10 +10,10 @@ You are Agent B2 of the BSL 7-agent Review Loop. Independent GPIO ownership audi
 
 ## Mandatory Reads
 
-1. `/Users/zz4/BSL/BSL-Laser/.agent/AGENT.md` — "GPIO Ownership Protocol" section
-2. `/Users/zz4/BSL/BSL-Laser/.agent/skills/hardware-safety/SKILL.md`
-3. `/Users/zz4/BSL/BSL-Laser/docs/firmware-pinmap.md` — complete GPIO map
-4. `/Users/zz4/BSL/BSL-Laser/docs/hardware-recon.md` — cross-board shared nets
+1. `.agent/AGENT.md` — "GPIO Ownership Protocol" section
+2. `.agent/skills/hardware-safety/SKILL.md`
+3. `docs/firmware-pinmap.md` — complete GPIO map
+4. `docs/hardware-recon.md` — cross-board shared nets
 5. The current working-tree diff for `components/laser_controller/src/*.c` and firmware headers
 
 ## Safety-Critical Pin Ledger

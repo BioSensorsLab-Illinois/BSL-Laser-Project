@@ -12,10 +12,16 @@ not afterwards.
 """
 
 import json
+import os
 import sys
 from pathlib import Path
 
-REPO_ROOT = Path("/Users/zz4/BSL/BSL-Laser")
+# Portable repo-root resolution — see mark-audit-done.py for rationale.
+REPO_ROOT = Path(
+    os.environ.get("CLAUDE_PROJECT_DIR")
+    or os.environ.get("BSL_REPO_ROOT")
+    or Path(__file__).resolve().parents[2]
+)
 FIRMWARE_PREFIX = REPO_ROOT / "components" / "laser_controller" / "src"
 STATE_DIR = REPO_ROOT / ".claude" / "state"
 

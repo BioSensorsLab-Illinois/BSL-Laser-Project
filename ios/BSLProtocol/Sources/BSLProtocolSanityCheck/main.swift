@@ -563,8 +563,21 @@ func run() async {
 
     let integrationEnabled = ProcessInfo.processInfo.environment["BSL_INTEGRATION"] == "1"
     if integrationEnabled {
-        let root = ProcessInfo.processInfo.environment["BSL_REPO_ROOT"]
-            ?? "/Users/zz4/BSL/BSL-Laser"
+        // Portable repo-root resolution. Prefer BSL_REPO_ROOT (explicit
+        // override), else CLAUDE_PROJECT_DIR (Claude Code sets this), else
+        // walk up from this source file to the repo root.
+        let env = ProcessInfo.processInfo.environment
+        let root: String = {
+            if let v = env["BSL_REPO_ROOT"], !v.isEmpty { return v }
+            if let v = env["CLAUDE_PROJECT_DIR"], !v.isEmpty { return v }
+            // main.swift lives at ios/BSLProtocol/Sources/BSLProtocolSanityCheck/main.swift
+            return URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()  // BSLProtocolSanityCheck
+                .deletingLastPathComponent()  // Sources
+                .deletingLastPathComponent()  // BSLProtocol
+                .deletingLastPathComponent()  // ios
+                .path
+        }()
         let port = 8090
         do {
             print("--- starting Python mock on port \(port) ---")

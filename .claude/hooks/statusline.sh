@@ -3,7 +3,8 @@
 # Called frequently by Claude Code. Keep it fast.
 
 set -u
-REPO_ROOT="${BSL_REPO_ROOT:-/Users/zz4/BSL/BSL-Laser}"
+# Portable repo-root resolution — see session-start-banner.sh for rationale.
+REPO_ROOT="${CLAUDE_PROJECT_DIR:-${BSL_REPO_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}}"
 STATE_DIR="${REPO_ROOT}/.claude/state"
 
 BRANCH=$(git -C "${REPO_ROOT}" branch --show-current 2>/dev/null || echo no-branch)
