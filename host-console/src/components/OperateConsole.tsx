@@ -256,6 +256,63 @@ export function OperateConsole({
     }
   }, [])
 
+  /*
+   * 2026-04-17 (audit round 3): runtime-control gate that matches what
+   * the firmware actually enforces. `operate.set_target`,
+   * `operate.set_output`, `operate.set_modulation` are all rejected by
+   * the firmware unless `deployment.active && deployment.ready` (see
+   * `laser_controller_comms_is_runtime_control_command`). Before this
+   * round the UI kept the sliders enabled whenever `connected`, so the
+   * operator could type a new setpoint, blur, and see the draft "30.0"
+   * sticky on screen — thinking the commit had succeeded — when in
+   * fact the firmware had returned `"Complete the deployment checklist
+   * successfully before using runtime control commands."` The reveal
+   * came on navigation: `OperateConsole` unmounted, the draft died,
+   * the remount sourced from the untouched live snapshot, and the old
+   * value reappeared. Now the gate is explicit and the operator can
+   * see why the input is disabled before typing.
+   */
+  const runtimeControlAllowed =
+    connected && deployment.active && deployment.ready
+  const runtimeControlBlockReason = !connected
+    ? 'No controller is connected.'
+    : !deployment.active
+      ? 'Enter deployment mode first. Runtime setpoints take effect only after the checklist qualifies TEC + LD.'
+      : !deployment.ready
+        ? 'The deployment checklist must reach the ready posture before runtime setpoints can be changed.'
+        : undefined
+
+  /*
+   * Last commit-failure error surfaced to the operator. The commit
+   * functions below await the ack, and on `!result.ok` they set this
+   * string + clear the associated draft so the displayed value snaps
+   * back to the firmware's live truth immediately (not only on the
+   * next page nav). Null clears the banner. A 6 s auto-clear timer is
+   * armed on every set to keep the banner from lingering forever.
+   */
+  const [runtimeCommitError, setRuntimeCommitErrorRaw] = useState<string | null>(null)
+  const runtimeCommitErrorTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  function setRuntimeCommitError(msg: string | null) {
+    if (runtimeCommitErrorTimer.current) {
+      clearTimeout(runtimeCommitErrorTimer.current)
+      runtimeCommitErrorTimer.current = null
+    }
+    setRuntimeCommitErrorRaw(msg)
+    if (msg) {
+      runtimeCommitErrorTimer.current = setTimeout(() => {
+        setRuntimeCommitErrorRaw(null)
+        runtimeCommitErrorTimer.current = null
+      }, 6000)
+    }
+  }
+  useEffect(() => {
+    return () => {
+      if (runtimeCommitErrorTimer.current) {
+        clearTimeout(runtimeCommitErrorTimer.current)
+      }
+    }
+  }, [])
+
   /* -------- active step for the focus card -------- */
 
   const activeStep = deployment.steps.find((step) => step.status === 'in_progress')
@@ -330,8 +387,8 @@ export function OperateConsole({
     note: string,
     args?: Record<string, number | string | boolean>,
     timeoutMs = 3200,
-  ) {
-    await onIssueCommandAwaitAck(cmd, 'write', note, args, { timeoutMs })
+  ): Promise<{ ok: boolean; note: string }> {
+    return onIssueCommandAwaitAck(cmd, 'write', note, args, { timeoutMs })
   }
 
   function updateRuntimeTemp(nextValue: string) {
@@ -360,27 +417,34 @@ export function OperateConsole({
     }))
   }
 
-  function commitRuntimeTarget(source: 'temp' | 'lambda' = targetDraft.source) {
+  async function commitRuntimeTarget(
+    source: 'temp' | 'lambda' = targetDraft.source,
+  ) {
     /*
-     * Allow runtime setpoint commits anytime the controller is connected,
-     * regardless of deployment state (2026-04-17 user directive). The
-     * firmware persists `runtime_target_*` to NVS via the service profile
-     * and reloads on boot, so adjustments out-of-deployment survive
-     * power cycles.
-     *
-     * 2026-04-16 user directive: the typed setpoint must stay in the
-     * input field even if the firmware has not yet echoed it back in
-     * telemetry. Previously a `.finally()` cleared `dirty`, which then
-     * fell the displayed value back to `liveRuntimeTempC` — if the
-     * firmware's live telemetry was still the previous value (or zero
-     * on a cold boot), the user saw their input "snap back" and
-     * concluded the control was dead. Now the draft is kept sticky:
-     * the value the user typed remains displayed until they type
-     * another value. This lets the user tune + save deployment
-     * parameters without the field ghosting back to zero between
-     * commits.
+     * 2026-04-17 (audit round 3): the firmware rejects
+     * `operate.set_target` unless `deployment.active && deployment.ready`
+     * (see `laser_controller_comms_is_runtime_control_command`). The
+     * previous version of this function kept the draft sticky on
+     * commit and fired `void issue(...)` without awaiting the ack —
+     * so a rejection was invisible to the operator. The symptom the
+     * user reported was: type 30.0, blur, display shows 30.0, switch
+     * pages, come back → display snaps back to 28.7 because the
+     * commit was never applied. Now the input is pre-disabled when
+     * the gate is closed; we await the ack; and on `!ok` we drop the
+     * draft dirty flag so the displayed value snaps back to the
+     * firmware truth immediately AND surface the firmware error text
+     * to the operator. On success the draft stays sticky so the user
+     * can see what they committed until the next telemetry echo
+     * overwrites it.
      */
-    if (!connected) return
+    if (!runtimeControlAllowed) {
+      setRuntimeCommitError(
+        runtimeControlBlockReason ||
+          'Runtime setpoint commit is not available right now.',
+      )
+      setTargetDraft((current) => ({ ...current, dirty: false }))
+      return
+    }
 
     const tempC = clampTecTempC(parseNumber(runtimeTempC, liveSnapshot.tec.targetTempC))
     const lambdaNm = clampTecWavelengthNm(
@@ -394,7 +458,7 @@ export function OperateConsole({
       source,
     })
 
-    void issue(
+    const result = await issue(
       'operate.set_target',
       source === 'lambda'
         ? 'Update the runtime wavelength setpoint.'
@@ -403,40 +467,64 @@ export function OperateConsole({
         ? { target_mode: 'lambda', lambda_nm: lambdaNm }
         : { target_mode: 'temp', temp_c: tempC },
     )
+    if (!result.ok) {
+      setRuntimeCommitError(result.note || 'Runtime setpoint commit rejected.')
+      setTargetDraft((current) => ({ ...current, dirty: false }))
+    } else {
+      setRuntimeCommitError(null)
+    }
   }
 
-  function commitRequestedCurrent() {
+  async function commitRequestedCurrent() {
     /*
-     * Allow current-setpoint commits anytime connected. The firmware's
-     * `operate.set_output` accepts the request and stores it without
-     * triggering hardware unless `enabled` is also flipped — and we
-     * preserve the existing `enabled` value in the args, so this commit
-     * never enables NIR by itself. (2026-04-16)
-     *
-     * 2026-04-16 user directive: once the operator types a current
-     * value and commits it, the displayed value must stay at what they
-     * typed until they change it again. Previously `.finally()` cleared
-     * `dirty`, which caused the slider to snap back to `bench.requested
-     * CurrentA` — which could be zero or a stale value, making the
-     * operator think the field was dead. The draft now persists as the
-     * displayed value so saving deployment defaults (without actually
-     * firing NIR) is usable.
+     * 2026-04-17 (audit round 3): mirror the gate + await pattern of
+     * commitRuntimeTarget. `operate.set_output` is rejected pre-ready
+     * just like `operate.set_target`, so the same snap-back symptom
+     * applied to LD current. Now the slider is pre-disabled when the
+     * firmware gate is closed; the ack is awaited; on failure the
+     * draft is cleared (displays the truth) and the error is
+     * surfaced; on success the draft stays sticky until the next
+     * telemetry echo.
      */
-    if (!connected) return
+    if (!runtimeControlAllowed) {
+      setRuntimeCommitError(
+        runtimeControlBlockReason ||
+          'Runtime setpoint commit is not available right now.',
+      )
+      setCurrentDraft((current) => ({ ...current, dirty: false }))
+      return
+    }
 
     setCurrentDraft({ dirty: true, value: formatNumber(requestedCurrentA, 2) })
-    void issue(
+    const result = await issue(
       'operate.set_output',
       bench.requestedNirEnabled
         ? 'Update the live constant NIR current request.'
         : 'Update the stored constant NIR current while output stays off.',
       { enabled: bench.requestedNirEnabled, current_a: requestedCurrentA },
     )
+    if (!result.ok) {
+      setRuntimeCommitError(result.note || 'NIR current commit rejected.')
+      setCurrentDraft((current) => ({ ...current, dirty: false }))
+    } else {
+      setRuntimeCommitError(null)
+    }
   }
 
-  function commitModulation(nextEnabled = modulationEnabled) {
-    /* Modulation params are stored values; commit anytime connected. */
-    if (!connected) return
+  async function commitModulation(nextEnabled = modulationEnabled) {
+    /*
+     * 2026-04-17 (audit round 3): same gate + await pattern. If the
+     * firmware would reject, the draft is cleared up-front so the
+     * displayed value reflects truth; error surfaced.
+     */
+    if (!runtimeControlAllowed) {
+      setRuntimeCommitError(
+        runtimeControlBlockReason ||
+          'Modulation commit is not available right now.',
+      )
+      setModulationDraft((current) => ({ ...current, dirty: false }))
+      return
+    }
 
     const frequencyHz = Math.max(
       0,
@@ -454,7 +542,7 @@ export function OperateConsole({
       dutyPct: String(dutyCyclePct),
     })
 
-    void issue(
+    const result = await issue(
       'operate.set_modulation',
       'Update host modulation parameters.',
       {
@@ -462,9 +550,13 @@ export function OperateConsole({
         frequency_hz: frequencyHz,
         duty_cycle_pct: dutyCyclePct,
       },
-    ).finally(() => {
-      setModulationDraft((current) => ({ ...current, dirty: false }))
-    })
+    )
+    setModulationDraft((current) => ({ ...current, dirty: false }))
+    if (!result.ok) {
+      setRuntimeCommitError(result.note || 'Modulation commit rejected.')
+    } else {
+      setRuntimeCommitError(null)
+    }
   }
 
   /* LED commit — debounced 200ms trailing, so dragging the slider fires
@@ -499,6 +591,14 @@ export function OperateConsole({
       ledCommitTimer.current = null
     }
     const nextEnabled = !bench.requestedLedEnabled
+    /*
+     * 2026-04-17 (audit round 2, S3): clear the brightness-draft
+     * dirty flag on the next telemetry cycle. Without this the
+     * toggleLed path left `ledDraft.dirty=true` (set by an in-flight
+     * scheduleLedCommit) after flushing the pending timer, so the
+     * slider snapped back to the firmware-echoed brightness on the
+     * next snapshot and the operator's typed value was lost.
+     */
     void issue(
       'operate.set_led',
       nextEnabled ? 'Enable the GPIO6 LED request.' : 'Disable the GPIO6 LED request.',
@@ -507,7 +607,9 @@ export function OperateConsole({
         duty_cycle_pct: nextEnabled ? requestedLedBrightnessPct : 0,
         frequency_hz: 20000,
       },
-    )
+    ).finally(() => {
+      setLedDraft((current) => ({ ...current, dirty: false }))
+    })
   }
 
   /* -------- render -------- */
@@ -566,24 +668,26 @@ export function OperateConsole({
           <button
             type="button"
             className="action-button is-inline"
-            disabled={!connected || deployment.running}
+            disabled={!connected || deployment.running || deployment.active}
             title={
               !connected
                 ? 'No controller connected.'
                 : deployment.running
                   ? 'Deployment checklist is running — wait for it to complete.'
-                  : undefined
+                  : deployment.active
+                    ? 'Deployment mode is already active. Use "Exit deployment" first if you want to restart it.'
+                    : undefined
             }
             onClick={() =>
               void issue(
                 'deployment.enter',
-                'Re-enter deployment mode, clear faults, reclaim ownership, and hold GPIO6 low.',
+                'Enter deployment mode, clear faults, reclaim ownership, and hold GPIO6 low.',
                 undefined,
                 4000,
               )
             }
           >
-            Re-enter deployment
+            Enter deployment
           </button>
           <button
             type="button"
@@ -670,11 +774,13 @@ export function OperateConsole({
           <button
             type="button"
             className="action-button is-inline"
-            disabled={!connected}
+            disabled={!connected || deployment.running}
             title={
-              connected
-                ? 'Persist the current NIR current + TEC target as the deployment defaults. Next boot starts the 5-second auto-deploy at these values.'
-                : 'No controller connected.'
+              !connected
+                ? 'No controller connected.'
+                : deployment.running
+                  ? 'Deployment checklist is running — wait for it to complete before saving defaults.'
+                  : 'Persist the current NIR current + TEC target as the deployment defaults. Next boot starts the 5-second auto-deploy at these values.'
             }
             onClick={() =>
               void issue(
@@ -739,7 +845,11 @@ export function OperateConsole({
             <div className="section-head">
               <div>
                 <h3>Checklist</h3>
-                <p>25 °C deployment target. Rows advance live.</p>
+                <p>
+                  {deployment.targetMode === 'lambda'
+                    ? `${formatNumber(deployment.targetLambdaNm, 1)} nm deployment target. Rows advance live.`
+                    : `${formatNumber(deployment.targetTempC, 1)} °C deployment target. Rows advance live.`}
+                </p>
               </div>
               <span
                 className={
@@ -931,11 +1041,11 @@ export function OperateConsole({
                     value={clampTecTempC(
                       parseNumber(runtimeTempC, liveSnapshot.tec.targetTempC),
                     )}
-                    disabled={!connected}
-                    title={connected ? undefined : 'No controller connected.'}
+                    disabled={!runtimeControlAllowed}
+                    title={runtimeControlBlockReason}
                     onChange={(event) => updateRuntimeTemp(event.target.value)}
-                    onMouseUp={() => commitRuntimeTarget('temp')}
-                    onTouchEnd={() => commitRuntimeTarget('temp')}
+                    onMouseUp={() => { void commitRuntimeTarget('temp') }}
+                    onTouchEnd={() => { void commitRuntimeTarget('temp') }}
                   />
                 </label>
                 <label className="field">
@@ -946,12 +1056,12 @@ export function OperateConsole({
                     max="65"
                     step="0.1"
                     value={runtimeTempC}
-                    disabled={!connected}
-                    title={connected ? undefined : 'No controller connected.'}
+                    disabled={!runtimeControlAllowed}
+                    title={runtimeControlBlockReason}
                     onChange={(event) => updateRuntimeTemp(event.target.value)}
-                    onBlur={() => commitRuntimeTarget('temp')}
+                    onBlur={() => { void commitRuntimeTarget('temp') }}
                     onKeyDown={(event) => {
-                      if (event.key === 'Enter') commitRuntimeTarget('temp')
+                      if (event.key === 'Enter') { void commitRuntimeTarget('temp') }
                     }}
                   />
                 </label>
@@ -968,11 +1078,11 @@ export function OperateConsole({
                     value={clampTecWavelengthNm(
                       parseNumber(runtimeLambdaNm, liveSnapshot.tec.targetLambdaNm),
                     )}
-                    disabled={!connected}
-                    title={connected ? undefined : 'No controller connected.'}
+                    disabled={!runtimeControlAllowed}
+                    title={runtimeControlBlockReason}
                     onChange={(event) => updateRuntimeLambda(event.target.value)}
-                    onMouseUp={() => commitRuntimeTarget('lambda')}
-                    onTouchEnd={() => commitRuntimeTarget('lambda')}
+                    onMouseUp={() => { void commitRuntimeTarget('lambda') }}
+                    onTouchEnd={() => { void commitRuntimeTarget('lambda') }}
                   />
                 </label>
                 <label className="field">
@@ -983,17 +1093,27 @@ export function OperateConsole({
                     max="790"
                     step="0.1"
                     value={runtimeLambdaNm}
-                    disabled={!connected}
-                    title={connected ? undefined : 'No controller connected.'}
+                    disabled={!runtimeControlAllowed}
+                    title={runtimeControlBlockReason}
                     onChange={(event) => updateRuntimeLambda(event.target.value)}
-                    onBlur={() => commitRuntimeTarget('lambda')}
+                    onBlur={() => { void commitRuntimeTarget('lambda') }}
                     onKeyDown={(event) => {
-                      if (event.key === 'Enter') commitRuntimeTarget('lambda')
+                      if (event.key === 'Enter') { void commitRuntimeTarget('lambda') }
                     }}
                   />
                 </label>
               </div>
             </div>
+            {!runtimeControlAllowed && runtimeControlBlockReason && (
+              <p className="inline-help" role="status">
+                {runtimeControlBlockReason}
+              </p>
+            )}
+            {runtimeCommitError && (
+              <p className="inline-help" role="alert" data-tone="critical">
+                {runtimeCommitError}
+              </p>
+            )}
           </section>
 
           </div>
@@ -1041,17 +1161,19 @@ export function OperateConsole({
                 step="0.05"
                 value={requestedCurrentA}
                 /*
-                 * 2026-04-16 user directive: NIR current setpoint is a
-                 * stored value, no hardware actuation. Allow editing
-                 * anytime the controller is connected — in or out of
-                 * deployment, regardless of `nirEnabled` (which gates
-                 * the actual Output on button).
+                 * 2026-04-17 (audit round 3): gate matches the firmware
+                 * `is_runtime_control_command` reject path. Previously
+                 * disabled only on `!connected`, which let the operator
+                 * type + blur a new current value, see it stick on
+                 * screen, then discover on page nav that the firmware
+                 * had rejected the commit. Now pre-disabled with the
+                 * real reason.
                  */
-                disabled={!connected}
-                title={connected ? undefined : 'No controller connected.'}
+                disabled={!runtimeControlAllowed}
+                title={runtimeControlBlockReason}
                 onChange={(event) => setCurrentDraft({ dirty: true, value: event.target.value })}
-                onMouseUp={commitRequestedCurrent}
-                onTouchEnd={commitRequestedCurrent}
+                onMouseUp={() => { void commitRequestedCurrent() }}
+                onTouchEnd={() => { void commitRequestedCurrent() }}
               />
             </label>
 
@@ -1064,12 +1186,12 @@ export function OperateConsole({
                   max="5.2"
                   step="0.05"
                   value={laserCurrentA}
-                  disabled={!connected}
-                  title={connected ? undefined : 'No controller connected.'}
+                  disabled={!runtimeControlAllowed}
+                  title={runtimeControlBlockReason}
                   onChange={(event) => setCurrentDraft({ dirty: true, value: event.target.value })}
-                  onBlur={commitRequestedCurrent}
+                  onBlur={() => { void commitRequestedCurrent() }}
                   onKeyDown={(event) => {
-                    if (event.key === 'Enter') commitRequestedCurrent()
+                    if (event.key === 'Enter') { void commitRequestedCurrent() }
                   }}
                 />
               </label>
@@ -1108,8 +1230,8 @@ export function OperateConsole({
                 <input
                   type="number"
                   value={modulationFrequencyHz}
-                  disabled={!connected}
-                  title={connected ? undefined : 'No controller connected.'}
+                  disabled={!runtimeControlAllowed}
+                  title={runtimeControlBlockReason}
                   onChange={(event) =>
                     setModulationDraft((current) => ({
                       ...current,
@@ -1117,9 +1239,9 @@ export function OperateConsole({
                       frequencyHz: event.target.value,
                     }))
                   }
-                  onBlur={() => commitModulation()}
+                  onBlur={() => { void commitModulation() }}
                   onKeyDown={(event) => {
-                    if (event.key === 'Enter') commitModulation()
+                    if (event.key === 'Enter') { void commitModulation() }
                   }}
                 />
               </label>
@@ -1128,8 +1250,8 @@ export function OperateConsole({
                 <input
                   type="number"
                   value={modulationDutyPct}
-                  disabled={!connected}
-                  title={connected ? undefined : 'No controller connected.'}
+                  disabled={!runtimeControlAllowed}
+                  title={runtimeControlBlockReason}
                   onChange={(event) =>
                     setModulationDraft((current) => ({
                       ...current,
@@ -1137,9 +1259,9 @@ export function OperateConsole({
                       dutyPct: event.target.value,
                     }))
                   }
-                  onBlur={() => commitModulation()}
+                  onBlur={() => { void commitModulation() }}
                   onKeyDown={(event) => {
-                    if (event.key === 'Enter') commitModulation()
+                    if (event.key === 'Enter') { void commitModulation() }
                   }}
                 />
               </label>
@@ -1149,8 +1271,8 @@ export function OperateConsole({
               <input
                 type="checkbox"
                 checked={modulationEnabled}
-                disabled={!connected}
-                title={connected ? undefined : 'No controller connected.'}
+                disabled={!runtimeControlAllowed}
+                title={runtimeControlBlockReason}
                 onChange={(event) => {
                   const nextEnabled = event.target.checked
                   setModulationDraft((current) => ({
@@ -1158,7 +1280,7 @@ export function OperateConsole({
                     dirty: true,
                     enabled: nextEnabled,
                   }))
-                  commitModulation(nextEnabled)
+                  void commitModulation(nextEnabled)
                 }}
               />
               <span>Enable PCN modulation</span>

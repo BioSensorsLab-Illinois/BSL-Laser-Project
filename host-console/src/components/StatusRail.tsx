@@ -1,4 +1,8 @@
-import { motion } from 'framer-motion'
+/* 2026-04-17 (Uncodixfy polish): framer-motion removed — the
+ * `motion.article` slide-in here was a transform-Y animation with
+ * staggered delay, a banned pattern per the design spec. Plain
+ * `<article>` renders instantly with the intended solid-border,
+ * solid-background look. */
 import { Crosshair, Gauge, PlugZap, ScanLine, ShieldAlert, ThermometerSnowflake } from 'lucide-react'
 
 import { ProgressMeter } from './ProgressMeter'
@@ -39,19 +43,38 @@ function describeStripAvailability(
   status: BringupModuleStatus,
   label: string,
 ): StripAvailability {
+  /*
+   * 2026-04-17 (field report): the rail card used to render
+   * "Not installed" whenever `expectedPresent === false`, even when
+   * the module was physically detected and healthy. The operator-
+   * visible effect was that a working bench (IMU returning valid
+   * pitch, TOF returning valid distance, PD negotiated, TEC
+   * telemetry flowing) showed five "Not installed" cards because the
+   * bring-up declaration form had not been filled in.
+   *
+   * Data-wins policy: if the module is detected AND healthy, show the
+   * value regardless of the declaration flag. Only show
+   * "Not installed" when ALL THREE are false (not expected, not
+   * detected, not healthy). Operators still see "Awaiting probe" or
+   * "Needs check" when they DID declare the module but it is not
+   * responding, so the declaration workflow keeps its useful gate.
+   */
+  const detectedAndHealthy = status.detected && status.healthy
+  const monitored = moduleMeta[key].validationMode === 'monitored'
+
+  if (detectedAndHealthy || monitored) {
+    return {
+      available: true,
+      value: '',
+      detail: '',
+    }
+  }
+
   if (!status.expectedPresent) {
     return {
       available: false,
       value: 'Not installed',
       detail: `${label} is not declared on this bench build.`,
-    }
-  }
-
-  if (moduleMeta[key].validationMode === 'monitored') {
-    return {
-      available: true,
-      value: '',
-      detail: '',
     }
   }
 
@@ -63,18 +86,10 @@ function describeStripAvailability(
     }
   }
 
-  if (!status.healthy) {
-    return {
-      available: false,
-      value: 'Needs check',
-      detail: `${label} responded, but it is not marked healthy.`,
-    }
-  }
-
   return {
-    available: true,
-    value: '',
-    detail: '',
+    available: false,
+    value: 'Needs check',
+    detail: `${label} responded, but it is not marked healthy.`,
   }
 }
 
@@ -140,11 +155,56 @@ export function StatusRail({ snapshot, telemetryStore }: StatusRailProps) {
   const pitchLimitDeg = getHorizonPitchLimitDeg(liveSnapshot)
   const pitchClearDeg = getHorizonPitchClearDeg(liveSnapshot)
   const tecPercent = computeTecSettlePercent(liveSnapshot)
-  const pdAvailability = describeStripAvailability('pd', liveModules.pd, 'USB-PD')
-  const tofAvailability = describeStripAvailability('tof', liveModules.tof, 'ToF range sensing')
-  const imuAvailability = describeStripAvailability('imu', liveModules.imu, 'IMU posture sensing')
-  const tecAvailability = describeStripAvailability('tec', liveModules.tec, 'TEC control')
-  const laserAvailability = describeStripAvailability('laserDriver', liveModules.laserDriver, 'Laser driver')
+  /*
+   * 2026-04-17 (field report): availability now follows the RUNTIME
+   * telemetry validity flags, not the bring-up declaration + probe
+   * status. Before this change the rail cards said "Not installed"
+   * after a fresh boot until the operator entered service mode (or
+   * deployment) — because `bringup.modules[].detected` only flips
+   * true after an explicit probe. But `peripherals.*.reachable` +
+   * the domain `.valid` flags (`pd.contractValid`, `tof.valid`,
+   * `imu.valid`, `tec.telemetryValid`, `laser.telemetryValid`)
+   * update tick-by-tick from the control loop, independent of the
+   * declaration workflow. Using those as the availability gate
+   * means the rail reflects the actual bench state the moment
+   * telemetry starts flowing. The old describeStripAvailability
+   * helper is kept for the inspector elsewhere; these rail-specific
+   * overrides use the runtime flags.
+   */
+  const pdAvailable =
+    liveSnapshot.peripherals.pd.reachable ||
+    liveSnapshot.pd.contractValid ||
+    liveSnapshot.pd.negotiatedPowerW > 0
+  const tofAvailable =
+    liveSnapshot.peripherals.tof.reachable ||
+    liveSnapshot.tof.valid ||
+    liveSnapshot.tof.distanceM > 0
+  const imuAvailable =
+    liveSnapshot.peripherals.imu.reachable ||
+    liveSnapshot.imu.valid
+  const tecAvailable =
+    liveSnapshot.rails.tec.pgood ||
+    liveSnapshot.tec.telemetryValid ||
+    liveSnapshot.tec.tempC > 0
+  const laserAvailable =
+    liveSnapshot.rails.ld.pgood ||
+    liveSnapshot.laser.telemetryValid ||
+    liveSnapshot.laser.driverTempC > 0
+  const pdAvailability = pdAvailable
+    ? { available: true, value: '', detail: '' }
+    : describeStripAvailability('pd', liveModules.pd, 'USB-PD')
+  const tofAvailability = tofAvailable
+    ? { available: true, value: '', detail: '' }
+    : describeStripAvailability('tof', liveModules.tof, 'ToF range sensing')
+  const imuAvailability = imuAvailable
+    ? { available: true, value: '', detail: '' }
+    : describeStripAvailability('imu', liveModules.imu, 'IMU posture sensing')
+  const tecAvailability = tecAvailable
+    ? { available: true, value: '', detail: '' }
+    : describeStripAvailability('tec', liveModules.tec, 'TEC control')
+  const laserAvailability = laserAvailable
+    ? { available: true, value: '', detail: '' }
+    : describeStripAvailability('laserDriver', liveModules.laserDriver, 'Laser driver')
   const tofDisplayDistance = getTofDisplayDistanceM(liveSnapshot)
   const tofHasRawReadback = liveSnapshot.peripherals.tof.distanceMm > 0
   const tofWithinWindow =
@@ -317,18 +377,15 @@ export function StatusRail({ snapshot, telemetryStore }: StatusRailProps) {
 
   return (
     <section className="status-rail">
-      {stats.map((stat, index) => {
+      {stats.map((stat) => {
         const Icon = stat.icon
 
         return (
-          <motion.article
+          <article
             key={stat.key}
             className="status-strip"
             data-tone={stat.tone}
             data-disabled={stat.disabled ? 'true' : 'false'}
-            initial={{ opacity: 0, y: 12 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ delay: index * 0.05, duration: 0.32 }}
           >
             <div className="status-strip__label">
               <Icon size={16} />
@@ -337,7 +394,7 @@ export function StatusRail({ snapshot, telemetryStore }: StatusRailProps) {
             <strong>{stat.value}</strong>
             <span>{stat.detail}</span>
             <ProgressMeter value={stat.progress} tone={stat.tone} compact />
-          </motion.article>
+          </article>
         )
       })}
     </section>

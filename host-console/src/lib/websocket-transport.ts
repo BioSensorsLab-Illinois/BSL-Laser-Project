@@ -212,6 +212,29 @@ export class WebSocketTransport implements DeviceTransport {
     })
   }
 
+  /*
+   * Synchronous close intended for page unload. close() is fire-and-
+   * forget from the browser side — it triggers the TCP FIN handshake
+   * immediately without needing the 80 ms async grace. This gives the
+   * ESP32 a fighting chance to run its close_fn path before the
+   * browser tears the context down. (2026-04-17)
+   */
+  closeImmediate(): void {
+    this.active = false
+    this.disconnecting = true
+    this.clearHandshakeProbeTimers()
+    this.protocolReady = false
+    if (this.socket !== null) {
+      const socket = this.socket
+      this.socket = null
+      try {
+        socket.close()
+      } catch {
+        /* socket already closed — nothing to do */
+      }
+    }
+  }
+
   async sendCommand(command: CommandEnvelope): Promise<void> {
     if (!this.active || this.socket === null || this.socket.readyState !== WebSocket.OPEN) {
       throw new Error('Wireless transport is not connected.')

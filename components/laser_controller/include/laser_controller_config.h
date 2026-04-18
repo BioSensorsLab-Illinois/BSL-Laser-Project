@@ -16,6 +16,42 @@ typedef struct {
     float full_mode_min_w;
 } laser_controller_power_policy_t;
 
+/*
+ * Per-interlock enable mask. Every flag defaults to `true` (every
+ * interlock active) so existing behavior is preserved on a fresh boot
+ * and on any config that predates this struct. Operators can selectively
+ * disable noisy or unwanted interlocks from the Integrate workspace.
+ *
+ * Safety note: setting `interlocks_disabled=true` in the bringup/service
+ * block still short-circuits ALL interlock evaluation (the master
+ * disable). These flags sit UNDERNEATH that master switch — they only
+ * apply while interlocks are NOT globally disabled. This keeps the
+ * service-mode escape hatch intact.
+ */
+typedef struct {
+    bool horizon_enabled;
+    bool distance_enabled;
+    bool lambda_drift_enabled;
+    bool tec_temp_adc_enabled;
+    bool imu_invalid_enabled;
+    bool imu_stale_enabled;
+    bool tof_invalid_enabled;
+    bool tof_stale_enabled;
+    bool ld_overtemp_enabled;
+    bool ld_loop_bad_enabled;
+    /*
+     * When `true`, the distance interlock fires ONLY when
+     * tof_distance_m < tof_min_range_m. The upper-bound check is
+     * skipped, tof_invalid and tof_stale are implicitly disabled, and a
+     * missing / out-of-FoV reading is treated as "no object in the near
+     * field" (safe). User directive 2026-04-17: "allow lower bound only
+     * interlock trigger, don't care about the far threshold nor stale
+     * or missing data". Default false (legacy two-sided + freshness
+     * check).
+     */
+    bool tof_low_bound_only;
+} laser_controller_interlock_enable_t;
+
 typedef struct {
     laser_controller_radians_t horizon_threshold_rad;
     laser_controller_radians_t horizon_hysteresis_rad;
@@ -53,6 +89,15 @@ typedef struct {
      * larger offsets indicate a wiring fault, not calibration.
      */
     laser_controller_volts_t lio_voltage_offset_v;
+    /*
+     * Per-interlock enable mask + ToF low-bound-only (2026-04-17 user
+     * directive). APPENDED at the end of the struct to simplify NVS
+     * migration: an older blob lacking this tail is still bit-for-bit
+     * prefix-compatible with the previous layout and can be loaded via
+     * a memcpy of the frozen prefix followed by a default-seed of this
+     * field. See `laser_controller_service.c` migrate paths.
+     */
+    laser_controller_interlock_enable_t interlocks;
 } laser_controller_safety_thresholds_t;
 
 typedef struct {

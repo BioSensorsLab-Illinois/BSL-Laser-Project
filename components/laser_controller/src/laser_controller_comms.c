@@ -35,8 +35,18 @@
 #define LASER_CONTROLLER_COMMS_FAST_TELEMETRY_PERIOD_MS 60U
 #define LASER_CONTROLLER_COMMS_WIRELESS_FAST_TELEMETRY_PERIOD_MS 180U
 #define LASER_CONTROLLER_COMMS_LIVE_TELEMETRY_PERIOD_MS 1000U
-#define LASER_CONTROLLER_COMMS_STATUS_PERIOD_MS    10000U
-#define LASER_CONTROLLER_COMMS_WIRELESS_POST_COMMAND_QUIET_MS 400U
+#define LASER_CONTROLLER_COMMS_STATUS_PERIOD_MS    5000U
+/*
+ * Tightened 400 -> 80 (2026-04-17 user directive): the 400 ms window
+ * starves fast_telemetry on a Wi-Fi session where the host is even
+ * lightly active — one GUI-driven command per second was enough to
+ * permanently suppress telemetry. 80 ms still lets a command response
+ * head out ahead of the next fast tick on a busy link without crushing
+ * perceived refresh rate. If the Wi-Fi stack needs more recovery time
+ * under congestion, the httpd_queue_work backpressure path already
+ * drops frames gracefully.
+ */
+#define LASER_CONTROLLER_COMMS_WIRELESS_POST_COMMAND_QUIET_MS 80U
 #define LASER_CONTROLLER_COMMS_MAX_LINE_LEN   768U
 #define LASER_CONTROLLER_COMMS_FRAME_BUFFER_BYTES 32768U
 #define LASER_CONTROLLER_COMMS_QUEUE_DEPTH    8U
@@ -2544,7 +2554,7 @@ static void laser_controller_comms_write_snapshot_json(
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        "\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"horizonThresholdDeg\":%.2f,\"horizonHysteresisDeg\":%.2f,\"tofMinRangeM\":%.3f,\"tofMaxRangeM\":%.3f,\"tofHysteresisM\":%.3f,\"imuStaleMs\":%lu,\"tofStaleMs\":%lu,\"railGoodTimeoutMs\":%lu,\"lambdaDriftLimitNm\":%.2f,\"lambdaDriftHysteresisNm\":%.2f,\"lambdaDriftHoldMs\":%lu,\"ldOvertempLimitC\":%.2f,\"tecTempAdcTripV\":%.3f,\"tecTempAdcHysteresisV\":%.3f,\"tecTempAdcHoldMs\":%lu,\"tecMinCommandC\":%.2f,\"tecMaxCommandC\":%.2f,\"tecReadyToleranceC\":%.2f,\"maxLaserCurrentA\":%.2f,\"offCurrentThresholdA\":%.2f,\"maxTofLedDutyCyclePct\":%u,\"lioVoltageOffsetV\":%.4f,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f},",
+        "\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"horizonThresholdDeg\":%.2f,\"horizonHysteresisDeg\":%.2f,\"tofMinRangeM\":%.3f,\"tofMaxRangeM\":%.3f,\"tofHysteresisM\":%.3f,\"imuStaleMs\":%lu,\"tofStaleMs\":%lu,\"railGoodTimeoutMs\":%lu,\"lambdaDriftLimitNm\":%.2f,\"lambdaDriftHysteresisNm\":%.2f,\"lambdaDriftHoldMs\":%lu,\"ldOvertempLimitC\":%.2f,\"tecTempAdcTripV\":%.3f,\"tecTempAdcHysteresisV\":%.3f,\"tecTempAdcHoldMs\":%lu,\"tecMinCommandC\":%.2f,\"tecMaxCommandC\":%.2f,\"tecReadyToleranceC\":%.2f,\"maxLaserCurrentA\":%.2f,\"offCurrentThresholdA\":%.2f,\"maxTofLedDutyCyclePct\":%u,\"lioVoltageOffsetV\":%.4f,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f,\"interlocks\":{\"horizonEnabled\":%s,\"distanceEnabled\":%s,\"lambdaDriftEnabled\":%s,\"tecTempAdcEnabled\":%s,\"imuInvalidEnabled\":%s,\"imuStaleEnabled\":%s,\"tofInvalidEnabled\":%s,\"tofStaleEnabled\":%s,\"ldOvertempEnabled\":%s,\"ldLoopBadEnabled\":%s,\"tofLowBoundOnly\":%s}},",
         status->decision.allow_alignment ? "true" : "false",
         status->decision.allow_nir ? "true" : "false",
         status->decision.horizon_blocked ? "true" : "false",
@@ -2576,7 +2586,18 @@ static void laser_controller_comms_write_snapshot_json(
         actual_lambda_nm,
         status->bench.target_lambda_nm,
         lambda_drift_nm,
-        status->inputs.tec_temp_adc_voltage_v);
+        status->inputs.tec_temp_adc_voltage_v,
+        status->config.thresholds.interlocks.horizon_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.distance_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.lambda_drift_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.tec_temp_adc_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.imu_invalid_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.imu_stale_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.tof_invalid_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.tof_stale_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.ld_overtemp_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.ld_loop_bad_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.tof_low_bound_only ? "true" : "false");
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
@@ -2897,7 +2918,7 @@ static void laser_controller_comms_write_command_snapshot_json(
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        "\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"horizonThresholdDeg\":%.2f,\"horizonHysteresisDeg\":%.2f,\"tofMinRangeM\":%.3f,\"tofMaxRangeM\":%.3f,\"tofHysteresisM\":%.3f,\"imuStaleMs\":%lu,\"tofStaleMs\":%lu,\"railGoodTimeoutMs\":%lu,\"lambdaDriftLimitNm\":%.2f,\"lambdaDriftHysteresisNm\":%.2f,\"lambdaDriftHoldMs\":%lu,\"ldOvertempLimitC\":%.2f,\"tecTempAdcTripV\":%.3f,\"tecTempAdcHysteresisV\":%.3f,\"tecTempAdcHoldMs\":%lu,\"tecMinCommandC\":%.2f,\"tecMaxCommandC\":%.2f,\"tecReadyToleranceC\":%.2f,\"maxLaserCurrentA\":%.2f,\"offCurrentThresholdA\":%.2f,\"maxTofLedDutyCyclePct\":%u,\"lioVoltageOffsetV\":%.4f,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f},",
+        "\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"horizonThresholdDeg\":%.2f,\"horizonHysteresisDeg\":%.2f,\"tofMinRangeM\":%.3f,\"tofMaxRangeM\":%.3f,\"tofHysteresisM\":%.3f,\"imuStaleMs\":%lu,\"tofStaleMs\":%lu,\"railGoodTimeoutMs\":%lu,\"lambdaDriftLimitNm\":%.2f,\"lambdaDriftHysteresisNm\":%.2f,\"lambdaDriftHoldMs\":%lu,\"ldOvertempLimitC\":%.2f,\"tecTempAdcTripV\":%.3f,\"tecTempAdcHysteresisV\":%.3f,\"tecTempAdcHoldMs\":%lu,\"tecMinCommandC\":%.2f,\"tecMaxCommandC\":%.2f,\"tecReadyToleranceC\":%.2f,\"maxLaserCurrentA\":%.2f,\"offCurrentThresholdA\":%.2f,\"maxTofLedDutyCyclePct\":%u,\"lioVoltageOffsetV\":%.4f,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f,\"interlocks\":{\"horizonEnabled\":%s,\"distanceEnabled\":%s,\"lambdaDriftEnabled\":%s,\"tecTempAdcEnabled\":%s,\"imuInvalidEnabled\":%s,\"imuStaleEnabled\":%s,\"tofInvalidEnabled\":%s,\"tofStaleEnabled\":%s,\"ldOvertempEnabled\":%s,\"ldLoopBadEnabled\":%s,\"tofLowBoundOnly\":%s}},",
         status->decision.allow_alignment ? "true" : "false",
         status->decision.allow_nir ? "true" : "false",
         status->decision.horizon_blocked ? "true" : "false",
@@ -2929,7 +2950,18 @@ static void laser_controller_comms_write_command_snapshot_json(
         actual_lambda_nm,
         status->bench.target_lambda_nm,
         lambda_drift_nm,
-        status->inputs.tec_temp_adc_voltage_v);
+        status->inputs.tec_temp_adc_voltage_v,
+        status->config.thresholds.interlocks.horizon_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.distance_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.lambda_drift_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.tec_temp_adc_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.imu_invalid_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.imu_stale_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.tof_invalid_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.tof_stale_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.ld_overtemp_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.ld_loop_bad_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.tof_low_bound_only ? "true" : "false");
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
@@ -3103,7 +3135,7 @@ static void laser_controller_comms_write_live_telemetry_json(
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        "\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f},",
+        "\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f,\"interlocks\":{\"horizonEnabled\":%s,\"distanceEnabled\":%s,\"lambdaDriftEnabled\":%s,\"tecTempAdcEnabled\":%s,\"imuInvalidEnabled\":%s,\"imuStaleEnabled\":%s,\"tofInvalidEnabled\":%s,\"tofStaleEnabled\":%s,\"ldOvertempEnabled\":%s,\"ldLoopBadEnabled\":%s,\"tofLowBoundOnly\":%s}},",
         status->decision.allow_alignment ? "true" : "false",
         status->decision.allow_nir ? "true" : "false",
         status->decision.horizon_blocked ? "true" : "false",
@@ -3113,7 +3145,18 @@ static void laser_controller_comms_write_live_telemetry_json(
         actual_lambda_nm,
         status->bench.target_lambda_nm,
         lambda_drift_nm,
-        status->inputs.tec_temp_adc_voltage_v);
+        status->inputs.tec_temp_adc_voltage_v,
+        status->config.thresholds.interlocks.horizon_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.distance_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.lambda_drift_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.tec_temp_adc_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.imu_invalid_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.imu_stale_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.tof_invalid_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.tof_stale_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.ld_overtemp_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.ld_loop_bad_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.tof_low_bound_only ? "true" : "false");
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
@@ -3304,7 +3347,21 @@ static void laser_controller_comms_write_live_snapshot_json(
         status->inputs.tec_temp_good ? 0U : 1U);
 
     laser_controller_comms_write_haptic_readback_json(buffer, status);
-    laser_controller_comms_write_gpio_inspector_json(buffer, status);
+    /*
+     * GPIO inspector block unconditionally skipped from the periodic
+     * status_snapshot broadcast (2026-04-17). The 40-pin dump is ~8 KB
+     * of JSON and can stretch the status_snapshot frame to ~30 KB once
+     * bringup + bench + haptic + deployment are included. On Wi-Fi AP
+     * that large frame holds the httpd send socket for >1 s; when a
+     * slow client (NVS-save-in-flight) lets the TCP window fill, the
+     * 1 s send_wait_timeout fires, the send errors out, and
+     * httpd_sess_trigger_close tears the session down — presenting to
+     * the user as "Wireless controller link dropped" mid-Apply. The
+     * inspector remains available on demand via `status.io_get`
+     * (emit_io_status_response); the Integrate workspace polls it when
+     * the inspector panel is visible. Telemetry clients that need live
+     * pin readback should poll, not rely on the 5-s broadcast.
+     */
     laser_controller_comms_write_button_state_json(buffer, status);
     laser_controller_comms_write_button_board_json(buffer, status);
     laser_controller_comms_write_bench_json(buffer, status);
@@ -3312,7 +3369,7 @@ static void laser_controller_comms_write_live_snapshot_json(
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        "\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f},",
+        "\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f,\"interlocks\":{\"horizonEnabled\":%s,\"distanceEnabled\":%s,\"lambdaDriftEnabled\":%s,\"tecTempAdcEnabled\":%s,\"imuInvalidEnabled\":%s,\"imuStaleEnabled\":%s,\"tofInvalidEnabled\":%s,\"tofStaleEnabled\":%s,\"ldOvertempEnabled\":%s,\"ldLoopBadEnabled\":%s,\"tofLowBoundOnly\":%s}},",
         status->decision.allow_alignment ? "true" : "false",
         status->decision.allow_nir ? "true" : "false",
         status->decision.horizon_blocked ? "true" : "false",
@@ -3322,7 +3379,18 @@ static void laser_controller_comms_write_live_snapshot_json(
         actual_lambda_nm,
         status->bench.target_lambda_nm,
         lambda_drift_nm,
-        status->inputs.tec_temp_adc_voltage_v);
+        status->inputs.tec_temp_adc_voltage_v,
+        status->config.thresholds.interlocks.horizon_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.distance_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.lambda_drift_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.tec_temp_adc_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.imu_invalid_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.imu_stale_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.tof_invalid_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.tof_stale_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.ld_overtemp_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.ld_loop_bad_enabled ? "true" : "false",
+        status->config.thresholds.interlocks.tof_low_bound_only ? "true" : "false");
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
@@ -3950,7 +4018,7 @@ static void laser_controller_comms_emit_bench_status_response(
     if (include_safety) {
         laser_controller_comms_buffer_append_fmt(
             &buffer,
-            ",\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"horizonThresholdDeg\":%.2f,\"horizonHysteresisDeg\":%.2f,\"tofMinRangeM\":%.3f,\"tofMaxRangeM\":%.3f,\"tofHysteresisM\":%.3f,\"imuStaleMs\":%lu,\"tofStaleMs\":%lu,\"railGoodTimeoutMs\":%lu,\"lambdaDriftLimitNm\":%.2f,\"lambdaDriftHysteresisNm\":%.2f,\"lambdaDriftHoldMs\":%lu,\"ldOvertempLimitC\":%.2f,\"tecTempAdcTripV\":%.3f,\"tecTempAdcHysteresisV\":%.3f,\"tecTempAdcHoldMs\":%lu,\"tecMinCommandC\":%.2f,\"tecMaxCommandC\":%.2f,\"tecReadyToleranceC\":%.2f,\"maxLaserCurrentA\":%.2f,\"offCurrentThresholdA\":%.2f,\"maxTofLedDutyCyclePct\":%u,\"lioVoltageOffsetV\":%.4f,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f}",
+            ",\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"horizonThresholdDeg\":%.2f,\"horizonHysteresisDeg\":%.2f,\"tofMinRangeM\":%.3f,\"tofMaxRangeM\":%.3f,\"tofHysteresisM\":%.3f,\"imuStaleMs\":%lu,\"tofStaleMs\":%lu,\"railGoodTimeoutMs\":%lu,\"lambdaDriftLimitNm\":%.2f,\"lambdaDriftHysteresisNm\":%.2f,\"lambdaDriftHoldMs\":%lu,\"ldOvertempLimitC\":%.2f,\"tecTempAdcTripV\":%.3f,\"tecTempAdcHysteresisV\":%.3f,\"tecTempAdcHoldMs\":%lu,\"tecMinCommandC\":%.2f,\"tecMaxCommandC\":%.2f,\"tecReadyToleranceC\":%.2f,\"maxLaserCurrentA\":%.2f,\"offCurrentThresholdA\":%.2f,\"maxTofLedDutyCyclePct\":%u,\"lioVoltageOffsetV\":%.4f,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f,\"interlocks\":{\"horizonEnabled\":%s,\"distanceEnabled\":%s,\"lambdaDriftEnabled\":%s,\"tecTempAdcEnabled\":%s,\"imuInvalidEnabled\":%s,\"imuStaleEnabled\":%s,\"tofInvalidEnabled\":%s,\"tofStaleEnabled\":%s,\"ldOvertempEnabled\":%s,\"ldLoopBadEnabled\":%s,\"tofLowBoundOnly\":%s}}",
             status->decision.allow_alignment ? "true" : "false",
             status->decision.allow_nir ? "true" : "false",
             status->decision.horizon_blocked ? "true" : "false",
@@ -3982,7 +4050,18 @@ static void laser_controller_comms_emit_bench_status_response(
             actual_lambda_nm,
             status->bench.target_lambda_nm,
             lambda_drift_nm,
-            status->inputs.tec_temp_adc_voltage_v);
+            status->inputs.tec_temp_adc_voltage_v,
+            status->config.thresholds.interlocks.horizon_enabled ? "true" : "false",
+            status->config.thresholds.interlocks.distance_enabled ? "true" : "false",
+            status->config.thresholds.interlocks.lambda_drift_enabled ? "true" : "false",
+            status->config.thresholds.interlocks.tec_temp_adc_enabled ? "true" : "false",
+            status->config.thresholds.interlocks.imu_invalid_enabled ? "true" : "false",
+            status->config.thresholds.interlocks.imu_stale_enabled ? "true" : "false",
+            status->config.thresholds.interlocks.tof_invalid_enabled ? "true" : "false",
+            status->config.thresholds.interlocks.tof_stale_enabled ? "true" : "false",
+            status->config.thresholds.interlocks.ld_overtemp_enabled ? "true" : "false",
+            status->config.thresholds.interlocks.ld_loop_bad_enabled ? "true" : "false",
+            status->config.thresholds.interlocks.tof_low_bound_only ? "true" : "false");
     }
 
     laser_controller_comms_buffer_append_fmt(
@@ -4422,6 +4501,18 @@ static void laser_controller_comms_handle_command_line(const char *line)
             laser_controller_comms_emit_error_response(
                 id,
                 "Clear the blocking latched fault before entering deployment mode.");
+            return;
+        }
+        /*
+         * 2026-04-17 (audit round 2, S2): pre-check the
+         * already-active case so the operator sees a specific
+         * error message instead of the generic "could not be
+         * entered from the current controller state" string.
+         */
+        if (status.deployment.active) {
+            laser_controller_comms_emit_error_response(
+                id,
+                "Deployment mode is already active. Use 'Exit deployment' first if you want to restart it.");
             return;
         }
         if (laser_controller_app_enter_deployment_mode() != ESP_OK) {
@@ -5232,6 +5323,25 @@ static void laser_controller_comms_handle_command_line(const char *line)
             "\"frequency_hz\":",
             &frequency_hz);
 
+        /*
+         * 2026-04-17 (audit round 2, S2): block LED enable while the
+         * deployment checklist is running. The checklist forces the
+         * front LED off on entry (app.c enter_deployment_mode), but
+         * without this gate any GUI slider drag during the
+         * rail-sequence steps turns the LED back on for 180 ms until
+         * the next control-task tick overrides it back — giving the
+         * operator visible but transient feedback that the front LED
+         * is respecting their click, when in fact deployment owns it.
+         * Reject cleanly during checklist; allow during ready_idle
+         * and during idle (non-deployment) states.
+         */
+        if (status.deployment.active && status.deployment.running) {
+            laser_controller_comms_emit_error_response(
+                id,
+                "LED control is blocked while the deployment checklist is running. It will re-arm once the checklist reaches the ready posture.");
+            return;
+        }
+
         laser_controller_bench_set_illumination(
             enabled,
             duty_cycle_pct,
@@ -5628,6 +5738,27 @@ static void laser_controller_comms_handle_command_line(const char *line)
             return;
         }
 
+        /*
+         * 2026-04-17 (audit round 2, S1 safety): block any safety-policy
+         * edit while the beam is ACTIVELY emitting. The thresholds
+         * consumed by safety_evaluate (max_laser_current_a,
+         * tec_temp_adc_trip_v, ld_overtemp_limit_c, tof_min_range_m,
+         * lambda_drift_limit_nm) are sampled fresh every control-task
+         * tick, so widening them mid-emission would retroactively
+         * un-trip an active safety guard. Block on nir-or-alignment
+         * output-enable from the latest safety decision so the
+         * operator always closes the beam path before mutating
+         * policy. This is the literal definition of the
+         * "safety policy cannot widen while live" rule.
+         */
+        if (status.decision.nir_output_enable ||
+            status.decision.alignment_output_enable) {
+            laser_controller_comms_emit_error_response(
+                id,
+                "Runtime safety edits are blocked while the laser or alignment output is active. Turn the output off first.");
+            return;
+        }
+
         if (laser_controller_comms_extract_float(line, "\"horizon_threshold_deg\":", &value_f)) {
             policy.thresholds.horizon_threshold_rad = value_f * LASER_CONTROLLER_RAD_PER_DEG;
         }
@@ -5703,6 +5834,60 @@ static void laser_controller_comms_handle_command_line(const char *line)
             policy.thresholds.lio_voltage_offset_v = value_f;
         }
 
+        /*
+         * Per-interlock enable mask + ToF low-bound-only (2026-04-17
+         * user directive). Accepts either a JSON bool or an int. Fields
+         * absent in the payload leave the existing policy unchanged so
+         * partial updates are non-destructive.
+         */
+        {
+            bool value_b = false;
+            if (laser_controller_comms_extract_bool(
+                    line, "\"interlock_horizon_enabled\":", &value_b)) {
+                policy.thresholds.interlocks.horizon_enabled = value_b;
+            }
+            if (laser_controller_comms_extract_bool(
+                    line, "\"interlock_distance_enabled\":", &value_b)) {
+                policy.thresholds.interlocks.distance_enabled = value_b;
+            }
+            if (laser_controller_comms_extract_bool(
+                    line, "\"interlock_lambda_drift_enabled\":", &value_b)) {
+                policy.thresholds.interlocks.lambda_drift_enabled = value_b;
+            }
+            if (laser_controller_comms_extract_bool(
+                    line, "\"interlock_tec_temp_adc_enabled\":", &value_b)) {
+                policy.thresholds.interlocks.tec_temp_adc_enabled = value_b;
+            }
+            if (laser_controller_comms_extract_bool(
+                    line, "\"interlock_imu_invalid_enabled\":", &value_b)) {
+                policy.thresholds.interlocks.imu_invalid_enabled = value_b;
+            }
+            if (laser_controller_comms_extract_bool(
+                    line, "\"interlock_imu_stale_enabled\":", &value_b)) {
+                policy.thresholds.interlocks.imu_stale_enabled = value_b;
+            }
+            if (laser_controller_comms_extract_bool(
+                    line, "\"interlock_tof_invalid_enabled\":", &value_b)) {
+                policy.thresholds.interlocks.tof_invalid_enabled = value_b;
+            }
+            if (laser_controller_comms_extract_bool(
+                    line, "\"interlock_tof_stale_enabled\":", &value_b)) {
+                policy.thresholds.interlocks.tof_stale_enabled = value_b;
+            }
+            if (laser_controller_comms_extract_bool(
+                    line, "\"interlock_ld_overtemp_enabled\":", &value_b)) {
+                policy.thresholds.interlocks.ld_overtemp_enabled = value_b;
+            }
+            if (laser_controller_comms_extract_bool(
+                    line, "\"interlock_ld_loop_bad_enabled\":", &value_b)) {
+                policy.thresholds.interlocks.ld_loop_bad_enabled = value_b;
+            }
+            if (laser_controller_comms_extract_bool(
+                    line, "\"tof_low_bound_only\":", &value_b)) {
+                policy.thresholds.interlocks.tof_low_bound_only = value_b;
+            }
+        }
+
         if (laser_controller_app_set_runtime_safety_policy(&policy) != ESP_OK) {
             laser_controller_comms_emit_error_response(
                 id,
@@ -5720,17 +5905,28 @@ static void laser_controller_comms_handle_command_line(const char *line)
             laser_controller_service_save_profile(now_ms);
         }
         laser_controller_comms_refresh_status_after_mutation(&status, 25U);
-        if (strcmp(command, "set_deployment_safety") == 0 ||
-            strcmp(command, "integrate.set_safety") == 0) {
-            laser_controller_comms_emit_status_response(id, &status);
-        } else {
-            laser_controller_comms_emit_bench_status_response(
-                id,
-                &status,
-                true,
-                false,
-                true);
-        }
+        /*
+         * 2026-04-17 (late, Apply-crash hotfix): unified all safety-set
+         * responses on the smaller `emit_bench_status_response` so the
+         * response frame stays well under the httpd SEND_WAIT_TIMEOUT
+         * cap. Previously `integrate.set_safety` emitted the full
+         * ~30 KB `emit_status_response` (includes gpioInspector.pins
+         * and the bringup detail block), which on a Wi-Fi AP link with
+         * lightly congested TCP queue would exceed the 1 s send timeout
+         * right after the 1–2 s NVS flash commit, trigger
+         * `httpd_sess_trigger_close` on the issuing socket, and surface
+         * as "Wireless controller link dropped" mid-Apply. The host
+         * reconciles safety state from the next periodic
+         * `status_snapshot` (now interlocks-aware and free of the GPIO
+         * inspector tail), so nothing is lost by switching to the
+         * bench-sized response.
+         */
+        laser_controller_comms_emit_bench_status_response(
+            id,
+            &status,
+            true,
+            false,
+            true);
         return;
     }
 
@@ -6884,12 +7080,38 @@ static void laser_controller_comms_tx_task(void *argument)
                 laser_controller_wireless_has_clients();
             const bool pause_wireless_telemetry =
                 laser_controller_comms_should_pause_wireless_telemetry(now_ms);
+            /*
+             * 2026-04-17: if a new WS client just upgraded, emit a
+             * full status_snapshot now — bypassing the pause/quiet
+             * window. Without this, a page refresh that landed inside
+             * a command-in-flight or post-command quiet window could
+             * leave the GUI blocked at "Waiting for controller
+             * firmware handshake…" for up to ~400 ms, and some
+             * browsers timed out their initial handshake before that.
+             * The consume call is read-then-clear, so the snapshot is
+             * emitted once per new client.
+             */
+            if (laser_controller_wireless_consume_new_client_pending()) {
+                laser_controller_comms_emit_status_event(&status);
+                last_status_ms = now_ms;
+            }
             const laser_controller_time_ms_t fast_telemetry_period_ms =
                 wireless_clients_active ?
                     LASER_CONTROLLER_COMMS_WIRELESS_FAST_TELEMETRY_PERIOD_MS :
                     LASER_CONTROLLER_COMMS_FAST_TELEMETRY_PERIOD_MS;
+            /*
+             * fast_telemetry is NOT gated by `pause_wireless_telemetry`
+             * (2026-04-17 user directive "I need at least 5 refreshes
+             * per second over AP"). On a Wi-Fi session where the host
+             * sends even periodic status probes, the 400-ms quiet
+             * window starved fast telemetry. Stage 2 async broadcast
+             * serializes every WS frame on the httpd task, so command
+             * responses and fast frames cannot interleave mid-JSON; the
+             * quiet window's original purpose is therefore covered by
+             * the transport layer. Live + status broadcasts still honor
+             * the pause so they don't pile up behind command traffic.
+             */
             const bool emit_fast_telemetry =
-                !pause_wireless_telemetry &&
                 (last_fast_telemetry_ms == 0U ||
                 (now_ms - last_fast_telemetry_ms) >=
                     fast_telemetry_period_ms);

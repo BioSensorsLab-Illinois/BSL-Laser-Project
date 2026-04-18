@@ -1,4 +1,9 @@
-import { AnimatePresence, motion } from 'framer-motion'
+/* 2026-04-17 (Uncodixfy polish): framer-motion removed. Event rows
+ * used staggered slide-in (`initial={{opacity:0,y:10}} animate=`) and
+ * the expanded-detail drawer used a height-morphing AnimatePresence.
+ * Both are banned transform + shape-morph animations. Plain native
+ * `<article>` + `<div>` with no entrance animation; the expand is a
+ * simple CSS display toggle driven by the `expanded` state. */
 import { useDeferredValue, useMemo, useState } from 'react'
 import {
   Activity,
@@ -585,12 +590,9 @@ export function EventTimeline({
           ])
 
           return (
-            <motion.article
+            <article
               key={renderKey}
               className={`event-card ${eventToneClass(event.severity)}`}
-              initial={{ opacity: 0, y: 10 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ duration: 0.22, delay: compact ? 0 : index * 0.02 }}
             >
               <button
                 type="button"
@@ -640,68 +642,60 @@ export function EventTimeline({
                 </div>
               </button>
 
-              <AnimatePresence initial={false}>
-                {expanded ? (
-                  <motion.div
-                    className="event-card__details"
-                    initial={{ height: 0, opacity: 0 }}
-                    animate={{ height: 'auto', opacity: 1 }}
-                    exit={{ height: 0, opacity: 0 }}
-                    transition={{ duration: 0.18 }}
-                  >
-                    <div className="event-card__detail-grid">
-                      <div>
-                        <span>Title</span>
-                        <strong>{event.title}</strong>
-                      </div>
-                      <div>
-                        <span>Category</span>
-                        <strong>{titleCaseToken(event.category)}</strong>
-                      </div>
-                      <div>
-                        <span>Source</span>
-                        <strong>{formatSourceLabel(event.source)}</strong>
-                      </div>
-                      <div>
-                        <span>Time</span>
-                        <strong>{formatShortTime(event.atIso)}</strong>
-                      </div>
-                      {event.device !== undefined ? (
-                        <div>
-                          <span>Device</span>
-                          <strong>{event.device}</strong>
-                        </div>
-                      ) : null}
-                      {event.addressHex !== undefined ? (
-                        <div>
-                          <span>Address</span>
-                          <strong>{event.addressHex}</strong>
-                        </div>
-                      ) : null}
-                      {event.registerName !== undefined || event.registerHex !== undefined ? (
-                        <div>
-                          <span>Register</span>
-                          <strong>{event.registerName ?? event.registerHex}</strong>
-                        </div>
-                      ) : null}
-                      {event.valueHex !== undefined ? (
-                        <div>
-                          <span>Value</span>
-                          <strong>{event.valueHex}</strong>
-                        </div>
-                      ) : null}
+              {expanded ? (
+                <div className="event-card__details">
+                  <div className="event-card__detail-grid">
+                    <div>
+                      <span>Title</span>
+                      <strong>{event.title}</strong>
                     </div>
-
-                    {event.decodedDetail !== undefined ? (
-                      <div className="event-card__decoded">
-                        <span className="event-toolbar__label">Decoded from board and datasheet map</span>
-                        <p>{event.decodedDetail}</p>
+                    <div>
+                      <span>Category</span>
+                      <strong>{titleCaseToken(event.category)}</strong>
+                    </div>
+                    <div>
+                      <span>Source</span>
+                      <strong>{formatSourceLabel(event.source)}</strong>
+                    </div>
+                    <div>
+                      <span>Time</span>
+                      <strong>{formatShortTime(event.atIso)}</strong>
+                    </div>
+                    {event.device !== undefined ? (
+                      <div>
+                        <span>Device</span>
+                        <strong>{event.device}</strong>
                       </div>
                     ) : null}
-                  </motion.div>
-                ) : null}
-              </AnimatePresence>
-            </motion.article>
+                    {event.addressHex !== undefined ? (
+                      <div>
+                        <span>Address</span>
+                        <strong>{event.addressHex}</strong>
+                      </div>
+                    ) : null}
+                    {event.registerName !== undefined || event.registerHex !== undefined ? (
+                      <div>
+                        <span>Register</span>
+                        <strong>{event.registerName ?? event.registerHex}</strong>
+                      </div>
+                    ) : null}
+                    {event.valueHex !== undefined ? (
+                      <div>
+                        <span>Value</span>
+                        <strong>{event.valueHex}</strong>
+                      </div>
+                    ) : null}
+                  </div>
+
+                  {event.decodedDetail !== undefined ? (
+                    <div className="event-card__decoded">
+                      <span className="event-toolbar__label">Decoded from board and datasheet map</span>
+                      <p>{event.decodedDetail}</p>
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+            </article>
           )
         })}
 

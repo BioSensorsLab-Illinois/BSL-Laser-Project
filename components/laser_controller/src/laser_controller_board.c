@@ -4409,6 +4409,16 @@ void laser_controller_board_init_safe_defaults(void)
     (void)laser_controller_buttons_init(&s_button_readback);
     (void)laser_controller_rgb_led_init(&s_rgb_readback);
     (void)laser_controller_rgb_led_force_off(&s_rgb_readback);
+
+    /*
+     * 2026-04-17 (user directive): every non-rail peripheral must be
+     * initialized and probed on USB power from boot, not deferred to
+     * service/deployment entry. Only TEC and LD power supplies stay
+     * gated on external PD. Failures are non-fatal — each peripheral's
+     * capture_*_readback in read_inputs runs every tick and re-probes,
+     * so a peripheral plugged in after boot still comes online.
+     */
+    (void)laser_controller_board_dac_init_safe();
 }
 
 void laser_controller_board_read_inputs(
@@ -4501,11 +4511,16 @@ void laser_controller_board_read_inputs(
         laser_controller_adc_filter_reset(&s_adc_filter_ld_current_v);
     }
 
-    if (laser_controller_service_module_expected(LASER_CONTROLLER_MODULE_DAC)) {
-        laser_controller_board_capture_dac_readback(s_dac_ready);
-    } else {
-        laser_controller_board_clear_dac_readback();
-    }
+    /*
+     * 2026-04-17 (user directive): everything except TEC and LD rails
+     * must be testable on USB power without requiring bring-up
+     * declaration. Probe DAC on every tick; if it is not physically
+     * present, the probe fails and reachable stays false naturally.
+     * (Before this change the capture was gated on bring-up-expected,
+     * so operators saw "Not installed" on every status-rail card
+     * until they explicitly declared the module.)
+     */
+    laser_controller_board_capture_dac_readback(s_dac_ready);
 
     if (inputs->tec_telemetry_valid) {
         if (laser_controller_board_read_adc_voltage(ADC_CHANNEL_7, &voltage_v) == ESP_OK) {
@@ -4537,16 +4552,14 @@ void laser_controller_board_read_inputs(
         laser_controller_adc_filter_reset(&s_adc_filter_tec_voltage);
     }
 
-    if (imu_expected) {
-        laser_controller_board_read_imu_inputs(inputs, config, now_ms);
-    } else {
-        inputs->imu_data_valid = false;
-        inputs->imu_data_fresh = false;
-        inputs->beam_pitch_rad = 0.0f;
-        inputs->beam_roll_rad = 0.0f;
-        inputs->beam_yaw_rad = 0.0f;
-        laser_controller_board_clear_imu_readback();
-    }
+    /*
+     * 2026-04-17 (user directive): IMU probed on every tick from
+     * boot. USB power alone is enough to run the LSM6DSO; bring-up
+     * declaration should not gate the physical probe. If the IMU is
+     * not present the SPI read fails and reachable stays false.
+     */
+    (void)imu_expected;
+    laser_controller_board_read_imu_inputs(inputs, config, now_ms);
     inputs->tof_data_valid = false;
     inputs->tof_data_fresh = false;
     inputs->tof_distance_m = 0.0f;
@@ -5006,6 +5019,23 @@ void laser_controller_board_reset_gpio_debug_state(void)
     s_tof_sideband_mode = LASER_CONTROLLER_TOF_SIDEBAND_MODE_FLOAT;
     s_tof_sideband_applied_duty_cycle_pct = 0U;
     s_tof_sideband_applied_frequency_hz = 0U;
+    /*
+     * 2026-04-17 (audit round 2, S1 safety): drive rails to the safe
+     * default BEFORE taking the bus mutex. The I2C/SPI teardown that
+     * follows holds s_bus_mutex for 50-300 ms; during that window the
+     * control task's 5 ms tick is starved and cannot react to a
+     * TEC_PGOOD fall by pulling LD safe. That violates SOP rule #3
+     * ("TEC loss = immediate LD shutdown"). Driving safe rails here
+     * first guarantees the rails are already OFF before the stall
+     * window begins — if TEC goes down during the teardown there is
+     * no LD to shut down. kSafeOutputs is the fail-safe posture:
+     * TEC_EN=0, LD_EN=0, SBDN=OFF, PCN=low, green/red/LEDs off.
+     * The post-teardown restore (below) still uses s_last_outputs,
+     * so non-service-mode callers see no visible rail interruption
+     * because s_last_outputs already matches the safe posture in
+     * normal flow.
+     */
+    laser_controller_board_drive_safe_gpio_levels(&kSafeOutputs);
     laser_controller_board_lock_bus();
 
     if (s_i2c_ready && s_i2c_bus != NULL) {

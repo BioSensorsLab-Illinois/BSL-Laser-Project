@@ -49,6 +49,19 @@ const LINK_IDLE_PROBE_TIMEOUT_MS = 1000
 const WIFI_LINK_IDLE_PROBE_DELAY_MS = 6000
 const WIFI_LINK_IDLE_PROBE_TIMEOUT_MS = 5000
 const SESSION_AUTOSAVE_FLUSH_MS = 2500
+/*
+ * On initial page load with stored wifi transport, give the ESP32 time
+ * to reap any leftover TCP session from the previous browser context
+ * before we open a fresh WS. Without this window, a page refresh
+ * landed on the AP's close_fn while it was still tearing down the
+ * old FD and the new upgrade sat in CLOSE_WAIT purgatory —
+ * reproducing the "browser refresh guarantees no re-establishment
+ * without a full ESP32 reboot" symptom reported in the field.
+ * Subsequent reconnects are fast (the stale socket is already gone).
+ * (2026-04-17)
+ */
+const WIFI_FIRST_CONNECT_DELAY_MS = 2500
+const WIFI_RECONNECT_DELAY_MS = 900
 
 type LinkLivenessProbe = {
   commandId: number
@@ -197,6 +210,17 @@ function isSlowWirelessCommand(cmd: string): boolean {
     cmd === 'get_status' ||
     cmd === 'get_bringup_profile' ||
     cmd === 'set_runtime_safety' ||
+    /*
+     * 2026-04-17 (audit round 2): dotted-family commands that write
+     * NVS take the full flash-write budget and legitimately exceed the
+     * base Wi-Fi ack timeout on a congested link. Without these in the
+     * slow list, the host would time out and report failure while the
+     * firmware quietly completes the NVS commit, leaving the user
+     * believing the save failed while the device thinks it succeeded.
+     */
+    cmd === 'operate.save_deployment_defaults' ||
+    cmd === 'integrate.set_safety' ||
+    cmd === 'integrate.save_profile' ||
     cmd.includes('service_mode') ||
     cmd.startsWith('set_supply_') ||
     cmd.startsWith('set_haptic_') ||
@@ -617,6 +641,19 @@ function makeSeedSnapshot(): DeviceSnapshot {
       targetLambdaNm: 785,
       lambdaDriftNm: 0,
       tempAdcVoltageV: 0,
+      interlocks: {
+        horizonEnabled: true,
+        distanceEnabled: true,
+        lambdaDriftEnabled: true,
+        tecTempAdcEnabled: true,
+        imuInvalidEnabled: true,
+        imuStaleEnabled: true,
+        tofInvalidEnabled: true,
+        tofStaleEnabled: true,
+        ldOvertempEnabled: true,
+        ldLoopBadEnabled: true,
+        tofLowBoundOnly: false,
+      },
     },
     bringup: makeDefaultBringupStatus(),
     deployment: {
@@ -715,7 +752,14 @@ function mergeSnapshot(
     },
     gpioInspector: mergeGpioInspector(current.gpioInspector, incoming.gpioInspector),
     bench: { ...current.bench, ...incoming.bench },
-    safety: { ...current.safety, ...incoming.safety },
+    safety: {
+      ...current.safety,
+      ...incoming.safety,
+      interlocks: {
+        ...current.safety.interlocks,
+        ...(incoming.safety?.interlocks ?? {}),
+      },
+    },
     bringup: {
       ...current.bringup,
       ...(incoming.bringup ?? {}),
@@ -819,6 +863,14 @@ export function useDeviceSession() {
   )
   const autosaveDirtyRef = useRef(false)
   const autosaveWriteInFlightRef = useRef(false)
+  /*
+   * 2026-04-17: latched at hook mount. The first wifi auto-connect
+   * after a page load waits WIFI_FIRST_CONNECT_DELAY_MS so any stale
+   * TCP session from the prior page context gets torn down on the
+   * ESP32 before we open a new one. Subsequent reconnects use the
+   * shorter WIFI_RECONNECT_DELAY_MS.
+   */
+  const wifiFirstConnectPendingRef = useRef(true)
 
   const transport = useMemo<DeviceTransport>(() => {
     if (transportKind === 'serial') {
@@ -1321,9 +1373,22 @@ export function useDeviceSession() {
     return new Promise<CommandAckResult>((resolve) => {
       const timeoutId = window.setTimeout(() => {
         pendingAcksRef.current.delete(commandId)
+        /*
+         * 2026-04-17: actionable timeout copy. A bare "timed out"
+         * leaves the operator wondering what to try. The per-transport
+         * hint tells them the recovery path (wait for auto-reconnect
+         * vs. reopen serial) so the error is immediately clearable.
+         */
+        const kind = transportKindRef.current
+        const recoveryHint =
+          kind === 'wifi'
+            ? ' The wireless link may have dropped briefly — wait a moment for auto-reconnect, then retry.'
+            : kind === 'serial'
+              ? ' Check the USB cable and press Connect serial above, or reset the controller.'
+              : ''
         resolve({
           ok: false,
-          note: 'Controller acknowledgement timed out.',
+          note: `Controller did not answer the command in time.${recoveryHint}`,
         })
       }, timeoutMs)
 
@@ -1335,7 +1400,20 @@ export function useDeviceSession() {
   }, [])
 
   const connect = useCallback(async () => {
-    if (transportStatus === 'connected' || transportStatus === 'connecting') {
+    /*
+     * 2026-04-17: read the ref, not the React state. The previous
+     * `transportStatus` closure value could lag the synchronous
+     * transportStatusRef.current update by one render — in a rapid
+     * reconnect cycle the 900 ms timer fired while React still saw
+     * 'connecting' from the previous attempt, bailing out silently
+     * and leaving the session wedged on `transportRecovering = true`
+     * with no open socket. This matched the reported "page refresh
+     * loses connection until ESP32 reboots" symptom.
+     */
+    if (
+      transportStatusRef.current === 'connected' ||
+      transportStatusRef.current === 'connecting'
+    ) {
       return
     }
 
@@ -1355,7 +1433,7 @@ export function useDeviceSession() {
     setTransportRecovering(false)
     setTransportDetail('Connecting…')
     await transportRef.current?.connect()
-  }, [transportKind, transportStatus])
+  }, [transportKind])
 
   useEffect(() => {
     if (transportKind !== 'mock') {
@@ -1392,16 +1470,61 @@ export function useDeviceSession() {
       return
     }
 
+    const isFirstAttempt = wifiFirstConnectPendingRef.current
+    const delay = isFirstAttempt
+      ? WIFI_FIRST_CONNECT_DELAY_MS
+      : WIFI_RECONNECT_DELAY_MS
+
+    if (isFirstAttempt) {
+      /*
+       * 2026-04-17: make the first-connect drain window legible to
+       * the operator. Without this message the connection banner
+       * stays on the generic "disconnected" copy for 2.5 s after a
+       * page reload, prompting redundant manual Connect clicks that
+       * bypass the drain window and resurface the stale-socket race
+       * the delay was designed to prevent.
+       */
+      setTransportDetail(
+        'Waiting briefly before reconnecting — giving the controller time to close the previous session.',
+      )
+    }
+
     const timerId = window.setTimeout(() => {
+      wifiFirstConnectPendingRef.current = false
       if (!wifiManualDisconnectRef.current) {
         void connect()
       }
-    }, 900)
+    }, delay)
 
     return () => {
       window.clearTimeout(timerId)
     }
   }, [connect, firmwareProgress, transportKind, transportStatus, wifiReconnectEnabled, wifiUrl])
+
+  /*
+   * 2026-04-17: synchronous WS close on page unload. The browser
+   * closes sockets on unload eventually, but the race with the
+   * async disconnect() path meant a page refresh could leave the
+   * ESP32 holding a stale socket while the new page immediately
+   * opened a fresh one — the new upgrade then landed during the
+   * firmware's close_fn and the GUI sat at
+   * "Waiting for controller firmware handshake…" until someone
+   * power-cycled the board.
+   */
+  useEffect(() => {
+    const handler = () => {
+      const transport = transportRef.current
+      if (transport instanceof WebSocketTransport) {
+        transport.closeImmediate()
+      }
+    }
+    window.addEventListener('beforeunload', handler)
+    window.addEventListener('pagehide', handler)
+    return () => {
+      window.removeEventListener('beforeunload', handler)
+      window.removeEventListener('pagehide', handler)
+    }
+  }, [])
 
   useEffect(() => {
     writeStoredTransportKind(transportKind)

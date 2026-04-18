@@ -161,6 +161,18 @@ type BringupFormState = {
   safetyTecReadyToleranceC: string
   safetyMaxLaserCurrentA: string
   safetyOffCurrentThresholdA: string
+  safetyMaxTofLedDutyCyclePct: string
+  safetyInterlockHorizonEnabled: boolean
+  safetyInterlockDistanceEnabled: boolean
+  safetyInterlockLambdaDriftEnabled: boolean
+  safetyInterlockTecTempAdcEnabled: boolean
+  safetyInterlockImuInvalidEnabled: boolean
+  safetyInterlockImuStaleEnabled: boolean
+  safetyInterlockTofInvalidEnabled: boolean
+  safetyInterlockTofStaleEnabled: boolean
+  safetyInterlockLdOvertempEnabled: boolean
+  safetyInterlockLdLoopBadEnabled: boolean
+  safetyTofLowBoundOnly: boolean
 }
 
 type BringupDraft = BringupFormState
@@ -493,6 +505,18 @@ function makeFormState(snapshot: DeviceSnapshot): BringupFormState {
     safetyTecReadyToleranceC: formatNumber(snapshot.safety.tecReadyToleranceC, 2),
     safetyMaxLaserCurrentA: formatNumber(snapshot.safety.maxLaserCurrentA, 2),
     safetyOffCurrentThresholdA: formatNumber(snapshot.safety.offCurrentThresholdA, 2),
+    safetyMaxTofLedDutyCyclePct: String(snapshot.safety.maxTofLedDutyCyclePct),
+    safetyInterlockHorizonEnabled: snapshot.safety.interlocks.horizonEnabled,
+    safetyInterlockDistanceEnabled: snapshot.safety.interlocks.distanceEnabled,
+    safetyInterlockLambdaDriftEnabled: snapshot.safety.interlocks.lambdaDriftEnabled,
+    safetyInterlockTecTempAdcEnabled: snapshot.safety.interlocks.tecTempAdcEnabled,
+    safetyInterlockImuInvalidEnabled: snapshot.safety.interlocks.imuInvalidEnabled,
+    safetyInterlockImuStaleEnabled: snapshot.safety.interlocks.imuStaleEnabled,
+    safetyInterlockTofInvalidEnabled: snapshot.safety.interlocks.tofInvalidEnabled,
+    safetyInterlockTofStaleEnabled: snapshot.safety.interlocks.tofStaleEnabled,
+    safetyInterlockLdOvertempEnabled: snapshot.safety.interlocks.ldOvertempEnabled,
+    safetyInterlockLdLoopBadEnabled: snapshot.safety.interlocks.ldLoopBadEnabled,
+    safetyTofLowBoundOnly: snapshot.safety.interlocks.tofLowBoundOnly,
   }
 }
 
@@ -1702,6 +1726,19 @@ export function BringupWorkbench({
       safetyTecMaxCommandC: liveForm.safetyTecMaxCommandC,
       safetyTecReadyToleranceC: liveForm.safetyTecReadyToleranceC,
       safetyMaxLaserCurrentA: liveForm.safetyMaxLaserCurrentA,
+      safetyOffCurrentThresholdA: liveForm.safetyOffCurrentThresholdA,
+      safetyMaxTofLedDutyCyclePct: liveForm.safetyMaxTofLedDutyCyclePct,
+      safetyInterlockHorizonEnabled: liveForm.safetyInterlockHorizonEnabled,
+      safetyInterlockDistanceEnabled: liveForm.safetyInterlockDistanceEnabled,
+      safetyInterlockLambdaDriftEnabled: liveForm.safetyInterlockLambdaDriftEnabled,
+      safetyInterlockTecTempAdcEnabled: liveForm.safetyInterlockTecTempAdcEnabled,
+      safetyInterlockImuInvalidEnabled: liveForm.safetyInterlockImuInvalidEnabled,
+      safetyInterlockImuStaleEnabled: liveForm.safetyInterlockImuStaleEnabled,
+      safetyInterlockTofInvalidEnabled: liveForm.safetyInterlockTofInvalidEnabled,
+      safetyInterlockTofStaleEnabled: liveForm.safetyInterlockTofStaleEnabled,
+      safetyInterlockLdOvertempEnabled: liveForm.safetyInterlockLdOvertempEnabled,
+      safetyInterlockLdLoopBadEnabled: liveForm.safetyInterlockLdLoopBadEnabled,
+      safetyTofLowBoundOnly: liveForm.safetyTofLowBoundOnly,
     }))
     setDraftNote('Live runtime safety policy loaded into the local bench plan.')
   }
@@ -2257,6 +2294,28 @@ export function BringupWorkbench({
         form.safetyOffCurrentThresholdA,
         snapshot.safety.offCurrentThresholdA,
       ),
+      max_tof_led_duty_cycle_pct: Math.round(
+        Math.max(0, Math.min(100, parseNumber(
+          form.safetyMaxTofLedDutyCyclePct,
+          snapshot.safety.maxTofLedDutyCyclePct,
+        ))),
+      ),
+      /*
+       * Per-interlock enable mask + ToF low-bound-only (2026-04-17). Every
+       * flag defaults to the snapshot's current value so a partial form
+       * never silently disables an interlock the operator didn't touch.
+       */
+      interlock_horizon_enabled: form.safetyInterlockHorizonEnabled,
+      interlock_distance_enabled: form.safetyInterlockDistanceEnabled,
+      interlock_lambda_drift_enabled: form.safetyInterlockLambdaDriftEnabled,
+      interlock_tec_temp_adc_enabled: form.safetyInterlockTecTempAdcEnabled,
+      interlock_imu_invalid_enabled: form.safetyInterlockImuInvalidEnabled,
+      interlock_imu_stale_enabled: form.safetyInterlockImuStaleEnabled,
+      interlock_tof_invalid_enabled: form.safetyInterlockTofInvalidEnabled,
+      interlock_tof_stale_enabled: form.safetyInterlockTofStaleEnabled,
+      interlock_ld_overtemp_enabled: form.safetyInterlockLdOvertempEnabled,
+      interlock_ld_loop_bad_enabled: form.safetyInterlockLdLoopBadEnabled,
+      tof_low_bound_only: form.safetyTofLowBoundOnly,
     }
   }
 
@@ -3762,26 +3821,30 @@ async function setLdSbdnMode(mode: LdSbdnMode) {
             <label className="field">
               <FieldLabel
                 label="ToF min range (m)"
-                help="Minimum permitted distance before the range interlock trips."
+                help="Minimum permitted distance before the range interlock trips. Must be >0 and <5 m."
               />
               <input
                 type="number"
                 step="0.01"
+                min="0.001"
+                max="5"
                 value={form.safetyTofMinRangeM}
-                title="Minimum permitted distance before the range interlock trips."
+                title="Minimum permitted distance before the range interlock trips. Must be >0 and <5 m."
                 onChange={(event) => patchForm('safetyTofMinRangeM', event.target.value)}
               />
             </label>
             <label className="field">
               <FieldLabel
                 label="ToF max range (m)"
-                help="Maximum permitted distance before the range interlock trips."
+                help="Maximum permitted distance before the range interlock trips. Must be >min and <=10 m."
               />
               <input
                 type="number"
                 step="0.01"
+                min="0.001"
+                max="10"
                 value={form.safetyTofMaxRangeM}
-                title="Maximum permitted distance before the range interlock trips."
+                title="Maximum permitted distance before the range interlock trips. Must be >min and <=10 m."
                 onChange={(event) => patchForm('safetyTofMaxRangeM', event.target.value)}
               />
             </label>
@@ -3879,26 +3942,30 @@ async function setLdSbdnMode(mode: LdSbdnMode) {
             <label className="field">
               <FieldLabel
                 label="LD overtemp (°C)"
-                help="Laser driver temperature limit before a major fault is raised."
+                help="Laser driver temperature limit before a major fault is raised. Must be in [20, 120] °C."
               />
               <input
                 type="number"
                 step="0.1"
+                min="20"
+                max="120"
                 value={form.safetyLdOvertempLimitC}
-                title="Laser driver temperature limit before a major fault is raised."
+                title="Laser driver temperature limit before a major fault is raised. Must be in [20, 120] °C."
                 onChange={(event) => patchForm('safetyLdOvertempLimitC', event.target.value)}
               />
             </label>
             <label className="field">
               <FieldLabel
                 label="TEC temp ADC trip (V)"
-                help="Trip voltage on the TEC temperature ADC monitor."
+                help="Trip voltage on the TEC temperature ADC monitor. Must be in (0, 3.3] V."
               />
               <input
                 type="number"
                 step="0.001"
+                min="0.001"
+                max="3.3"
                 value={form.safetyTecTempAdcTripV}
-                title="Trip voltage on the TEC temperature ADC monitor."
+                title="Trip voltage on the TEC temperature ADC monitor. Must be in (0, 3.3] V."
                 onChange={(event) => patchForm('safetyTecTempAdcTripV', event.target.value)}
               />
             </label>
@@ -3970,13 +4037,15 @@ async function setLdSbdnMode(mode: LdSbdnMode) {
             <label className="field">
               <FieldLabel
                 label="Max laser current (A)"
-                help="Maximum host-stageable laser current."
+                help="Maximum host-stageable laser current. Hardware ceiling is 5.2 A; values outside (0, 5.2] are rejected by the controller."
               />
               <input
                 type="number"
                 step="0.05"
+                min="0.01"
+                max="5.2"
                 value={form.safetyMaxLaserCurrentA}
-                title="Maximum host-stageable laser current."
+                title="Maximum host-stageable laser current. Hardware ceiling is 5.2 A; values outside (0, 5.2] are rejected by the controller."
                 onChange={(event) => patchForm('safetyMaxLaserCurrentA', event.target.value)}
               />
             </label>
@@ -3991,6 +4060,21 @@ async function setLdSbdnMode(mode: LdSbdnMode) {
                 value={form.safetyOffCurrentThresholdA}
                 title="Ready-idle bias current threshold."
                 onChange={(event) => patchForm('safetyOffCurrentThresholdA', event.target.value)}
+              />
+            </label>
+            <label className="field">
+              <FieldLabel
+                label="ToF LED peak brightness (%)"
+                help="Hard maximum duty cycle for the GPIO6 ToF-board front LED. Integer percent 0..100. Enforced at every illumination entry point in firmware so neither the operator nor the side-button policy can exceed it. Default 50% to prevent thermal damage to the TPS61169 driver + LED under extended full-duty operation."
+              />
+              <input
+                type="number"
+                step="1"
+                min="0"
+                max="100"
+                value={form.safetyMaxTofLedDutyCyclePct}
+                title="ToF LED peak brightness cap (%). Integer 0-100."
+                onChange={(event) => patchForm('safetyMaxTofLedDutyCyclePct', event.target.value)}
               />
             </label>
           </div>
@@ -4013,6 +4097,52 @@ async function setLdSbdnMode(mode: LdSbdnMode) {
               Temp ADC {snapshot.safety.tecTempAdcBlocked ? 'high' : 'clear'}
             </span>
           </div>
+
+          <div className="field-block">
+            <FieldLabel
+              label="Interlock enables"
+              help="Disable a specific interlock to stop it firing while keeping the others active. The master `interlocksDisabled` service override sits above these."
+            />
+            <div className="interlock-grid">
+              {([
+                ['safetyInterlockHorizonEnabled', 'Horizon (IMU pitch)'],
+                ['safetyInterlockDistanceEnabled', 'Distance (ToF range)'],
+                ['safetyInterlockTofInvalidEnabled', 'ToF invalid'],
+                ['safetyInterlockTofStaleEnabled', 'ToF stale'],
+                ['safetyInterlockImuInvalidEnabled', 'IMU invalid'],
+                ['safetyInterlockImuStaleEnabled', 'IMU stale'],
+                ['safetyInterlockLambdaDriftEnabled', 'Lambda drift'],
+                ['safetyInterlockTecTempAdcEnabled', 'TEC temp ADC'],
+                ['safetyInterlockLdOvertempEnabled', 'LD overtemp'],
+                ['safetyInterlockLdLoopBadEnabled', 'LD loop good'],
+              ] as const).map(([key, label]) => (
+                <label key={key} className="interlock-toggle">
+                  <input
+                    type="checkbox"
+                    checked={form[key]}
+                    onChange={(event) => patchForm(key, event.target.checked)}
+                  />
+                  <span>{label}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+
+          <label className="field interlock-tof-low-only">
+            <input
+              type="checkbox"
+              checked={form.safetyTofLowBoundOnly}
+              onChange={(event) =>
+                patchForm('safetyTofLowBoundOnly', event.target.checked)
+              }
+            />
+            <span>
+              <strong>ToF low-bound only</strong>
+              <small>
+                Fire only when distance drops below the minimum. The upper bound, stale-data, and invalid-reading checks are skipped. Missing or out-of-FoV readings are treated as "no near object".
+              </small>
+            </span>
+          </label>
         </article>
 
         <article className="panel-cutout bringup-module-overview">

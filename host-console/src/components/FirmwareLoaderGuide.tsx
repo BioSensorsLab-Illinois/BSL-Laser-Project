@@ -1,4 +1,11 @@
-import { motion } from 'framer-motion'
+/* 2026-04-17 (Uncodixfy polish): framer-motion removed — the two
+ * pulsing `motion.div` hotspots used continuous scale + opacity
+ * animations, and the step-list used scroll-triggered slide-ins.
+ * Both violate "no transform animations ... simple opacity/color
+ * changes" per the spec. Replaced with static static hotspot chips
+ * and static step list; a subtle CSS opacity-only pulse is
+ * retained for the RST/BOOT chips so the guide still draws the
+ * eye without a bouncy motion. */
 import { Cable, LoaderCircle, RotateCcw } from 'lucide-react'
 
 import boardLayout from '../assets/esp32-board-layout-horizontal.png'
@@ -100,23 +107,15 @@ export function FirmwareLoaderGuide({
               decoding="async"
             />
 
-            <motion.div
-              className="board-hotspot is-reset"
-              animate={{ scale: [1, 1.06, 1], opacity: [0.86, 1, 0.86] }}
-              transition={{ duration: 1.8, repeat: Infinity, ease: 'easeInOut' }}
-            >
+            <div className="board-hotspot is-reset">
               <span className="board-hotspot__pulse" />
               <span className="board-hotspot__chip">RST</span>
-            </motion.div>
+            </div>
 
-            <motion.div
-              className="board-hotspot is-boot"
-              animate={{ scale: [1, 1.08, 1], opacity: [0.88, 1, 0.88] }}
-              transition={{ duration: 1.8, repeat: Infinity, ease: 'easeInOut', delay: 0.3 }}
-            >
+            <div className="board-hotspot is-boot">
               <span className="board-hotspot__pulse" />
               <span className="board-hotspot__chip">BOOT</span>
-            </motion.div>
+            </div>
           </div>
 
           <div className="board-caption">
@@ -134,21 +133,14 @@ export function FirmwareLoaderGuide({
           </div>
 
           <div className="flash-step-list">
-            {flashingSteps.map((step, index) => (
-              <motion.div
-                key={step.index}
-                className="flash-step"
-                initial={{ opacity: 0, y: 12 }}
-                whileInView={{ opacity: 1, y: 0 }}
-                viewport={{ once: true, amount: 0.4 }}
-                transition={{ duration: 0.28, delay: index * 0.05 }}
-              >
+            {flashingSteps.map((step) => (
+              <div key={step.index} className="flash-step">
                 <div className="flash-step__index">{step.index}</div>
                 <div className="flash-step__body">
                   <strong>{step.title}</strong>
                   <p>{step.detail}</p>
                 </div>
-              </motion.div>
+              </div>
             ))}
           </div>
 

@@ -19,4 +19,4 @@ if [ -z "$PORT" ]; then
 fi
 
 echo "Flashing to $PORT..."
-idf.py -p "$PORT" flash monitor
+idf.py -p "$PORT" flash 

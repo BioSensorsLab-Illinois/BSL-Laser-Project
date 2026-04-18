@@ -176,6 +176,22 @@ Current bring-up-specific behavior:
 - Each deployment step now carries `startedAtMs` and `completedAtMs`.
 - `integrate.set_safety` applies runtime safety immediately and also requests device-side persistence so the same thresholds survive reboot and are reused automatically by deployment.
 - `integrate.set_safety` now owns `off_current_threshold_a`; the default is `0.2 A`, and idle bias current below that threshold is treated as intentional in deployment ready-idle posture.
+- `integrate.set_safety`, `set_runtime_safety`, and `set_deployment_safety` are rejected with an actionable error while the laser or alignment output is active (`decision.nir_output_enable` or `decision.alignment_output_enable`). Turn the output off first. The rejection also applies to the NIR duty-cycle / peak-current fields so live policy edits cannot silently change an active emission.
+- `integrate.set_safety` / `set_runtime_safety` / `set_deployment_safety` additionally accept the following optional boolean fields, each of which disables a specific interlock while leaving every other check active. Fields absent from a payload are **non-destructive** (leave the current setting unchanged). Defaults are all-true, and the master `interlocksDisabled` (service override) short-circuits all of these:
+  - `interlock_horizon_enabled`
+  - `interlock_distance_enabled`
+  - `interlock_lambda_drift_enabled`
+  - `interlock_tec_temp_adc_enabled`
+  - `interlock_imu_invalid_enabled`
+  - `interlock_imu_stale_enabled`
+  - `interlock_tof_invalid_enabled`
+  - `interlock_tof_stale_enabled`
+  - `interlock_ld_overtemp_enabled`
+  - `interlock_ld_loop_bad_enabled`
+- `tof_low_bound_only` (optional boolean) — when `true`, the distance interlock fires only when `tof_distance_m < tof_min_range_m`. The upper-bound, invalid-data, and stale-data checks are all skipped; a missing or out-of-FoV reading is treated as "no near object" (safe-unblocked). Default `false`.
+- The `safety` object in `status_snapshot`, `live_telemetry`, and every `status.*` response now carries a sibling `interlocks` sub-object with the camelCase equivalents: `horizonEnabled`, `distanceEnabled`, `lambdaDriftEnabled`, `tecTempAdcEnabled`, `imuInvalidEnabled`, `imuStaleEnabled`, `tofInvalidEnabled`, `tofStaleEnabled`, `ldOvertempEnabled`, `ldLoopBadEnabled`, `tofLowBoundOnly`.
+- `deployment.enter` is idempotent at the firmware level: a second request while `deployment.active` is true returns an error of the form "Deployment mode is already active. Use 'Exit deployment' first if you want to restart it." The host console disables the button in that state; any other host must tolerate the rejection without retry.
+- `operate.save_deployment_defaults`, `integrate.set_safety`, and `integrate.save_profile` all trigger NVS writes on commit. Hosts should allow an ACK window of at least 6.5 s for these commands on congested Wi-Fi links (USB CDC remains sub-second).
 - STUSB4500 ownership is intentionally narrow:
   - passive/general firmware reads are allowed for status and deployment qualification
   - one boot-time firmware reconcile write window only when firmware PDO auto-load-on-mismatch is enabled
@@ -421,6 +437,14 @@ The bench image now uses two async telemetry tiers:
 
 - `live_telemetry`: the lightweight high-rate stream for UI motion and fast numeric readback. It carries the current `session`, `pd`, `bench`, `rails`, `imu`, `tof`, `laser`, `tec`, `safety`, `buttons`, compact `bringup` service state, deployment state, and split `fault` summary.
 - `status_snapshot`: the slower richer snapshot for periodic reconciliation. It now also carries `bench`, `buttons`, identity, GPIO inspector state, haptic peripheral readback, and the compact bring-up status block.
+
+Cadences (post-refactor 2026-04-17):
+
+- `fast_telemetry`: ~60 ms over USB, ~180 ms over Wi-Fi.
+- `live_telemetry`: ~1 s.
+- `status_snapshot`: ~5 s periodic, plus an immediate emission within one TX-task tick (~20 ms) to each newly connected WS client — the firmware sets an internal `new_client_snapshot_pending` flag on every post-handshake callback so a fresh host does not have to poll `status.get` at connect time.
+
+All broadcast frames on the WS path are posted via `httpd_queue_work` to the httpd task; producers do not block on `httpd_ws_send_frame_async`. Frames from a single producer preserve submission order, but the command task and TX task are independent producers and their frames may interleave at the client; the host must not assume a response precedes a surrounding telemetry frame.
 
 Representative `live_telemetry` event:
 

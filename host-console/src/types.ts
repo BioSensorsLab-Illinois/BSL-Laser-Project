@@ -801,6 +801,35 @@ export interface SafetyStatus {
   targetLambdaNm: number
   lambdaDriftNm: number
   tempAdcVoltageV: number
+  /**
+   * Per-interlock enable mask. Every flag defaults to true server-side;
+   * setting a flag to false disables that specific interlock while
+   * leaving every other check active. The master `interlocksDisabled`
+   * (service mode override) sits above these and short-circuits all of
+   * them. See `laser_controller_safety.c` for the evaluation order.
+   * Added 2026-04-17 per user directive.
+   */
+  interlocks: {
+    horizonEnabled: boolean
+    distanceEnabled: boolean
+    lambdaDriftEnabled: boolean
+    tecTempAdcEnabled: boolean
+    imuInvalidEnabled: boolean
+    imuStaleEnabled: boolean
+    tofInvalidEnabled: boolean
+    tofStaleEnabled: boolean
+    ldOvertempEnabled: boolean
+    ldLoopBadEnabled: boolean
+    /**
+     * When true the ToF interlock fires ONLY when distance drops below
+     * the minimum threshold. The upper bound, stale-data, and invalid-
+     * reading checks are all skipped. A missing or out-of-FoV reading
+     * is treated as "no near object" (safe-unblocked) so the operator
+     * is never bothered by the ToF when the target is further than the
+     * sensor's usable range.
+     */
+    tofLowBoundOnly: boolean
+  }
 }
 
 export interface DeviceSnapshot {

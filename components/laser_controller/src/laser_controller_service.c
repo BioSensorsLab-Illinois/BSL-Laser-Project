@@ -125,6 +125,38 @@ typedef struct {
     uint32_t haptic_rtp_level;
 } laser_controller_service_persisted_profile_v4_t;
 
+/*
+ * v5's frozen safety_thresholds layout (2026-04-17 snapshot). Mirrors
+ * `laser_controller_safety_thresholds_t` BEFORE the interlock-enable
+ * mask + tof_low_bound_only fields were appended. Required because the
+ * live typedef has grown and the NVS load path keys off exact size
+ * match — without this freeze, every operator's saved DAC/PD/IMU
+ * profile would be rejected on the first boot with the new firmware.
+ * Migrate path (`migrate_v5_profile`) copies field-by-field into the
+ * current profile and seeds interlock flags with the safe "all
+ * enabled" defaults.
+ */
+typedef struct {
+    laser_controller_radians_t horizon_threshold_rad;
+    laser_controller_radians_t horizon_hysteresis_rad;
+    laser_controller_distance_m_t tof_min_range_m;
+    laser_controller_distance_m_t tof_max_range_m;
+    laser_controller_distance_m_t tof_hysteresis_m;
+    laser_controller_nm_t lambda_drift_limit_nm;
+    laser_controller_nm_t lambda_drift_hysteresis_nm;
+    laser_controller_celsius_t ld_overtemp_limit_c;
+    laser_controller_volts_t tec_temp_adc_trip_v;
+    laser_controller_volts_t tec_temp_adc_hysteresis_v;
+    laser_controller_celsius_t tec_min_command_c;
+    laser_controller_celsius_t tec_max_command_c;
+    laser_controller_celsius_t tec_ready_tolerance_c;
+    laser_controller_amps_t max_laser_current_a;
+    laser_controller_amps_t off_current_threshold_a;
+    laser_controller_amps_t current_match_tolerance_a;
+    uint32_t max_tof_led_duty_cycle_pct;
+    laser_controller_volts_t lio_voltage_offset_v;
+} laser_controller_safety_thresholds_v5_frozen_t;
+
 typedef struct {
     uint32_t version;
     char profile_name[LASER_CONTROLLER_SERVICE_PROFILE_NAME_LEN];
@@ -162,7 +194,7 @@ typedef struct {
     uint32_t haptic_library;
     laser_controller_service_haptic_actuator_t haptic_actuator;
     uint32_t haptic_rtp_level;
-    laser_controller_safety_thresholds_t safety_thresholds;
+    laser_controller_safety_thresholds_v5_frozen_t safety_thresholds;
     laser_controller_timeout_policy_t safety_timeouts;
 } laser_controller_service_persisted_profile_v5_t;
 
@@ -220,6 +252,43 @@ typedef struct {
 
 static laser_controller_service_context_t s_service;
 static portMUX_TYPE s_service_lock = portMUX_INITIALIZER_UNLOCKED;
+
+/*
+ * File-scope default interlock mask used by NVS migration paths to seed
+ * the new `interlocks` field when upgrading from a profile blob saved
+ * before the 2026-04-17 interlock-mask change. Allocated in .rodata so
+ * the migration doesn't have to put a full `laser_controller_config_t`
+ * on the main-task stack during boot (that blew
+ * CONFIG_ESP_MAIN_TASK_STACK_SIZE once already — see the stack-overflow
+ * boot panic that forced this refactor). Mirrors the defaults set in
+ * `laser_controller_config_load_defaults`.
+ */
+static const laser_controller_interlock_enable_t kDefaultInterlockEnables = {
+    .horizon_enabled      = true,
+    .distance_enabled     = true,
+    .lambda_drift_enabled = true,
+    .tec_temp_adc_enabled = true,
+    .imu_invalid_enabled  = true,
+    .imu_stale_enabled    = true,
+    .tof_invalid_enabled  = true,
+    .tof_stale_enabled    = true,
+    .ld_overtemp_enabled  = true,
+    .ld_loop_bad_enabled  = true,
+    .tof_low_bound_only   = false,
+};
+
+/*
+ * Compile-time guard: the NVS "old-profile-without-interlocks" branch
+ * in `load_profile_locked` uses the delta between the current and the
+ * frozen safety_thresholds layout as its blob-size sentinel. If a future
+ * struct growth changes that delta unexpectedly, we want a build error,
+ * not a silent NVS migration bug.
+ */
+_Static_assert(
+    sizeof(laser_controller_safety_thresholds_t) >
+        sizeof(laser_controller_safety_thresholds_v5_frozen_t),
+    "safety_thresholds_t must be strictly larger than the frozen v5 layout; "
+    "otherwise NVS migration cannot distinguish old blobs from new.");
 
 static float laser_controller_service_clamp_float(float value, float minimum, float maximum)
 {
@@ -782,7 +851,23 @@ static void laser_controller_service_migrate_v5_profile(
     profile->haptic_library = legacy->haptic_library;
     profile->haptic_actuator = legacy->haptic_actuator;
     profile->haptic_rtp_level = legacy->haptic_rtp_level;
-    profile->safety_thresholds = legacy->safety_thresholds;
+    /*
+     * Safety thresholds: the v5 frozen layout is prefix-identical to the
+     * current `laser_controller_safety_thresholds_t` up through
+     * lio_voltage_offset_v. The interlocks field was APPENDED (see
+     * laser_controller_config.h), so a byte-for-byte prefix copy keeps
+     * every previously-saved threshold and timeout. Interlocks are then
+     * seeded from the file-scope const default so we don't allocate a
+     * full `laser_controller_config_t` on the main-task stack (which
+     * already carries four persisted_profile variants and was close to
+     * its `CONFIG_ESP_MAIN_TASK_STACK_SIZE` ceiling — see
+     * `kDefaultInterlockEnables`).
+     */
+    memcpy(
+        &profile->safety_thresholds,
+        &legacy->safety_thresholds,
+        sizeof(laser_controller_safety_thresholds_v5_frozen_t));
+    profile->safety_thresholds.interlocks = kDefaultInterlockEnables;
     profile->safety_timeouts = legacy->safety_timeouts;
     laser_controller_service_load_default_runtime_target(
         &profile->runtime_target_mode,
@@ -1002,8 +1087,37 @@ static bool laser_controller_service_load_profile_locked(void)
         return false;
     }
 
+    /*
+     * Blob-size branch. Order matters — match largest (current) first.
+     * The "current minus interlocks tail" branch accepts blobs saved by
+     * the firmware that shipped BEFORE the 2026-04-17 interlock-mask
+     * change; those blobs are prefix-identical to the current struct
+     * because the new interlocks field was appended to
+     * `laser_controller_safety_thresholds_t` rather than inserted.
+     */
     if (size == sizeof(profile)) {
         err = nvs_get_blob(handle, LASER_CONTROLLER_SERVICE_NVS_KEY, &profile, &size);
+    } else if (size == sizeof(profile) -
+                       (sizeof(laser_controller_safety_thresholds_t) -
+                        sizeof(laser_controller_safety_thresholds_v5_frozen_t))) {
+        /*
+         * 2026-04-17 correction: the delta between the current
+         * `safety_thresholds_t` and the frozen v5 layout is the correct
+         * sentinel for "pre-interlock-mask profile blob". `sizeof` on
+         * the bare `interlock_enable_t` (11 bools) is 11 bytes, but the
+         * struct's trailing-member padding in `safety_thresholds_t`
+         * rounds the actual growth to 12 bytes. Using the layout delta
+         * keeps this correct regardless of future padding changes, and
+         * the _Static_assert below pins the arithmetic so any future
+         * struct grow doesn't silently break NVS migration.
+         */
+        memset(&profile, 0, sizeof(profile));
+        err = nvs_get_blob(
+            handle, LASER_CONTROLLER_SERVICE_NVS_KEY, &profile, &size);
+        if (err == ESP_OK) {
+            profile.safety_thresholds.interlocks = kDefaultInterlockEnables;
+            size = sizeof(profile);
+        }
     } else if (size == sizeof(profile_v5)) {
         err = nvs_get_blob(handle, LASER_CONTROLLER_SERVICE_NVS_KEY, &profile_v5, &size);
         if (err == ESP_OK) {
@@ -1175,15 +1289,33 @@ static void laser_controller_service_apply_manual_defaults_locked(const char *pr
     laser_controller_service_apply_core_preset_locked(profile_name);
     s_service.status.interlocks_disabled = false;
 
+    /*
+     * Default to "every module expected present". Before 2026-04-17 this
+     * zeroed every expected/debug flag and required the operator to
+     * declare each installed module manually in service mode. The
+     * downstream cost was large: on a fresh boot every bringup-fact tag
+     * reads "Not installed" even when the peripheral is alive on the
+     * bus, and runtime telemetry withholds live cache updates until the
+     * operator enters service mode once to flip the flag. That has been
+     * the single biggest "stuck until I poke service mode" complaint.
+     *
+     * With Stage 1 (unconditional runtime probe in read_inputs) the
+     * missing-module case is cheap: probe NACKs fast-fail in ~1 ms with
+     * per-peripheral backoff timers. Starting "expected" just means the
+     * bringup detail block reports detected=false when absent, which is
+     * the correct observation — not a policy error. The operator can
+     * still flip individual module flags off from the Integrate
+     * workspace when deliberately unbuilding a board.
+     */
     for (uint32_t index = 0U; index < LASER_CONTROLLER_MODULE_COUNT; ++index) {
-        s_service.status.modules[index].expected_present = false;
-        s_service.status.modules[index].debug_enabled = false;
+        s_service.status.modules[index].expected_present = true;
+        s_service.status.modules[index].debug_enabled = true;
     }
 
     laser_controller_service_copy_text(
         s_service.status.last_action,
         sizeof(s_service.status.last_action),
-        "Manual bring-up defaults loaded. Pick one module and declare only the hardware that is physically installed.");
+        "Manual bring-up defaults loaded. All modules marked expected; disable individually from Integrate if deliberately unbuilt.");
     laser_controller_service_refresh_modules_locked();
 }
 

@@ -48,5 +48,11 @@ esp_err_t laser_controller_wireless_configure(
 esp_err_t laser_controller_wireless_scan_networks(void);
 void laser_controller_wireless_broadcast_text(const char *line);
 bool laser_controller_wireless_has_clients(void);
+/*
+ * Atomically read and clear the "new client joined — please emit a
+ * fresh snapshot" flag. Called by the comms TX task on every tick.
+ * Returns true at most once per newly-connected client.
+ */
+bool laser_controller_wireless_consume_new_client_pending(void);
 void laser_controller_wireless_copy_status(
     laser_controller_wireless_status_t *status);

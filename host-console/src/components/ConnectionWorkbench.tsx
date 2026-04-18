@@ -423,7 +423,19 @@ export function ConnectionWorkbench({
       return
     }
 
-    onSetWifiUrl(controllerBenchAp.wsUrl)
+    /*
+     * 2026-04-17: guard against a no-op URL write. onSetWifiUrl() on
+     * an unchanged string is a React setState bail-out in practice,
+     * but the ConnectionWorkbench is a hot path and the URL change
+     * invalidates the transport memo in use-device-session, which
+     * destroys and re-creates the WS mid-UI-flow. Only set when the
+     * URL actually changes so a wifi session that was already at the
+     * bench AP default URL doesn't churn its transport when the
+     * station-mode credentials are staged from a different link.
+     */
+    if (wifiUrl !== controllerBenchAp.wsUrl) {
+      onSetWifiUrl(controllerBenchAp.wsUrl)
+    }
 
     if (transportKind === 'serial' && transportStatus === 'connected') {
       void onIssueCommandAwaitAck(

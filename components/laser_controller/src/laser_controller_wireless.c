@@ -19,6 +19,7 @@
 #include "lwip/sockets.h"
 #include "nvs.h"
 
+#include "laser_controller_app.h"
 #include "laser_controller_comms.h"
 
 #define LASER_CONTROLLER_WIRELESS_AP_SSID          "BSL-HTLS-Bench"
@@ -40,7 +41,19 @@
  * close callback (registered in start_http_server) keep slots clean.
  */
 #define LASER_CONTROLLER_WIRELESS_CLIENT_SLOTS     4
-#define LASER_CONTROLLER_WIRELESS_MAX_FRAME_LEN    768U
+/*
+ * WS receive-frame buffer. 768 was the pre-2026-04-17 value; any command
+ * payload larger than this was rejected with ESP_ERR_INVALID_SIZE from
+ * the URI handler, which in ESP-IDF httpd_ws tears the WebSocket
+ * session down (TCP RST) and surfaces to the host as "Wireless
+ * controller link dropped". That bit us after the `integrate.set_safety`
+ * payload grew past 1 KB with the interlock-enable mask (10 new
+ * booleans + `tof_low_bound_only`) on top of the existing ~20 numeric
+ * policy fields. Raising to 2048 leaves ample headroom for every
+ * command the host currently issues, while still rejecting pathological
+ * > 2 KB commands to bound the per-session stack allocation at 731.
+ */
+#define LASER_CONTROLLER_WIRELESS_MAX_FRAME_LEN    2048U
 #define LASER_CONTROLLER_WIRELESS_NVS_NAMESPACE    "laser_wifi"
 #define LASER_CONTROLLER_WIRELESS_NVS_KEY          "config"
 #define LASER_CONTROLLER_WIRELESS_CONFIG_VERSION   1U
@@ -48,8 +61,44 @@
 /*
  * Drop threshold tightened 4 -> 2 (2026-04-16): defense in depth in
  * case the close callback doesn't fire (e.g. on TCP RST without FIN).
+ *
+ * Tightened further 2 -> 1 (2026-04-17) after the WS stability audit:
+ * we now also call httpd_sess_trigger_close() on the FIRST send failure
+ * in broadcast_text(), so there is no reason to retry a second time.
+ * Keeping a stale FD alive for a second broadcast pass was exactly the
+ * head-of-line stall that blocked service/deployment-mode entry and
+ * the browser-refresh reconnect path: while one zombie FD sat in send()
+ * for up to HTTPD_SEND_WAIT_TIMEOUT seconds, every other client saw no
+ * data, the output mutex stayed held, and the command_task queue
+ * stopped draining.
  */
-#define LASER_CONTROLLER_WIRELESS_CLIENT_DROP_FAILURES 2U
+#define LASER_CONTROLLER_WIRELESS_CLIENT_DROP_FAILURES 1U
+
+/*
+ * Per-send timeout for WS frames. Must be < command ack timeout and
+ * short enough that a dead client doesn't wedge the broadcast loop for
+ * the full ESP-IDF default (5 s). 1500 ms is a compromise: long enough
+ * that a congested but alive Wi-Fi link still completes one fragment,
+ * short enough that a dead FD is evicted in well under the operator's
+ * 5 s command ack deadline.
+ */
+/*
+ * Tightened 2 -> 1 (2026-04-17 late) after the stuck-command-queue
+ * incident: the httpd task serializes ALL WS sends (Stage 2). A single
+ * slow or dead client can block the httpd task for up to this timeout,
+ * stalling broadcasts AND per-client ACKs to ALL clients. 2s was too
+ * generous; 1s is the right compromise for a Wi-Fi AP-mode link on a
+ * busy bench.
+ */
+#define LASER_CONTROLLER_WIRELESS_SEND_WAIT_TIMEOUT_S 1
+/*
+ * TCP keep-alive probe parameters. On a quiet link we want to detect a
+ * dead peer in ~9 s rather than the Linux default (hours). The server
+ * side does not send heartbeat frames; the TCP layer does it for us.
+ */
+#define LASER_CONTROLLER_WIRELESS_KEEP_ALIVE_IDLE_S     5
+#define LASER_CONTROLLER_WIRELESS_KEEP_ALIVE_INTERVAL_S 2
+#define LASER_CONTROLLER_WIRELESS_KEEP_ALIVE_COUNT      2
 
 typedef struct {
     uint32_t version;
@@ -78,8 +127,33 @@ static laser_controller_wireless_mode_t s_mode =
     LASER_CONTROLLER_WIRELESS_MODE_SOFTAP;
 static int s_client_fds[LASER_CONTROLLER_WIRELESS_CLIENT_SLOTS] = { -1, -1, -1, -1 };
 static uint8_t s_client_send_failures[LASER_CONTROLLER_WIRELESS_CLIENT_SLOTS] = { 0U, 0U, 0U, 0U };
+/*
+ * Diagnostic counters for the Stage 2 async broadcast path. Increment
+ * from the producer task (no lock; single-writer per counter is fine
+ * since we only report them, never act on them):
+ *   - broadcast_oom:        malloc failed for the heap-dup copy
+ *   - broadcast_queue_fail: httpd_queue_work returned non-ESP_OK
+ *     (control socket full or httpd task not running)
+ * Both outcomes DROP the frame rather than running inline on the
+ * caller's task, which was the frame-splice / command-queue-wedge
+ * source in the 2026-04-17 session archive.
+ */
+static uint32_t s_broadcast_drops_oom = 0U;
+static uint32_t s_broadcast_drops_queue_fail = 0U;
 static uint32_t s_client_generations[LASER_CONTROLLER_WIRELESS_CLIENT_SLOTS] = { 0U, 0U, 0U, 0U };
 static uint32_t s_client_generation_counter;
+/*
+ * 2026-04-17: set by the WS GET handler whenever a new (or recycled)
+ * client lands in our slot table. The comms TX task observes and
+ * clears this; when set, the next TX tick emits a full status snapshot
+ * unconditionally so the new client does not wait up to
+ * COMMS_WIRELESS_FAST_TELEMETRY_PERIOD_MS (180 ms) or the post-command
+ * quiet window (400 ms) before seeing any data. Without this, a page
+ * refresh during a command-in-flight window produced the
+ * "WS opens but no JSON handshake arrives" symptom reported in the
+ * field.
+ */
+static volatile bool s_new_client_snapshot_pending;
 static char s_active_ssid[33] = LASER_CONTROLLER_WIRELESS_AP_SSID;
 static char s_station_ssid[33];
 static char s_station_password[LASER_CONTROLLER_WIRELESS_PASSWORD_LEN];
@@ -94,6 +168,8 @@ static char s_ws_url[64] = LASER_CONTROLLER_WIRELESS_AP_WS_URL;
 static char s_last_error[96];
 static portMUX_TYPE s_wireless_lock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE s_client_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static void laser_controller_wireless_force_close_all_clients(void);
 
 static void laser_controller_wireless_copy_text(
     char *dest,
@@ -222,6 +298,7 @@ static void laser_controller_wireless_add_client(int fd)
     ssize_t empty_index = -1;
     size_t oldest_index = 0U;
     uint32_t oldest_generation = UINT32_MAX;
+    bool is_new_slot = false;
 
     portENTER_CRITICAL(&s_client_lock);
     for (size_t index = 0U;
@@ -251,7 +328,18 @@ static void laser_controller_wireless_add_client(int fd)
     s_client_fds[target_index] = fd;
     s_client_send_failures[target_index] = 0U;
     s_client_generations[target_index] = ++s_client_generation_counter;
+    is_new_slot = true;
     portEXIT_CRITICAL(&s_client_lock);
+
+    if (is_new_slot) {
+        /*
+         * Flag a fresh-snapshot request outside the critical section —
+         * comms/TX observes this on its next tick. Safe to set
+         * unconditionally: the write is idempotent and the volatile
+         * store doesn't need the lock.
+         */
+        s_new_client_snapshot_pending = true;
+    }
 }
 
 static void laser_controller_wireless_remove_client(int fd)
@@ -445,6 +533,29 @@ static void laser_controller_wireless_event_handler(
             portENTER_CRITICAL(&s_wireless_lock);
             s_ap_ready = false;
             portEXIT_CRITICAL(&s_wireless_lock);
+            /*
+             * Tear down every tracked WS session on AP stop. Once the
+             * AP is torn down the existing TCP sockets are dead; we
+             * were leaving them in s_client_fds until the next
+             * broadcast blew up with two failed sends. (2026-04-17)
+             */
+            laser_controller_wireless_force_close_all_clients();
+            return;
+        }
+
+        if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
+            /*
+             * Reverted 2026-04-17 evening — bulk-closing every tracked
+             * client on STADISCONNECTED nuked the live browser WS on
+             * every transient roaming / beacon-miss / power-save hiccup,
+             * which manifested as `clientCount=0` seconds after a
+             * successful WS upgrade and zero telemetry reaching the
+             * browser even though commands still ack'd via direct
+             * request-response. Let TCP keep-alive (configured in
+             * start_http_server) + close-on-send-failure handle stale
+             * sockets. Those paths are O(9 s) worst case, which is
+             * acceptable; bulk-close was "O(now) but wrong".
+             */
             return;
         }
 
@@ -595,6 +706,35 @@ static esp_err_t laser_controller_wireless_ensure_stack_ready(void)
     return ESP_OK;
 }
 
+/*
+ * WebSocket post-handshake callback. Fires on the httpd task AFTER the
+ * framework sends the 101 Switching Protocols and flips ws_handshake_done
+ * to true. This is the ONLY reliable hook for "a new WS client just
+ * connected" — per ESP-IDF httpd_uri.c:353, the framework explicitly
+ * does NOT invoke the user ws_handler on the initial upgrade GET. So
+ * without this callback, our s_client_fds[] tracker only learned about
+ * a client once it sent its first TEXT frame. If the client stayed
+ * silent (which a listen-only client legitimately may), no telemetry
+ * was ever broadcast to it — the wedge the AP-only audit found
+ * 2026-04-17 evening. (2026-04-17)
+ */
+static esp_err_t laser_controller_wireless_ws_post_handshake(httpd_req_t *req)
+{
+    laser_controller_wireless_add_client(httpd_req_to_sockfd(req));
+    /*
+     * 2026-04-17 (audit round 2, S2): a connected WS client IS a host.
+     * Stamp host activity so the headless auto-deploy at t=5s does NOT
+     * fire if an operator has the console open but is still in the
+     * pre-command ramp-up window. Without this, a listen-only WS
+     * client (still legitimate — the operator may just be watching
+     * telemetry) let auto-deploy run autonomously while the UI thought
+     * it owned the session, causing a surprise deployment the
+     * operator did not initiate.
+     */
+    laser_controller_app_note_host_activity();
+    return ESP_OK;
+}
+
 static esp_err_t laser_controller_wireless_ws_handler(httpd_req_t *req)
 {
     httpd_ws_frame_t frame = {
@@ -604,6 +744,11 @@ static esp_err_t laser_controller_wireless_ws_handler(httpd_req_t *req)
     esp_err_t err = ESP_OK;
 
     if (req->method == HTTP_GET) {
+        /*
+         * Defensive: on some IDF paths the framework routes a refresh
+         * through here. Keep add_client idempotent. The primary upgrade
+         * hook is now the post-handshake callback above. (2026-04-17)
+         */
         laser_controller_wireless_add_client(httpd_req_to_sockfd(req));
         return ESP_OK;
     }
@@ -670,25 +815,39 @@ static esp_err_t laser_controller_wireless_meta_handler(httpd_req_t *req)
 
 /*
  * httpd close callback. Fires when ESP-IDF tears down a session — TCP
- * FIN, RST, lru-purge, or explicit close. Without this, dead WS FDs
- * stayed in s_client_fds[] until CLIENT_DROP_FAILURES sends accumulated
- * (~seconds), which broke page-refresh and multi-tab use.
+ * FIN, RST, lru-purge, or explicit close.
  *
- * IMPORTANT: we deliberately do NOT call `close(sockfd)` here. Earlier
- * iterations did, per ESP-IDF docs ("the callback owns closing the
- * socket"). In practice, calling close() raced with kernel FD reuse:
- * a fresh WS connection landed on the same FD number while our close
- * was in flight, causing the new session's first frame to fail and the
- * GUI to hang on "Waiting for controller firmware handshake…". The
- * httpd's `lru_purge_enable=true` and the kernel TCP layer reap the
- * socket on their own; explicit close() was strictly harmful here.
- * (2026-04-17)
+ * Reversal of 2026-04-17 morning note (same day): we now DO call
+ * close(sockfd) here. Per ESP-IDF httpd_sess.c:373-378, when a
+ * close_fn is registered, httpd delegates the actual close() to the
+ * callback instead of calling it itself:
+ *     if (hd->config.close_fn) { hd->config.close_fn(hd, session->fd); }
+ *     else { close(session->fd); }
+ * If we DO NOT call close(), the socket FD leaks forever. Under the
+ * stress of repeated page-refresh / multi-client cycles, N open/close
+ * pairs leak N FDs, LwIP's VFS socket table fills, and httpd's next
+ * accept() returns RST — producing the exact "new sessions fail after
+ * several refreshes" wedge the field reported.
+ *
+ * The FD-reuse race the earlier note feared — "a fresh WS connection
+ * landed on the same FD number while our close was in flight, causing
+ * the new session's first frame to fail and the GUI to hang on
+ * 'Waiting for controller firmware handshake…'" — is now handled by
+ * the new-client snapshot flag (see `add_client` +
+ * `laser_controller_wireless_consume_new_client_pending` + the TX
+ * task's force-snapshot path). Even if a broadcast ships to a reused
+ * fd before our tracker is updated, the fresh `add_client` bumps the
+ * snapshot flag and the very next TX tick emits a correct
+ * status_snapshot to the new peer. The transient garbage frame is
+ * harmless: it's a snapshot event, not a state-changing command.
+ * (2026-04-17, revised)
  */
 static void laser_controller_wireless_session_closed(
     httpd_handle_t hd, int sockfd)
 {
     (void)hd;
     laser_controller_wireless_remove_client(sockfd);
+    (void)close(sockfd);
 }
 
 static void laser_controller_wireless_start_http_server(void)
@@ -700,6 +859,7 @@ static void laser_controller_wireless_start_http_server(void)
         .handler = laser_controller_wireless_ws_handler,
         .user_ctx = NULL,
         .is_websocket = true,
+        .ws_post_handshake_cb = laser_controller_wireless_ws_post_handshake,
     };
     static const httpd_uri_t meta_uri = {
         .uri = "/meta",
@@ -720,6 +880,27 @@ static void laser_controller_wireless_start_http_server(void)
     config.max_open_sockets = 7;
     config.lru_purge_enable = true;
     config.close_fn = laser_controller_wireless_session_closed;
+    /*
+     * Bound the per-send blocking time (2026-04-17). Default is 5 s;
+     * a dead FD in the middle of the broadcast loop held our
+     * s_output_lock for that long while staying blocked in send(),
+     * blocking every other telemetry emit and every command response.
+     */
+    config.send_wait_timeout = LASER_CONTROLLER_WIRELESS_SEND_WAIT_TIMEOUT_S;
+    config.recv_wait_timeout = 5;
+    /*
+     * Enable TCP keep-alive so a dead peer (laptop lid close, radio
+     * off, abrupt app kill) is detected in ~9 s instead of waiting
+     * for the next send() to fail. Combined with the
+     * AP_STADISCONNECTED hook above, this closes the gap where a
+     * disassociated station's TCP socket lived on until the next
+     * broadcast attempt. (2026-04-17)
+     */
+    config.keep_alive_enable = true;
+    config.keep_alive_idle = LASER_CONTROLLER_WIRELESS_KEEP_ALIVE_IDLE_S;
+    config.keep_alive_interval =
+        LASER_CONTROLLER_WIRELESS_KEEP_ALIVE_INTERVAL_S;
+    config.keep_alive_count = LASER_CONTROLLER_WIRELESS_KEEP_ALIVE_COUNT;
 
     if (httpd_start(&s_server, &config) != ESP_OK) {
         ESP_LOGE(TAG, "http server start failed");
@@ -1092,7 +1273,14 @@ esp_err_t laser_controller_wireless_scan_networks(void)
     return err;
 }
 
-void laser_controller_wireless_broadcast_text(const char *line)
+/*
+ * Inline (synchronous) broadcast — iterates tracked client FDs and
+ * sends `line` to each. This is the slow path: the WS send can block
+ * up to `send_wait_timeout` seconds per dead FD. Retained because
+ * `httpd_queue_work` has a bounded control socket and may reject work
+ * under heavy backpressure; in that case we fall back to inline send.
+ */
+static void laser_controller_wireless_broadcast_text_inline(const char *line)
 {
     httpd_ws_frame_t frame = {
         .final = true,
@@ -1101,7 +1289,7 @@ void laser_controller_wireless_broadcast_text(const char *line)
         .payload = (uint8_t *)(line != NULL ? line : ""),
         .len = line != NULL ? strlen(line) : 0U,
     };
-    int fds[LASER_CONTROLLER_WIRELESS_CLIENT_SLOTS] = { -1, -1 };
+    int fds[LASER_CONTROLLER_WIRELESS_CLIENT_SLOTS] = { -1, -1, -1, -1 };
 
     if (s_server == NULL || line == NULL || line[0] == '\0') {
         return;
@@ -1125,12 +1313,148 @@ void laser_controller_wireless_broadcast_text(const char *line)
         const bool ok =
             httpd_ws_send_frame_async(s_server, fds[index], &frame) == ESP_OK;
         laser_controller_wireless_note_send_result(fds[index], ok);
+        if (!ok) {
+            (void)httpd_sess_trigger_close(s_server, fds[index]);
+        }
     }
+}
+
+/*
+ * Async broadcast work. Runs on the httpd task via
+ * `httpd_queue_work`. The producer (comms TX, command response,
+ * log emit, etc.) builds the frame into a heap-allocated copy, hands
+ * it to this work item, and returns immediately — without holding
+ * `s_output_lock` across the potentially-multi-second WS send. That
+ * is the Stage 2 architectural fix: WS latency no longer stalls every
+ * other emitter in the firmware. (2026-04-17)
+ */
+typedef struct {
+    char *line;
+} laser_controller_wireless_broadcast_work_t;
+
+static void laser_controller_wireless_broadcast_work_fn(void *arg)
+{
+    laser_controller_wireless_broadcast_work_t *work =
+        (laser_controller_wireless_broadcast_work_t *)arg;
+    if (work == NULL) {
+        return;
+    }
+    laser_controller_wireless_broadcast_text_inline(work->line);
+    if (work->line != NULL) {
+        free(work->line);
+    }
+    free(work);
+}
+
+void laser_controller_wireless_broadcast_text(const char *line)
+{
+    if (s_server == NULL || line == NULL || line[0] == '\0') {
+        return;
+    }
+    /*
+     * Skip the heap allocation entirely if there are no tracked
+     * clients — no one to send to. This saves every
+     * emit_fast_telemetry tick from doing a strdup+free when the
+     * bench is USB-only with no WS peer.
+     */
+    if (!laser_controller_wireless_has_clients()) {
+        return;
+    }
+
+    const size_t len = strlen(line);
+    laser_controller_wireless_broadcast_work_t *work =
+        (laser_controller_wireless_broadcast_work_t *)malloc(sizeof(*work));
+    if (work == NULL) {
+        s_broadcast_drops_oom += 1U;
+        return;
+    }
+    work->line = (char *)malloc(len + 1U);
+    if (work->line == NULL) {
+        free(work);
+        s_broadcast_drops_oom += 1U;
+        return;
+    }
+    memcpy(work->line, line, len + 1U);
+
+    if (httpd_queue_work(
+            s_server,
+            laser_controller_wireless_broadcast_work_fn,
+            work) == ESP_OK) {
+        return;  /* async path: the only path. */
+    }
+    /*
+     * httpd control socket could not accept the work item. Drop the
+     * frame. DO NOT run inline on the caller's task: inline sends race
+     * with the httpd task's concurrent drain of queued work (both
+     * write to the same WS socket), producing byte-interleaved frames
+     * on the wire. That race wedged the command queue and produced
+     * spliced "tof{..resp..}" console logs in session
+     * 2026-04-17T19:37:50Z. Drop + counter is the safe behavior.
+     *
+     * Telemetry producers are resilient to drops: live_telemetry,
+     * status_snapshot, and fast_telemetry all emit periodically and
+     * the host reconciles on the next arrival. Command ACK drops are
+     * handled by the host's ACK timeout + retry path.
+     */
+    free(work->line);
+    free(work);
+    s_broadcast_drops_queue_fail += 1U;
 }
 
 bool laser_controller_wireless_has_clients(void)
 {
     return laser_controller_wireless_count_clients() != 0U;
+}
+
+bool laser_controller_wireless_consume_new_client_pending(void)
+{
+    /*
+     * Read-then-clear. A race with a second client adding itself at
+     * the same moment is benign: worst case we emit one snapshot that
+     * covers both clients.
+     */
+    if (!s_new_client_snapshot_pending) {
+        return false;
+    }
+    s_new_client_snapshot_pending = false;
+    return true;
+}
+
+/*
+ * Close every tracked WS session via httpd's own teardown path. The
+ * httpd task will fire close_fn() which calls remove_client(). This
+ * is safe to invoke from any task (event handler, comms, or control)
+ * — httpd_sess_trigger_close only marks the session; the close
+ * itself happens on the httpd task.
+ *
+ * A sockfd that is not a known session is a no-op (IDF returns
+ * ESP_ERR_NOT_FOUND without side-effects), so calling on a stale FD
+ * after the kernel already reaped it is harmless.
+ */
+static void laser_controller_wireless_force_close_all_clients(void)
+{
+    int fds[LASER_CONTROLLER_WIRELESS_CLIENT_SLOTS] = { -1, -1, -1, -1 };
+
+    if (s_server == NULL) {
+        return;
+    }
+
+    portENTER_CRITICAL(&s_client_lock);
+    for (size_t index = 0U;
+         index < LASER_CONTROLLER_WIRELESS_CLIENT_SLOTS;
+         ++index) {
+        fds[index] = s_client_fds[index];
+    }
+    portEXIT_CRITICAL(&s_client_lock);
+
+    for (size_t index = 0U;
+         index < LASER_CONTROLLER_WIRELESS_CLIENT_SLOTS;
+         ++index) {
+        if (fds[index] < 0) {
+            continue;
+        }
+        (void)httpd_sess_trigger_close(s_server, fds[index]);
+    }
 }
 
 void laser_controller_wireless_copy_status(

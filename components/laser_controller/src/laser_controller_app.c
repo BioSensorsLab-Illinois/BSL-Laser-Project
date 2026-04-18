@@ -20,6 +20,7 @@
 #include "laser_controller_safety.h"
 #include "laser_controller_state.h"
 #include "laser_controller_usb_debug_mock.h"
+#include "laser_controller_wireless.h"
 
 #define LASER_CONTROLLER_CONTROL_PERIOD_MS 5U
 #define LASER_CONTROLLER_SLOW_DIVIDER 10U
@@ -312,6 +313,24 @@ typedef struct {
      * fresh with the fault cleared and deployment re-arming.
      */
     bool button_recovery_requested;
+    /*
+     * Headless button-driven START-OF-DEPLOYMENT (2026-04-17 user
+     * feature). Same side1+side2 hold gesture as the 2 s fault-recovery
+     * path, but fires the NORMAL deployment sequence at 1 s when:
+     *   - no host is connected (no WS client, no recent USB activity)
+     *   - no fault is latched
+     *   - deployment is NOT already active
+     *   - service mode is NOT active
+     * At the 1 s mark `button_deploy_requested` is raised and consumed
+     * by `run_fast_cycle` end-of-tick handler: `enter_deployment_mode`
+     * then `run_deployment_sequence`. One-shot per hold — the gesture
+     * must be fully released and re-asserted to trigger again.
+     *
+     * `button_deploy_armed` latches true the instant the 1 s hold
+     * triggers, mirroring `button_recovery_armed`.
+     */
+    bool button_deploy_armed;
+    bool button_deploy_requested;
     /*
      * Last whole-second boundary logged during a recovery hold. Used
      * to de-duplicate the "hold X s elapsed" diagnostic so one entry
@@ -1463,31 +1482,55 @@ static void laser_controller_deployment_tick(
                     "DAC readback did not match safe deployment initialization");
             }
             break;
-        case LASER_CONTROLLER_DEPLOYMENT_STEP_PERIPHERALS_VERIFY:
-            if (context->last_inputs.imu_readback.reachable &&
-                context->last_inputs.imu_readback.configured &&
-                context->last_inputs.imu_readback.who_am_i == 0x6CU &&
-                context->last_inputs.tof_readback.reachable &&
-                context->last_inputs.tof_readback.configured &&
-                context->last_inputs.tof_readback.boot_state != 0U &&
-                context->last_inputs.tof_readback.sensor_id == 0xEACCU &&
-                context->last_inputs.haptic_readback.reachable) {
+        case LASER_CONTROLLER_DEPLOYMENT_STEP_PERIPHERALS_VERIFY: {
+            /*
+             * 2026-04-17 user directive: if an operator has disabled a
+             * peripheral's runtime interlocks from the Integrate safety
+             * form (or flipped ToF to low-bound-only), they explicitly
+             * want that peripheral NOT to gate deployment either. A
+             * peripheral's readback is considered satisfied-by-policy
+             * when its invalid+stale pair are both disabled, or — for
+             * ToF — when low-bound-only mode is on (which already
+             * ignores missing / stale data at runtime).
+             */
+            const laser_controller_interlock_enable_t *il =
+                &context->config.thresholds.interlocks;
+            const bool tof_gate_bypassed =
+                il->tof_low_bound_only ||
+                (!il->tof_invalid_enabled && !il->tof_stale_enabled);
+            const bool imu_gate_bypassed =
+                !il->imu_invalid_enabled && !il->imu_stale_enabled;
+
+            const bool imu_ok =
+                imu_gate_bypassed ||
+                (context->last_inputs.imu_readback.reachable &&
+                 context->last_inputs.imu_readback.configured &&
+                 context->last_inputs.imu_readback.who_am_i == 0x6CU);
+            const bool tof_ok =
+                tof_gate_bypassed ||
+                (context->last_inputs.tof_readback.reachable &&
+                 context->last_inputs.tof_readback.configured &&
+                 context->last_inputs.tof_readback.boot_state != 0U &&
+                 context->last_inputs.tof_readback.sensor_id == 0xEACCU);
+            const bool haptic_ok =
+                context->last_inputs.haptic_readback.reachable;
+
+            if (imu_ok && tof_ok && haptic_ok) {
                 laser_controller_deployment_complete_current_step(context, now_ms);
             } else if ((now_ms - context->deployment_step_started_ms) >=
                        LASER_CONTROLLER_DEPLOYMENT_PERIPHERAL_WAIT_MS) {
                 laser_controller_deployment_fail(
                     context,
                     now_ms,
-                    !context->last_inputs.imu_readback.reachable ||
-                            context->last_inputs.imu_readback.who_am_i != 0x6CU ?
+                    !imu_ok ?
                         LASER_CONTROLLER_FAULT_IMU_INVALID :
-                    !context->last_inputs.tof_readback.reachable ||
-                            context->last_inputs.tof_readback.sensor_id != 0xEACCU ?
+                    !tof_ok ?
                         LASER_CONTROLLER_FAULT_TOF_INVALID :
                         LASER_CONTROLLER_FAULT_SERVICE_OVERRIDE_REJECTED,
                     "one or more deployment peripherals failed readback verification");
             }
             break;
+        }
         case LASER_CONTROLLER_DEPLOYMENT_STEP_RAIL_SEQUENCE:
             if (!context->deployment_step_action_performed) {
                 context->deployment_substep =
@@ -2614,26 +2657,29 @@ static void laser_controller_apply_button_board_policy(
             rgb.enabled = true;
         } else if (context->deployment.active && context->deployment.running) {
             /*
-             * Checklist running — alternate between blue and green every
-             * 500 ms so the operator sees a distinctive "working on it"
-             * indication that is NOT the same as the solid-blue
-             * "ready, waiting for trigger" state. User directive
-             * 2026-04-16. `blink=false` here because `blink` in the
-             * RGB policy means "on/off pulse on a single color"; we
-             * are instead swapping between two solid colors, which is
-             * rendered as a solid color of whichever color is active
-             * this tick.
+             * 2026-04-17 (field report): checklist-running used to
+             * alternate blue↔green every 500 ms by swapping rgb.r/g/b
+             * on every control-task tick. That approach had two
+             * problems:
+             *   - It depended on the 5 ms control tick actually
+             *     re-applying the LED state on the exact tick
+             *     boundary. Under WS-drop load the apply path skipped
+             *     ticks and the LED looked "stuck" on one color
+             *     (operator reported solid-blue-while-running).
+             *   - Blue↔green is a harsh flash that reads as a fault
+             *     warning rather than "working on it".
+             *
+             * Now: solid blue + HARDWARE BLINK. The TLC59116 driver
+             * handles the 0.5 s on / 0.5 s off cadence natively
+             * (GRPPWM + blink mode), so the LED keeps pulsing even if
+             * the control task falls behind. Visually this reads as
+             * "same color as ready, but busy" — a clean distinction
+             * from solid-blue "ready to fire".
              */
-            if (((now_ms / 500U) & 1U) == 0U) {
-                rgb.r = 0U;
-                rgb.g = 0U;
-                rgb.b = 255U;
-            } else {
-                rgb.r = 0U;
-                rgb.g = 255U;
-                rgb.b = 0U;
-            }
-            rgb.blink = false;
+            rgb.r = 0U;
+            rgb.g = 0U;
+            rgb.b = 255U;
+            rgb.blink = true;
             rgb.enabled = true;
         } else if (!deployment_ready_idle) {
             /* Pre-deployment / pre-ready: LED dark. */
@@ -2743,6 +2789,48 @@ static void laser_controller_apply_button_board_policy(
                     (int)context->fault_latched,
                     (int)context->deployment.failed);
             }
+
+            /*
+             * Headless START-OF-DEPLOYMENT (2026-04-17 user feature).
+             * Fires at 1 s when no host GUI is connected, no fault, no
+             * deployment, no service mode — i.e. the operator wants to
+             * arm the device from nothing but the peripheral buttons.
+             * Distinct from the 2 s recovery path: this one does NOT
+             * touch the fault latch and does NOT require `fault_latched`
+             * — it assumes the device is idle and ready to deploy.
+             *
+             * "No GUI connected" = zero WS clients AND no USB comms
+             * activity in the last 3 s. A USB cable that only delivers
+             * power (headless bench cable, wall-wart-to-USB-C) is fine;
+             * an actively-commanding USB host will update
+             * `last_host_activity_ms` and suppress this trigger.
+             */
+            const bool host_inactive =
+                !laser_controller_wireless_has_clients() &&
+                (context->last_host_activity_ms == 0U ||
+                 (now_ms - context->last_host_activity_ms) >= 3000U);
+            const bool deploy_idle =
+                !context->deployment.active &&
+                !context->fault_latched &&
+                !context->deployment.failed &&
+                context->boot_complete &&
+                context->state_machine.current !=
+                    LASER_CONTROLLER_STATE_BOOT_INIT &&
+                context->state_machine.current !=
+                    LASER_CONTROLLER_STATE_SERVICE_MODE &&
+                !service_mode_active_now;
+            if (!context->button_deploy_armed &&
+                deploy_idle &&
+                host_inactive &&
+                held_ms >= 1000U) {
+                context->button_deploy_armed = true;
+                context->button_deploy_requested = true;
+                laser_controller_logger_log(
+                    now_ms,
+                    "deploy",
+                    "headless deploy: side1+side2 hold crossed 1 s "
+                    "with no GUI; queuing enter + checklist");
+            }
         }
     } else {
         if (context->both_side_held_since_ms != 0U) {
@@ -2753,6 +2841,7 @@ static void laser_controller_apply_button_board_policy(
         }
         context->both_side_held_since_ms = 0U;
         context->button_recovery_armed = false;
+        context->button_deploy_armed = false;
         context->button_recovery_last_whole_sec = 0U;
     }
 
@@ -3527,6 +3616,46 @@ static void laser_controller_run_fast_cycle(laser_controller_context_t *context)
                 "headless recovery: checklist restarted");
         }
     }
+
+    /*
+     * Headless button-driven start-of-deployment (2026-04-17 user
+     * feature). Distinct from the fault-recovery path above: no fault
+     * latch to clear, just enter deployment and run the checklist.
+     * Raised by `apply_button_board_policy` at the 1 s mark of a
+     * side1+side2 hold when no host GUI is connected and the device is
+     * idle.
+     */
+    if (context->button_deploy_requested) {
+        context->button_deploy_requested = false;
+
+        if (!context->deployment.active) {
+            const esp_err_t enter_rc =
+                laser_controller_app_enter_deployment_mode();
+            if (enter_rc != ESP_OK) {
+                laser_controller_logger_logf(
+                    now_ms,
+                    "deploy",
+                    "headless deploy: enter_deployment rejected (%d)",
+                    (int)enter_rc);
+                return;
+            }
+        }
+
+        const esp_err_t run_rc =
+            laser_controller_app_run_deployment_sequence();
+        if (run_rc != ESP_OK) {
+            laser_controller_logger_logf(
+                now_ms,
+                "deploy",
+                "headless deploy: run_deployment rejected (%d)",
+                (int)run_rc);
+        } else {
+            laser_controller_logger_log(
+                now_ms,
+                "deploy",
+                "headless deploy: checklist started via 1 s button hold");
+        }
+    }
 }
 
 static void laser_controller_run_slow_cycle(laser_controller_context_t *context)
@@ -4001,6 +4130,20 @@ esp_err_t laser_controller_app_enter_deployment_mode(void)
 
     if (s_context.deployment.running ||
         laser_controller_fault_latch_active(&s_context)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /*
+     * 2026-04-17 (audit round 2, S2): idempotent reject. The previous
+     * contract silently re-wrote deployment fields (zero'd sequence_id,
+     * reset target to default) whenever deployment.active was already
+     * true. A second client hitting `deployment.enter` between the
+     * first client's checklist pauses would therefore replace the
+     * first client's target behind its back. Reject here so the
+     * caller sees a clear error and the first client's state is
+     * preserved.
+     */
+    if (s_context.deployment.active) {
         return ESP_ERR_INVALID_STATE;
     }
 

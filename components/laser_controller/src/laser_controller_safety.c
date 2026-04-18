@@ -91,6 +91,24 @@ static bool laser_controller_distance_blocked(
     const laser_controller_distance_m_t max_clear =
         config->thresholds.tof_max_range_m - config->thresholds.tof_hysteresis_m;
 
+    /*
+     * Low-bound-only mode (user directive 2026-04-17): fire only when
+     * an object is closer than the minimum. Ignore max, ignore
+     * stale/invalid (those checks are also gated at the caller). In
+     * this mode a missing reading yields distance=0 which would wrongly
+     * trip — treat absent data (not fresh OR not valid) as "no near
+     * object" and return false.
+     */
+    if (config->thresholds.interlocks.tof_low_bound_only) {
+        if (hw == NULL || !hw->tof_data_valid || !hw->tof_data_fresh) {
+            return false;
+        }
+        if (snapshot->last_distance_blocked) {
+            return distance < min_clear;
+        }
+        return distance < min_trip;
+    }
+
     if (snapshot->last_distance_blocked) {
         return distance < min_clear || distance > max_clear;
     }
@@ -274,7 +292,22 @@ void laser_controller_safety_evaluate(
             "brownout observed");
     }
 
+    /*
+     * Per-interlock enable mask (2026-04-17 user directive). The master
+     * disable (`interlocks_disabled`) still short-circuits every check;
+     * these flags operate one layer below it. Safety-critical: default
+     * every `enabled` to true in `laser_controller_config_load_defaults`
+     * so a blank config keeps the legacy always-on behavior.
+     *
+     * ToF low-bound-only subsumes tof_invalid / tof_stale — when the
+     * mode is on, missing or stale data is explicitly NOT a fault.
+     */
+    const laser_controller_interlock_enable_t *interlocks =
+        &config->thresholds.interlocks;
+    const bool tof_low_only = interlocks->tof_low_bound_only;
+
     if (!interlocks_disabled &&
+        interlocks->imu_invalid_enabled &&
         !snapshot->allow_missing_imu &&
         !hw->imu_data_valid) {
         laser_controller_set_fault(
@@ -285,6 +318,7 @@ void laser_controller_safety_evaluate(
     }
 
     if (!interlocks_disabled &&
+        interlocks->imu_stale_enabled &&
         !snapshot->allow_missing_imu &&
         !hw->imu_data_fresh) {
         laser_controller_set_fault(
@@ -295,6 +329,8 @@ void laser_controller_safety_evaluate(
     }
 
     if (!interlocks_disabled &&
+        !tof_low_only &&
+        interlocks->tof_invalid_enabled &&
         !snapshot->allow_missing_tof &&
         !hw->tof_data_valid) {
         laser_controller_set_fault(
@@ -305,6 +341,8 @@ void laser_controller_safety_evaluate(
     }
 
     if (!interlocks_disabled &&
+        !tof_low_only &&
+        interlocks->tof_stale_enabled &&
         !snapshot->allow_missing_tof &&
         !hw->tof_data_fresh) {
         laser_controller_set_fault(
@@ -316,7 +354,7 @@ void laser_controller_safety_evaluate(
 
     if (!interlocks_disabled) {
         decision->horizon_blocked =
-            snapshot->allow_missing_imu ? false :
+            (!interlocks->horizon_enabled || snapshot->allow_missing_imu) ? false :
             laser_controller_horizon_blocked(config, snapshot);
         if (decision->horizon_blocked) {
             laser_controller_set_fault(
@@ -327,7 +365,7 @@ void laser_controller_safety_evaluate(
         }
 
         decision->distance_blocked =
-            snapshot->allow_missing_tof ? false :
+            (!interlocks->distance_enabled || snapshot->allow_missing_tof) ? false :
             laser_controller_distance_blocked(config, snapshot);
         if (decision->distance_blocked) {
             laser_controller_set_fault(
@@ -338,10 +376,14 @@ void laser_controller_safety_evaluate(
         }
 
         if (laser_controller_thermal_supervision_active(config, snapshot)) {
-            decision->lambda_drift_blocked =
-                laser_controller_lambda_drift_blocked(config, snapshot);
-            decision->tec_temp_adc_blocked =
-                laser_controller_tec_temp_adc_blocked(config, snapshot);
+            if (interlocks->lambda_drift_enabled) {
+                decision->lambda_drift_blocked =
+                    laser_controller_lambda_drift_blocked(config, snapshot);
+            }
+            if (interlocks->tec_temp_adc_enabled) {
+                decision->tec_temp_adc_blocked =
+                    laser_controller_tec_temp_adc_blocked(config, snapshot);
+            }
         }
     }
 
@@ -386,7 +428,8 @@ void laser_controller_safety_evaluate(
         (snapshot->ld_rail_pgood_for_ms >= LASER_CONTROLLER_LD_TEMP_SETTLE_MS) &&
         (snapshot->sbdn_not_off_for_ms  >= LASER_CONTROLLER_LD_TEMP_SETTLE_MS);
 
-    if (hw->ld_rail_pgood &&
+    if (interlocks->ld_overtemp_enabled &&
+        hw->ld_rail_pgood &&
         ld_temp_gate_open &&
         hw->laser_driver_temp_c > config->thresholds.ld_overtemp_limit_c) {
         laser_controller_set_fault(
@@ -430,6 +473,7 @@ void laser_controller_safety_evaluate(
      * and unchanged.
      */
     if (!interlocks_disabled &&
+        interlocks->ld_loop_bad_enabled &&
         hw->ld_rail_pgood &&
         snapshot->driver_operate_expected &&
         !hw->driver_loop_good) {

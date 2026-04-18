@@ -101,6 +101,24 @@ void laser_controller_config_load_defaults(laser_controller_config_t *config)
      */
     config->thresholds.lio_voltage_offset_v = 0.07f;
 
+    /*
+     * Per-interlock enable mask — every flag defaults to true so this
+     * matches the legacy always-on behavior. See `laser_controller_config.h`
+     * for the safety rationale; `interlocks_disabled` (bringup/service)
+     * remains the master override and short-circuits all of these.
+     */
+    config->thresholds.interlocks.horizon_enabled     = true;
+    config->thresholds.interlocks.distance_enabled    = true;
+    config->thresholds.interlocks.lambda_drift_enabled = true;
+    config->thresholds.interlocks.tec_temp_adc_enabled = true;
+    config->thresholds.interlocks.imu_invalid_enabled  = true;
+    config->thresholds.interlocks.imu_stale_enabled    = true;
+    config->thresholds.interlocks.tof_invalid_enabled  = true;
+    config->thresholds.interlocks.tof_stale_enabled    = true;
+    config->thresholds.interlocks.ld_overtemp_enabled  = true;
+    config->thresholds.interlocks.ld_loop_bad_enabled  = true;
+    config->thresholds.interlocks.tof_low_bound_only   = false;
+
     config->timeouts.imu_stale_ms = 50U;
     config->timeouts.tof_stale_ms = 100U;
     config->timeouts.pd_recheck_ms = 250U;
@@ -214,6 +232,45 @@ bool laser_controller_config_validate_runtime_safety(
         config->thresholds.max_laser_current_a <= 0.0f ||
         config->thresholds.off_current_threshold_a < 0.0f ||
         config->thresholds.current_match_tolerance_a < 0.0f) {
+        return false;
+    }
+
+    /*
+     * 2026-04-17 (audit round 3, S1 safety): clamp the runtime safety
+     * policy to the hardware ceiling. Before this check, the firmware
+     * accepted `max_laser_current_a = 99.99` silently — `bench.c:115
+     * laser_controller_bench_max_current_allowed` then fell back to
+     * `LASER_CONTROLLER_BENCH_MAX_CURRENT_A` at the emission site, so
+     * the effective operational cap stayed correct, BUT the STORED
+     * policy read back by `get_status` showed 99.99. An operator
+     * auditing settings would see 99.99 and believe the safety cap
+     * was effectively disabled. Reject here so the stored value
+     * always matches what is actually enforced.
+     *
+     * Hard upper bound is defined in `bench.c` as
+     * `LASER_CONTROLLER_BENCH_MAX_CURRENT_A` (5.2 A). Mirror it here
+     * (can't include bench.c privates from config.c without a new
+     * public header; the number is the same physical hardware limit).
+     */
+    if (config->thresholds.max_laser_current_a > 5.2f) {
+        return false;
+    }
+
+    /*
+     * Sanity bounds on the other thresholds that were previously
+     * unbounded. These are set generously so every reasonable
+     * calibration passes, but a fat-fingered entry like "155" for
+     * ld_overtemp_limit_c no longer silently succeeds.
+     */
+    if (config->thresholds.ld_overtemp_limit_c < 20.0f ||
+        config->thresholds.ld_overtemp_limit_c > 120.0f) {
+        return false;
+    }
+    if (config->thresholds.tec_temp_adc_trip_v > 3.3f) {
+        return false;
+    }
+    if (config->thresholds.tof_max_range_m > 10.0f ||
+        config->thresholds.tof_min_range_m > 5.0f) {
         return false;
     }
 
