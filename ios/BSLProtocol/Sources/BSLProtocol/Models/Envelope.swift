@@ -67,8 +67,11 @@ public enum InboundFrame: Sendable {
     /// live_telemetry payload. The session layer uses this to overlay only
     /// those sub-blocks and leave the rest of the snapshot untouched.
     /// Without this set, absent blocks decode to defaults and would silently
-    /// clobber live state.
-    case liveTelemetry(snapshot: DeviceSnapshot, presentKeys: Set<String>)
+    /// clobber live state. `rawPayload` carries the unmodified JSON so the
+    /// merger can do per-field overlays inside each sub-block (critical for
+    /// blocks like `tec` where an absent field would otherwise default to 0
+    /// and clobber the previous value).
+    case liveTelemetry(snapshot: DeviceSnapshot, presentKeys: Set<String>, rawPayload: Data)
     case commandResponse(ResponseEnvelope)
     case other(event: String?)
     case decodeError(String)
@@ -107,7 +110,7 @@ public enum FrameParser {
                     if event == "status_snapshot" {
                         return .statusSnapshot(snapshot)
                     }
-                    return .liveTelemetry(snapshot: snapshot, presentKeys: Set(payload.keys))
+                    return .liveTelemetry(snapshot: snapshot, presentKeys: Set(payload.keys), rawPayload: payloadData)
                 }
                 // If the envelope embedded the payload at the top level
                 // (some firmware paths do this for the initial snapshot),
@@ -116,7 +119,7 @@ public enum FrameParser {
                     if event == "status_snapshot" {
                         return .statusSnapshot(snapshot)
                     }
-                    return .liveTelemetry(snapshot: snapshot, presentKeys: Set(json.keys))
+                    return .liveTelemetry(snapshot: snapshot, presentKeys: Set(json.keys), rawPayload: data)
                 }
                 return .decodeError("could not decode \(event ?? "?") payload")
             }

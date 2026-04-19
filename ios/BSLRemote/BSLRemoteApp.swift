@@ -31,7 +31,11 @@ struct RootView: View {
     @Environment(DeviceSession.self) private var session
 
     var body: some View {
-        if case .connected = session.connection {
+        // Stay on MainView once we've ever successfully connected. Transient
+        // drops (Wi-Fi glitch, foreground/background) are shown as an inline
+        // reconnect banner inside MainView — bouncing back to ConnectView
+        // would lose setpoints, the wavelength sheet, and the user's place.
+        if session.hasEverConnected {
             MainView()
         } else {
             ConnectView()

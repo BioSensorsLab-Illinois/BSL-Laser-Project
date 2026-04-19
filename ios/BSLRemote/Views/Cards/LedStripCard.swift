@@ -1,66 +1,54 @@
 import SwiftUI
 import BSLProtocol
 
-/// Compact visible-LED strip. Tap the bulb icon to toggle on/off; slider
-/// adjusts duty cycle. Mirrors
-/// `bsl-laser-system/project/BSL Laser Controller.html:830-853`.
+/// Compact visible-LED strip. Tap the bulb to toggle on/off; slider adjusts
+/// duty cycle. Mirrors `bsl-laser-system/project/BSL Laser Controller.html:830-853`.
 ///
 /// Wire protocol: `operate.set_led { enable, duty_cycle_pct }`. Firmware
-/// clamps to `safety.maxTofLedDutyCyclePct` and rejects when deployment
-/// is not active.
+/// clamps to `safety.maxTofLedDutyCyclePct` and rejects when deployment is
+/// not active.
+///
+/// Interaction rules:
+///   - While the user is dragging, telemetry does NOT override `localValue`
+///     (prevents the slider from "snapping back" mid-gesture).
+///   - `commit()` only fires on drag end. The firmware confirms via a new
+///     `bench.requestedLedDutyCyclePct` value which then re-syncs.
+///   - Toggle respects `lastNonZero` so tapping off-then-on returns to the
+///     previous brightness.
 struct LedStripCard: View {
     @Environment(DeviceSession.self) private var session
     @Environment(\.bslTheme) private var t
 
-    @State private var lastNonZero: Int = 50
-    @State private var pendingCommit: Bool = false
     @State private var localValue: Double = 0
+    @State private var isDragging: Bool = false
+    @State private var awaitingAck: Bool = false
+    @State private var lastNonZero: Int = 50
 
     private var bench: BenchControlStatus { session.snapshot.bench }
-    private var cap: Int { session.snapshot.safety.maxTofLedDutyCyclePct }
+    private var cap: Int { max(session.snapshot.safety.maxTofLedDutyCyclePct, 1) }
     private var requested: Int { bench.requestedLedDutyCyclePct }
     private var blocked: Bool { bench.hostControlReadiness.ledBlockedReason != .none }
+    private var stale: Bool { session.isStale }
+
+    private var isOn: Bool {
+        // Treat either the enable flag or a non-zero duty as "on" — firmware
+        // conventions vary during state transitions.
+        bench.requestedLedEnabled || requested > 0
+    }
 
     var body: some View {
         BSLCard(pad: 14) {
             HStack(spacing: 12) {
-                Button(action: toggle) {
-                    Image(systemName: requested > 0 ? "lightbulb.fill" : "lightbulb")
-                        .font(.system(size: 18, weight: .medium))
-                        .foregroundStyle(requested > 0 ? Color.white : Color.blue)
-                        .frame(width: 36, height: 36)
-                        .background(
-                            RoundedRectangle(cornerRadius: 10)
-                                .fill(requested > 0 ? Color.blue : (t.dark ? Color.blue.opacity(0.15) : Color(red: 0.933, green: 0.945, blue: 0.976)))
-                        )
-                        .shadow(color: requested > 0 ? Color.blue.opacity(0.35) : .clear, radius: 4, x: 0, y: 2)
-                }
-                .buttonStyle(.plain)
-                .disabled(blocked)
-                .accessibilityLabel(requested > 0 ? "Turn LED off" : "Turn LED on")
-
+                toggleButton
                 VStack(spacing: 4) {
-                    HStack {
-                        Text("VISIBLE LED")
-                            .font(.system(size: 11, weight: .heavy))
-                            .tracking(1)
-                            .foregroundStyle(t.muted)
-                        Spacer()
-                        HStack(alignment: .firstTextBaseline, spacing: 1) {
-                            Text(session.isStale ? "—" : "\(requested)")
-                                .font(.system(size: 14, weight: .bold).monospacedDigit())
-                                .foregroundStyle(t.ink)
-                            Text("%")
-                                .font(.system(size: 11, weight: .medium))
-                                .foregroundStyle(t.muted)
-                        }
-                    }
+                    headerRow
                     Slider(
                         value: $localValue,
-                        in: 0...Double(max(cap, 1)),
+                        in: 0...Double(cap),
                         step: 1,
                         onEditingChanged: { editing in
-                            if !editing { commit() }
+                            isDragging = editing
+                            if !editing { commit(dutyPct: Int(localValue.rounded())) }
                         }
                     )
                     .tint(Color.blue)
@@ -70,31 +58,66 @@ struct LedStripCard: View {
         }
         .onAppear { localValue = Double(requested) }
         .onChange(of: requested) { _, new in
-            if !pendingCommit { localValue = Double(new) }
+            // Only accept telemetry updates while the user isn't actively
+            // dragging. Otherwise the slider thumb fights the gesture.
+            if !isDragging && !awaitingAck {
+                localValue = Double(new)
+            }
             if new > 0 { lastNonZero = new }
         }
     }
 
-    private func toggle() {
-        let newValue = requested > 0 ? 0 : max(lastNonZero, 10)
-        Task {
-            pendingCommit = true
-            defer { pendingCommit = false }
-            _ = await session.sendCommand(
-                "operate.set_led",
-                args: [
-                    "enable": .bool(newValue > 0),
-                    "duty_cycle_pct": .int(min(newValue, cap)),
-                ]
-            )
+    private var toggleButton: some View {
+        Button(action: toggle) {
+            Image(systemName: isOn ? "lightbulb.fill" : "lightbulb")
+                .font(.system(size: 18, weight: .medium))
+                .foregroundStyle(isOn ? Color.white : Color.blue)
+                .frame(width: 36, height: 36)
+                .background(
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(isOn ? Color.blue : (t.dark ? Color.blue.opacity(0.15) : Color(red: 0.933, green: 0.945, blue: 0.976)))
+                )
+                .shadow(color: isOn ? Color.blue.opacity(0.35) : .clear, radius: 4, x: 0, y: 2)
+        }
+        .buttonStyle(.plain)
+        .disabled(blocked || awaitingAck)
+        .accessibilityLabel(isOn ? "Turn LED off" : "Turn LED on")
+    }
+
+    private var headerRow: some View {
+        HStack {
+            Text("VISIBLE LED")
+                .font(.system(size: 11, weight: .heavy))
+                .tracking(1)
+                .foregroundStyle(t.muted)
+            Spacer()
+            HStack(alignment: .firstTextBaseline, spacing: 1) {
+                Text(stale ? "—" : "\(Int(localValue.rounded()))")
+                    .font(.system(size: 14, weight: .bold).monospacedDigit())
+                    .foregroundStyle(t.ink)
+                Text("%")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(t.muted)
+            }
         }
     }
 
-    private func commit() {
-        let clamped = min(max(Int(localValue.rounded()), 0), cap)
+    private func toggle() {
+        let turnOn = !isOn
+        let duty = turnOn ? min(max(lastNonZero, 10), cap) : 0
+        localValue = Double(duty)
+        commit(dutyPct: duty)
+    }
+
+    private func commit(dutyPct: Int) {
+        let clamped = min(max(dutyPct, 0), cap)
+        // Predictively pin localValue while the firmware ack is in flight so
+        // it doesn't visibly snap to a stale telemetry value during the
+        // 1-RTT window.
+        awaitingAck = true
+        localValue = Double(clamped)
         Task {
-            pendingCommit = true
-            defer { pendingCommit = false }
+            defer { awaitingAck = false }
             _ = await session.sendCommand(
                 "operate.set_led",
                 args: [
@@ -102,6 +125,9 @@ struct LedStripCard: View {
                     "duty_cycle_pct": .int(clamped),
                 ]
             )
+            // Small settle so the next telemetry frame's `requested` value
+            // matches what we just sent. Prevents an end-of-drag snap.
+            try? await Task.sleep(nanoseconds: 300_000_000)
         }
     }
 }

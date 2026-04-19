@@ -17,7 +17,7 @@ struct TriggerStrip: View {
                 if mode == .armed {
                     RoundedRectangle(cornerRadius: 6)
                         .stroke(style: StrokeStyle(lineWidth: 1, dash: [2, 2]))
-                        .foregroundStyle(BSL.orange)
+                        .foregroundStyle(BSL.ok)
                         .frame(width: 22, height: 22)
                 }
                 // lightning-bolt-like glyph from the HTML
@@ -45,15 +45,15 @@ struct TriggerStrip: View {
 
     private var iconBg: Color {
         switch mode {
-        case .lasing: return BSL.orange
-        case .armed:  return BSL.orange.opacity(0.12)
+        case .lasing: return BSL.warn
+        case .armed:  return BSL.ok.opacity(0.12)
         case .disarmed: return t.dark ? Color.white.opacity(0.06) : Color(red: 0.945, green: 0.952, blue: 0.972)
         }
     }
     private var iconColor: Color {
         switch mode {
         case .lasing:   return .white
-        case .armed:    return BSL.orange
+        case .armed:    return BSL.ok
         case .disarmed: return t.dim
         }
     }
@@ -73,7 +73,7 @@ struct TriggerStrip: View {
     }
     private var pillTone: BSLPill<Text>.Tone {
         switch mode {
-        case .lasing:   return .brand
+        case .lasing:   return .warn
         case .armed:    return .ok
         case .disarmed: return .neutral
         }

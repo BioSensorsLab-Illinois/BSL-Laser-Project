@@ -25,7 +25,14 @@ struct NirHeroCard: View {
     private var mode: LaserMode { snap.laserMode }
     private var maxA: Double { snap.nirMaxA }
     private var setA: Double { snap.nirSetpointA }
-    private var actualA: Double { snap.nirActualA }
+    /// Actual measured current. Values below 5 % of the ceiling are rounded
+    /// to 0 to suppress floor-level ADC noise in the display (cosmetic only —
+    /// the raw `measuredCurrentA` is still what `laserMode` checks against
+    /// `safety.offCurrentThresholdA` for the armed/lasing classification).
+    private var actualA: Double {
+        let raw = snap.nirActualA
+        return raw < 0.05 * maxA ? 0 : raw
+    }
     private var blockedReason: NirBlockedReason { snap.bench.hostControlReadiness.nirBlockedReason }
     private var stale: Bool { session.isStale }
 
@@ -92,8 +99,8 @@ struct NirHeroCard: View {
     @ViewBuilder private var statePill: some View {
         switch mode {
         case .lasing:
-            BSLPill(.brand) {
-                LiveDot(color: BSL.orange, size: 6)
+            BSLPill(.warn) {
+                LiveDot(color: BSL.warn, size: 6)
                 Text("LASING")
             }
         case .armed:
@@ -104,12 +111,13 @@ struct NirHeroCard: View {
     }
 
     @ViewBuilder private var gauge: some View {
+        let displayedA = actualA < 0.05 * maxA ? 0.0 : actualA
         ArcGauge(
-            value: stale ? 0 : actualA,
+            value: stale ? 0 : displayedA,
             maxValue: maxA,
             size: 160,
             stroke: 12,
-            color: mode == .lasing ? BSL.orange : t.muted,
+            color: mode == .lasing ? BSL.warn : t.muted,
             setpoint: (mode != .lasing && setA > 0) ? setA : nil,
             setpointColor: BSL.orange,
             breathing: mode == .armed && setA > 0
@@ -119,7 +127,7 @@ struct NirHeroCard: View {
                     .font(.system(size: 10, weight: .semibold))
                     .tracking(1)
                     .foregroundStyle(t.muted)
-                let pct = maxA > 0 ? Int((actualA / maxA * 100).rounded()) : 0
+                let pct = maxA > 0 ? Int((displayedA / maxA * 100).rounded()) : 0
                 HStack(alignment: .firstTextBaseline, spacing: 2) {
                     Text(stale ? "—" : "\(pct)")
                         .font(.system(size: 28, weight: .bold).monospacedDigit())

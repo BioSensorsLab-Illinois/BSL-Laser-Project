@@ -96,19 +96,23 @@ struct DeployBar: View {
     }
 
     private var armedStatus: some View {
-        HStack(spacing: 10) {
-            LiveDot(color: BSL.orange, size: 8)
+        let tint = mode == .lasing ? BSL.warn : BSL.ok
+        let softBg = mode == .lasing
+            ? (t.dark ? BSL.warn.opacity(0.10) : BSL.warnSoft)
+            : (t.dark ? BSL.ok.opacity(0.10)   : BSL.okSoft)
+        return HStack(spacing: 10) {
+            LiveDot(color: tint, size: 8)
             Text(mode == .lasing ? "LASING" : "ARMED")
                 .font(.system(size: 15, weight: .heavy))
                 .tracking(2)
         }
         .frame(maxWidth: .infinity)
         .frame(height: 56)
-        .foregroundStyle(BSL.orange)
-        .background(t.dark ? BSL.orange.opacity(0.10) : BSL.orangeSoft)
+        .foregroundStyle(tint)
+        .background(softBg)
         .overlay(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .strokeBorder(BSL.orange, lineWidth: 1.5)
+                .strokeBorder(tint, lineWidth: 1.5)
         )
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
     }
@@ -170,10 +174,25 @@ struct DeployBar: View {
             }
     }
 
+    /// Hold-to-arm = enter deployment mode + start the deployment checklist.
+    /// The firmware runs the checklist asynchronously; when the controller
+    /// lands in ready-idle (`deployment.active && deployment.ready &&
+    /// deployment.readyIdle`), the mode recomputes to `.armed` and the bar
+    /// redraws automatically. If deployment drops out of ready (mode reverts
+    /// to `.disarmed`), the HOLD TO ARM button reappears by the same path.
+    /// The app cannot enable emission — that requires the physical main
+    /// button per the firmware contract.
     private func sendArm() async {
         sending = true
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-        _ = await session.sendCommand("deployment.enter")
+        let enterResult = await session.sendCommand("deployment.enter")
+        if case .success(let resp) = enterResult, !resp.ok {
+            // Firmware already reported the reason via lastFirmwareError;
+            // don't try to run the checklist.
+            sending = false
+            return
+        }
+        _ = await session.sendCommand("deployment.run")
         sending = false
     }
 

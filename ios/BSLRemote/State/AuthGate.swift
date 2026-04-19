@@ -29,10 +29,10 @@ final class AuthGate {
     /// Per-build salt. Replace in custom builds.
     private let salt = "BSL-iOS-build-2026-04-18"
 
-    /// SHA-256 hex of the shipping PIN ("4520") concatenated with the salt.
-    /// Compute: printf '%s' "4520BSL-iOS-build-2026-04-18" | shasum -a 256
+    /// SHA-256 hex of the shipping PIN ("2012") concatenated with the salt.
+    /// Compute: printf '%s' "2012BSL-iOS-build-2026-04-18" | shasum -a 256
     private let expectedHashHex =
-        "b2f277ac0a5fbaebdaf2dd35febb6f8a97722b51d55146b143261441acab8334"
+        "6a46ec00262157256d1812d022bca65871ff01a247507685f86966029a680336"
 
     func tryUnlock(candidate: String) -> Bool {
         let combined = candidate + salt

@@ -77,7 +77,7 @@ struct StatusHeader: View {
         if hasCaution { return BSL.caution }
         if !connected { return t.dim }
         switch mode {
-        case .lasing:   return BSL.orange
+        case .lasing:   return BSL.warn
         case .armed:    return BSL.ok
         case .disarmed: return t.muted
         }

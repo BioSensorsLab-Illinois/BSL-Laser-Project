@@ -56,7 +56,9 @@ struct MainView: View {
                         if snap.bench.usbDebugMock.active {
                             UsbMockBanner(status: snap.bench.usbDebugMock)
                         }
-                        if session.isStale {
+                        if !session.isConnected {
+                            InlineNote(text: reconnectNote, tone: .caution)
+                        } else if session.isStale {
                             InlineNote(text: "Telemetry stale — reconnecting…", tone: .caution)
                         }
                         if let firmwareError = session.lastFirmwareError {
@@ -158,6 +160,15 @@ struct MainView: View {
             return "\(code) — service required"
         }
         return "Latched fault · service required"
+    }
+
+    private var reconnectNote: String {
+        switch session.connection {
+        case .connecting: return "Reconnecting to the controller…"
+        case .disconnected(let reason): return "Link lost — reconnecting (\(reason))"
+        case .failed(let reason): return "Link failed — retrying (\(reason))"
+        case .connected: return "Reconnecting…"
+        }
     }
 
     private var cautionDetail: String {

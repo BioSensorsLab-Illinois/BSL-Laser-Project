@@ -27,9 +27,6 @@ struct WavelengthEditorSheet: View {
     private var safety: SafetyStatus { session.snapshot.safety }
     private var t: BSLTheme { BSLTheme(scheme) }
 
-    // rough coupling between λ and TEC target (display-only estimate)
-    private var tecEstimate: Double { 25.0 + (lambda - 785.0) * 0.38 }
-
     var body: some View {
         BSLThemeProvider {
             VStack(spacing: 0) {
@@ -92,9 +89,14 @@ struct WavelengthEditorSheet: View {
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(BSL.nir)
             }
-            Text(String(format: "→ TEC target ≈ %.2f °C", tecEstimate))
-                .font(.system(size: 11).monospacedDigit())
+            // Do NOT show a client-side λ→°C estimate. The real coupling lives
+            // in the firmware's wavelength LUT; showing an incorrect formula
+            // would mislead operators. Firmware publishes `tec.targetTempC`
+            // after the lambda is staged — surface that in the live block.
+            Text("TEC target set by firmware after apply (from the wavelength LUT)")
+                .font(.system(size: 11))
                 .foregroundStyle(t.muted)
+                .multilineTextAlignment(.center)
         }
         .frame(maxWidth: .infinity)
         .padding(22)
@@ -152,9 +154,10 @@ struct WavelengthEditorSheet: View {
 
     private var live: some View {
         VStack(spacing: 8) {
-            row("Actual", String(format: "%.2f nm", tec.actualLambdaNm))
-            row("Drift",  String(format: "%+.2f nm", safety.lambdaDriftNm))
+            row("Actual λ", String(format: "%.2f nm", tec.actualLambdaNm))
+            row("Drift",    String(format: "%+.2f nm", safety.lambdaDriftNm))
             row("Drift limit", String(format: "±%.2f nm", safety.lambdaDriftLimitNm))
+            row("TEC target (firmware)", String(format: "%.2f °C", tec.targetTempC))
             row("TEC actual",  String(format: "%.2f °C",  tec.tempC))
         }
         .padding(12)

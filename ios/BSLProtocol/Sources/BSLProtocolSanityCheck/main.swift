@@ -74,7 +74,7 @@ func checkLiveTelemetryEnvelope() {
     }}
     """
     switch FrameParser.parse(line: line) {
-    case .liveTelemetry(let snap, let present):
+    case .liveTelemetry(let snap, let present, _):
         Check.expect(snap.laser.nirEnabled, "live.laser.nirEnabled")
         Check.expect(abs(snap.laser.measuredCurrentA - 2.25) < 1e-6, "live.laser.measuredCurrentA")
         Check.expect(!snap.tec.tempGood, "live.tec.tempGood")
@@ -106,7 +106,7 @@ func checkResponseEnvelopeOkAndError() {
 func checkUnknownEnumTokens() {
     let line = #"{"type":"event","event":"live_telemetry","timestamp_ms":1,"payload":{"session":{"state":"NEW_STATE"},"bench":{"hostControlReadiness":{"nirBlockedReason":"new-token"}}}}"#
     switch FrameParser.parse(line: line) {
-    case .liveTelemetry(let snap, _):
+    case .liveTelemetry(let snap, _, _):
         Check.expect(snap.session.state == .unknown, "unknown session state → .unknown")
         Check.expect(snap.bench.hostControlReadiness.nirBlockedReason == .unknown, "unknown reason → .unknown")
     default:
@@ -183,7 +183,7 @@ func checkAdversarialFrames() {
     // 4. Event envelope with wrong-typed numeric fields — tempC as string.
     let wrongType = #"{"type":"event","event":"live_telemetry","timestamp_ms":1,"payload":{"tec":{"tempC":"not-a-number"}}}"#
     switch FrameParser.parse(line: wrongType) {
-    case .liveTelemetry(let snap, _):
+    case .liveTelemetry(let snap, _, _):
         // Firmware contract says tempC is Double; we keep the default rather
         // than crashing. Current SafetyStatus/TecStatus decoders use
         // decodeIfPresent(Double.self) which throws on a string — and our
@@ -223,7 +223,7 @@ func checkAdversarialFrames() {
     }
     big += "}}"
     switch FrameParser.parse(line: big) {
-    case .liveTelemetry(let snap, _):
+    case .liveTelemetry(let snap, _, _):
         Check.expect(abs(snap.tec.tempC - 99.9) < 1e-6, "oversize frame still extracts tec.tempC")
     default:
         Check.expect(false, "oversize frame should still decode the known fields")

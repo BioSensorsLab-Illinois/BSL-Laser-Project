@@ -38,6 +38,14 @@ final class DeviceSession: TransportObserver {
 
     private let transport = WebSocketTransport()
     private var connectedURL: URL?
+    private var userRequestedDisconnect: Bool = false
+    private var reconnectAttempt: Int = 0
+    private var reconnectTask: Task<Void, Never>? = nil
+
+    /// Has the app ever successfully seen a `.connected` state for this URL?
+    /// Views use this to decide "keep the dashboard visible during a reconnect
+    /// attempt" vs "drop back to ConnectView because we never got in".
+    private(set) var hasEverConnected: Bool = false
 
     init() {
         transport.attach(observer: self)
@@ -47,26 +55,66 @@ final class DeviceSession: TransportObserver {
     /// session is torn down.
     func connect(url: URL) {
         self.connectedURL = url
+        self.userRequestedDisconnect = false
+        self.reconnectAttempt = 0
         UserDefaults.standard.set(url.absoluteString, forKey: Self.lastWsUrlDefaultsKey)
         transport.connect(url: url)
     }
 
     func disconnect() {
+        self.userRequestedDisconnect = true
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        self.hasEverConnected = false
         transport.disconnect(reason: "user requested")
+    }
+
+    /// Schedule a reconnect attempt with exponential backoff after a
+    /// transient transport failure. Cancelled by an explicit `disconnect()`.
+    private func scheduleReconnect() {
+        guard !userRequestedDisconnect, let url = connectedURL else { return }
+        reconnectTask?.cancel()
+        let attempt = reconnectAttempt
+        reconnectAttempt += 1
+        let delayMs = min(8_000, 500 * (1 << min(attempt, 4)))   // 0.5, 1, 2, 4, 8 s ceiling
+        reconnectTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delayMs) * 1_000_000)
+            guard let self, !Task.isCancelled, !self.userRequestedDisconnect else { return }
+            self.transport.connect(url: url)
+        }
     }
 
     /// Sends a mutating command and awaits the controller's `resp`. Surfaces
     /// firmware error strings verbatim via `lastFirmwareError`.
+    ///
+    /// Transport-level transient errors (`sessionClosed`, `notConnected`) are
+    /// NOT surfaced to `lastFirmwareError` — those are reconnect-loop noise,
+    /// not firmware rejections. They still fall through as `.failure` so
+    /// call sites can decide whether to retry.
     func sendCommand(
         _ cmd: String,
         args: [String: CommandArg]? = nil
     ) async -> Result<ResponseEnvelope, Error> {
+        guard isConnected else {
+            return .failure(WebSocketTransport.SendError.notConnected)
+        }
         do {
             let resp = try await transport.send(command: cmd, args: args)
             if !resp.ok {
                 self.lastFirmwareError = resp.error ?? "Firmware rejected the command."
             }
             return .success(resp)
+        } catch let err as WebSocketTransport.SendError {
+            // Transport-close / not-connected errors are transient during a
+            // Wi-Fi glitch or app backgrounding. Suppress the banner; the
+            // connection UI already surfaces the disconnected state.
+            switch err {
+            case .sessionClosed, .notConnected:
+                break
+            case .encodeFailed(let r):
+                self.lastFirmwareError = "Transport encode failed: \(r)"
+            }
+            return .failure(err)
         } catch {
             self.lastFirmwareError = error.localizedDescription
             return .failure(error)
@@ -97,10 +145,18 @@ final class DeviceSession: TransportObserver {
                 self.connection = .connecting(url: url.absoluteString)
             case .connected(let url):
                 self.connection = .connected(url: url.absoluteString)
+                self.hasEverConnected = true
+                self.reconnectAttempt = 0
             case .disconnected(let reason):
                 self.connection = .disconnected(reason: reason)
+                if self.hasEverConnected, !self.userRequestedDisconnect {
+                    self.scheduleReconnect()
+                }
             case .failed(let reason):
                 self.connection = .failed(reason: reason)
+                if self.hasEverConnected, !self.userRequestedDisconnect {
+                    self.scheduleReconnect()
+                }
             }
         }
     }
@@ -117,8 +173,13 @@ final class DeviceSession: TransportObserver {
         case .statusSnapshot(let snap):
             self.snapshot = snap
             self.lastFrameAt = Date()
-        case .liveTelemetry(let incoming, let presentKeys):
-            self.snapshot = DeviceSnapshot.overlay(base: self.snapshot, patch: incoming, presentKeys: presentKeys)
+        case .liveTelemetry(let incoming, let presentKeys, let rawPayload):
+            self.snapshot = DeviceSnapshot.overlay(
+                base: self.snapshot,
+                patch: incoming,
+                presentKeys: presentKeys,
+                rawPayload: rawPayload
+            )
             self.lastFrameAt = Date()
         case .commandResponse:
             // Handled by the transport's in-flight continuation map.
