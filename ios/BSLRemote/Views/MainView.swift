@@ -14,6 +14,8 @@ import BSLProtocol
 struct MainView: View {
     @Environment(DeviceSession.self) private var session
     @Environment(AuthGate.self) private var auth
+    @Environment(AppearanceStore.self) private var appearance
+    @Environment(LayoutPreference.self) private var layout
 
     @State private var showingSettings: Bool = false
     @State private var showingWavelength: Bool = false
@@ -66,14 +68,14 @@ struct MainView: View {
                                 session.lastFirmwareError = nil
                             }
                         }
-
-                        NirHeroCard()
-                        LedStripCard()
-                        HStack(spacing: 10) {
-                            WavelengthMiniCard(onTap: { showingWavelength = true })
-                            TemperatureMiniCard()
+                        if let success = session.lastSuccessMessage {
+                            InlineNote(text: success, tone: .success) {
+                                session.lastSuccessMessage = nil
+                            }
+                            .transition(.opacity)
                         }
-                        PowerRailCard()
+
+                        layoutBody
                         Color.clear.frame(height: 110) // breathing room above sticky bar
                     }
                     .padding(.horizontal, 14)
@@ -114,6 +116,8 @@ struct MainView: View {
             SettingsView()
                 .environment(session)
                 .environment(auth)
+                .environment(appearance)
+                .environment(layout)
         }
         .sheet(isPresented: $showingWavelength) {
             WavelengthEditorSheet()
@@ -131,6 +135,20 @@ struct MainView: View {
                 .environment(session)
                 .environment(auth)
                 .presentationDetents([.medium, .large])
+        }
+    }
+
+    /// Routes to one of the five main-page layouts based on `LayoutPreference`.
+    /// Default (and V1 shipping layout) is the Clinical Dashboard. All five
+    /// share the surrounding StatusHeader, FaultBanner, inline notes, and
+    /// sticky DeployBar — only the card-stack region switches.
+    @ViewBuilder private var layoutBody: some View {
+        switch layout.variation {
+        case 2: LayoutV2MissionControl(onOpenWavelength: { showingWavelength = true })
+        case 3: LayoutV3InstrumentGrid(onOpenWavelength: { showingWavelength = true })
+        case 4: LayoutV4UnifiedCard(onOpenWavelength: { showingWavelength = true })
+        case 5: LayoutV5BauhausGrid(onOpenWavelength: { showingWavelength = true })
+        default: LayoutV1Dashboard(onOpenWavelength: { showingWavelength = true })
         }
     }
 
@@ -217,10 +235,10 @@ private struct MasterWarningSheet: View {
     }
 }
 
-/// Compact inline note. Keeps stale/firmware-error banners readable in the
-/// new scroll region.
+/// Compact inline note. Keeps stale / firmware-error / success banners
+/// readable in the new scroll region.
 private struct InlineNote: View {
-    enum Tone { case caution, warn }
+    enum Tone { case caution, warn, success }
     let text: String
     let tone: Tone
     var onDismiss: (() -> Void)? = nil
@@ -229,8 +247,8 @@ private struct InlineNote: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            Image(systemName: tone == .warn ? "exclamationmark.triangle.fill" : "clock.arrow.circlepath")
-                .foregroundStyle(tone == .warn ? BSL.warn : BSL.caution)
+            Image(systemName: icon)
+                .foregroundStyle(iconColor)
             Text(text)
                 .font(.system(size: 12))
                 .foregroundStyle(t.ink)
@@ -247,8 +265,30 @@ private struct InlineNote: View {
             }
         }
         .padding(10)
-        .background((tone == .warn ? BSL.warnSoft : BSL.cautionSoft).opacity(t.dark ? 0.25 : 1.0))
+        .background(bg.opacity(t.dark ? 0.25 : 1.0))
         .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+
+    private var icon: String {
+        switch tone {
+        case .warn:    return "exclamationmark.triangle.fill"
+        case .caution: return "clock.arrow.circlepath"
+        case .success: return "checkmark.circle.fill"
+        }
+    }
+    private var iconColor: Color {
+        switch tone {
+        case .warn:    return BSL.warn
+        case .caution: return BSL.caution
+        case .success: return BSL.ok
+        }
+    }
+    private var bg: Color {
+        switch tone {
+        case .warn:    return BSL.warnSoft
+        case .caution: return BSL.cautionSoft
+        case .success: return BSL.okSoft
+        }
     }
 }
 

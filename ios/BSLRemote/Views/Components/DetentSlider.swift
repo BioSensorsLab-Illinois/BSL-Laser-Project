@@ -56,7 +56,7 @@ struct DetentSlider: View {
                         .opacity(dimmed ? 0.45 : 1.0)
                         .frame(width: max(fillW, 0), height: 8)
                         .padding(.vertical, 14)
-                        .animation(isDragging ? nil : .easeOut(duration: 0.18), value: value)
+                        .animation(isDragging ? nil : .interpolatingSpring(stiffness: 140, damping: 18), value: value)
 
                     // Notches
                     ZStack(alignment: .leading) {
@@ -83,7 +83,7 @@ struct DetentSlider: View {
                         .frame(width: 24, height: 24)
                         .shadow(color: .black.opacity(0.15), radius: 2, x: 0, y: 1)
                         .offset(x: fillW - 12, y: 0)
-                        .animation(isDragging ? nil : .easeOut(duration: 0.18), value: value)
+                        .animation(isDragging ? nil : .interpolatingSpring(stiffness: 140, damping: 18), value: value)
                         .padding(.vertical, 6)
                         .allowsHitTesting(false)
                 }

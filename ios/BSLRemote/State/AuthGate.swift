@@ -11,8 +11,8 @@ import Observation
 /// (`components/laser_controller/src/laser_controller_comms.c:5754`).
 ///
 /// To rotate the PIN, regenerate `expectedHashHex` + `salt` at build time.
-/// The default shipping PIN is the four-digit `4520` — change before
-/// distribution.
+/// The current shipping PIN is the four-digit `2012` (user directive
+/// 2026-04-19) — change before distribution.
 @MainActor
 @Observable
 final class AuthGate {
@@ -30,7 +30,7 @@ final class AuthGate {
     private let salt = "BSL-iOS-build-2026-04-18"
 
     /// SHA-256 hex of the shipping PIN ("2012") concatenated with the salt.
-    /// Compute: printf '%s' "2012BSL-iOS-build-2026-04-18" | shasum -a 256
+    /// Compute: `printf '%s' "2012BSL-iOS-build-2026-04-18" | shasum -a 256`
     private let expectedHashHex =
         "6a46ec00262157256d1812d022bca65871ff01a247507685f86966029a680336"
 

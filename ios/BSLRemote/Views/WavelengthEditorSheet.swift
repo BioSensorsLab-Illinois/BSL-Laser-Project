@@ -85,16 +85,32 @@ struct WavelengthEditorSheet: View {
                 Text(String(format: "%.1f", lambda))
                     .font(.system(size: 72, weight: .thin).monospacedDigit())
                     .foregroundStyle(t.ink)
+                    .contentTransition(.numericText())
+                    .animation(.easeInOut(duration: 0.25), value: lambda)
                 Text("nanometers")
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(BSL.nir)
             }
-            // Do NOT show a client-side λ→°C estimate. The real coupling lives
-            // in the firmware's wavelength LUT; showing an incorrect formula
-            // would mislead operators. Firmware publishes `tec.targetTempC`
-            // after the lambda is staged — surface that in the live block.
-            Text("TEC target set by firmware after apply (from the wavelength LUT)")
-                .font(.system(size: 11))
+            // Projected TEC target — same bench-measured LUT the desktop
+            // console uses (host-console/src/lib/tec-calibration.ts) and a
+            // close match to the firmware wavelength LUT in
+            // components/laser_controller/src/laser_controller_config.c. This
+            // is a client-side *projection* shown to help the operator
+            // anticipate settling; the authoritative target temperature
+            // arrives from firmware in `tec.targetTempC` after apply.
+            let projected = TecCalibration.tempFromWavelengthNm(lambda)
+            HStack(spacing: 8) {
+                Image(systemName: "thermometer.medium")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(BSL.nir)
+                Text(String(format: "Projected TEC target: %.2f °C", projected))
+                    .font(.system(size: 12, weight: .semibold).monospacedDigit())
+                    .foregroundStyle(t.ink)
+                    .contentTransition(.numericText())
+                    .animation(.easeInOut(duration: 0.25), value: projected)
+            }
+            Text("Firmware wavelength LUT is authoritative — applied value may differ slightly after clamp.")
+                .font(.system(size: 10))
                 .foregroundStyle(t.muted)
                 .multilineTextAlignment(.center)
         }
@@ -169,7 +185,11 @@ struct WavelengthEditorSheet: View {
         HStack {
             Text(label).font(.system(size: 11)).foregroundStyle(t.muted)
             Spacer()
-            Text(value).font(.system(size: 12, weight: .semibold).monospacedDigit()).foregroundStyle(t.ink)
+            Text(value)
+                .font(.system(size: 12, weight: .semibold).monospacedDigit())
+                .foregroundStyle(t.ink)
+                .contentTransition(.numericText())
+                .animation(.easeInOut(duration: 0.25), value: value)
         }
     }
 
@@ -206,6 +226,8 @@ struct WavelengthEditorSheet: View {
         switch result {
         case .success(let resp):
             if resp.ok {
+                session.rememberWavelength(lambda)
+                session.reportSuccess(String(format: "Wavelength %.1f nm staged — TEC settling.", lambda))
                 dismiss()
             } else {
                 banner = "Rejected: \(resp.error ?? "unknown reason")"

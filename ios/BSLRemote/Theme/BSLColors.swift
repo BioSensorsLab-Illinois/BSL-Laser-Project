@@ -28,6 +28,9 @@ enum BSL {
     enum Light {
         static let bg       = Color(red: 0.980, green: 0.980, blue: 0.980)    // #FAFAFA
         static let surface  = Color.white
+        /// Second-level surface for nested-card feel (e.g. keypad keys on a
+        /// white card). Slightly warmer than `bg`.
+        static let surface2 = Color(red: 0.978, green: 0.982, blue: 0.992)    // #FAFBFD
         static let border   = Color(red: 0.074, green: 0.160, blue: 0.294, opacity: 0.08)
         static let borderStrong = Color(red: 0.074, green: 0.160, blue: 0.294, opacity: 0.16)
         static let ink      = Color(red: 0.058, green: 0.090, blue: 0.164)    // #0F172A

@@ -26,9 +26,12 @@ struct TemperatureMiniCard: View {
                     .tracking(1)
                     .foregroundStyle(t.muted)
                 HStack(alignment: .firstTextBaseline, spacing: 3) {
-                    Text(stale ? "—" : String(format: "%.2f", tec.tempC))
+                    let value = stale ? "—" : String(format: "%.2f", tec.tempC)
+                    Text(value)
                         .font(.system(size: 26, weight: .bold).monospacedDigit())
                         .foregroundStyle(t.ink)
+                        .contentTransition(.numericText())
+                        .animation(.easeInOut(duration: 0.35), value: value)
                     Text("°C")
                         .font(.system(size: 13, weight: .medium))
                         .foregroundStyle(t.muted)
@@ -36,6 +39,8 @@ struct TemperatureMiniCard: View {
                 Text(String(format: "Target %.2f °C", tec.targetTempC))
                     .font(.system(size: 10))
                     .foregroundStyle(t.muted)
+                    .contentTransition(.numericText())
+                    .animation(.easeInOut(duration: 0.35), value: tec.targetTempC)
             }
         }
     }

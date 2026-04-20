@@ -65,10 +65,10 @@ extension DeviceSnapshot {
         return Int((nirActualA / nirMaxA * 100).rounded())
     }
 
-    /// Coarse "external trigger" proxy. No dedicated footswitch field exists in
-    /// telemetry; derive from `laser.nirEnabled` (firmware accepted the command)
-    /// combined with lasing. When armed+nirEnabled but not yet lasing we report
-    /// the footswitch as "awaiting".
+    /// Coarse "external trigger" proxy. No dedicated main-button field exists
+    /// in telemetry; derive from `laser.nirEnabled` (firmware accepted the
+    /// command) combined with lasing. When armed+nirEnabled but not yet
+    /// lasing we report the main button as "awaiting trigger".
     var externalTriggerActive: Bool {
         laser.measuredCurrentA > safety.offCurrentThresholdA
     }

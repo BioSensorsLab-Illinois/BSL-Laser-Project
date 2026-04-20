@@ -1,7 +1,9 @@
 import SwiftUI
 
-/// Small status strip: EXT TRIGGER · FOOTSWITCH with dynamic label + pill.
-/// Mirrors `bsl-laser-system/project/BSL Laser Controller.html:1285-1323`.
+/// Small status strip: EXT TRIGGER · MAIN BUTTON with dynamic label + pill.
+/// (Operator-facing rename 2026-04-19: "footswitch" → "main button",
+/// "depression" → "trigger".) Mirrors
+/// `bsl-laser-system/project/BSL Laser Controller.html:1285-1323`.
 struct TriggerStrip: View {
     let mode: LaserMode
     var compact: Bool = false
@@ -25,7 +27,7 @@ struct TriggerStrip: View {
                     .frame(width: 12, height: 12)
             }
             VStack(alignment: .leading, spacing: 1) {
-                Text("EXT TRIGGER · FOOTSWITCH")
+                Text("EXT TRIGGER · MAIN BUTTON")
                     .font(.system(size: 10, weight: .heavy))
                     .tracking(1)
                     .foregroundStyle(t.muted)
@@ -59,8 +61,8 @@ struct TriggerStrip: View {
     }
     private var stateLine: String {
         switch mode {
-        case .lasing:   return "Depressed — emission active"
-        case .armed:    return "Awaiting depression to emit"
+        case .lasing:   return "Triggered — emission active"
+        case .armed:    return "Awaiting trigger to emit"
         case .disarmed: return "Inactive — arm to enable"
         }
     }

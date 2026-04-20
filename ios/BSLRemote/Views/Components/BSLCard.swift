@@ -48,6 +48,8 @@ struct BigMetricRow: View {
                     Text(bigValue)
                         .font(.system(size: 22, weight: .bold).monospacedDigit())
                         .foregroundStyle(t.ink)
+                        .contentTransition(.numericText())
+                        .animation(.easeInOut(duration: 0.25), value: bigValue)
                     Text(bigUnit)
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(t.muted)
@@ -57,6 +59,8 @@ struct BigMetricRow: View {
                         Text("→ \(set) \(setUnit)")
                             .font(.system(size: 10, weight: .semibold).monospacedDigit())
                             .foregroundStyle(BSL.orange)
+                            .contentTransition(.numericText())
+                            .animation(.easeInOut(duration: 0.25), value: set)
                     }
                 }
             }

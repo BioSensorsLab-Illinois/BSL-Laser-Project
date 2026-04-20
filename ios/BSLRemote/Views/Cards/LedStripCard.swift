@@ -56,7 +56,20 @@ struct LedStripCard: View {
                 }
             }
         }
-        .onAppear { localValue = Double(requested) }
+        .onAppear {
+            if requested > 0 {
+                localValue = Double(requested)
+                lastNonZero = requested
+            } else if let remembered = session.persistedLedDutyPct, remembered > 0 {
+                // Seed the slider from the last operator-accepted duty so
+                // the bulb matches what the controller actually has (the
+                // DeviceSession replays this to firmware during post-connect
+                // sync). Prevents the "visible LED is on but iOS shows 0 %"
+                // startup gap.
+                localValue = Double(min(remembered, cap))
+                lastNonZero = remembered
+            }
+        }
         .onChange(of: requested) { _, new in
             // Only accept telemetry updates while the user isn't actively
             // dragging. Otherwise the slider thumb fights the gesture.
@@ -92,9 +105,12 @@ struct LedStripCard: View {
                 .foregroundStyle(t.muted)
             Spacer()
             HStack(alignment: .firstTextBaseline, spacing: 1) {
-                Text(stale ? "—" : "\(Int(localValue.rounded()))")
+                let rounded = Int(localValue.rounded())
+                Text(stale ? "—" : "\(rounded)")
                     .font(.system(size: 14, weight: .bold).monospacedDigit())
                     .foregroundStyle(t.ink)
+                    .contentTransition(.numericText())
+                    .animation(.easeInOut(duration: 0.25), value: rounded)
                 Text("%")
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(t.muted)
@@ -116,17 +132,28 @@ struct LedStripCard: View {
         // 1-RTT window.
         awaitingAck = true
         localValue = Double(clamped)
+        // Remember locally regardless — lets the slider survive a
+        // reconnect — but don't send the runtime `operate.set_led` when
+        // firmware would reject it (deployment not active, checklist
+        // running, …). The rejection is noisy and the operator already
+        // sees the locked slider state.
+        session.rememberLed(dutyPct: clamped, enabled: clamped > 0)
+        guard bench.hostControlReadiness.ledBlockedReason == .none else {
+            awaitingAck = false
+            return
+        }
         Task {
             defer { awaitingAck = false }
-            _ = await session.sendCommand(
+            let result = await session.sendCommand(
                 "operate.set_led",
                 args: [
                     "enable": .bool(clamped > 0),
                     "duty_cycle_pct": .int(clamped),
                 ]
             )
-            // Small settle so the next telemetry frame's `requested` value
-            // matches what we just sent. Prevents an end-of-drag snap.
+            if case .success(let resp) = result, resp.ok {
+                session.rememberLed(dutyPct: clamped, enabled: clamped > 0)
+            }
             try? await Task.sleep(nanoseconds: 300_000_000)
         }
     }

@@ -74,7 +74,18 @@ struct NirHeroCard: View {
                 TriggerStrip(mode: mode)
             }
         }
-        .onAppear { localSet = setA }
+        .onAppear {
+            // Prefer the firmware-reported setpoint. If the firmware hasn't
+            // had time to publish yet (fresh reconnect, snapshot empty) and
+            // we have a persisted value from the previous session, show
+            // that as a placeholder — DeviceSession will re-apply it to
+            // firmware during post-connect sync.
+            if setA > 0 {
+                localSet = setA
+            } else if let remembered = session.persistedNirSetpointA, remembered > 0 {
+                localSet = min(remembered, maxA)
+            }
+        }
         .onChange(of: setA) { _, new in
             if !pendingCommit { localSet = new }
         }
@@ -132,6 +143,8 @@ struct NirHeroCard: View {
                     Text(stale ? "—" : "\(pct)")
                         .font(.system(size: 28, weight: .bold).monospacedDigit())
                         .foregroundStyle(t.ink)
+                        .contentTransition(.numericText())
+                        .animation(.easeInOut(duration: 0.35), value: pct)
                     Text("%")
                         .font(.system(size: 14, weight: .medium))
                         .foregroundStyle(t.muted)
@@ -153,16 +166,27 @@ struct NirHeroCard: View {
 
     private func commit() {
         let clamped = min(max(localSet, 0), maxA)
+        // Firmware will reject any `operate.set_output` that arrives while
+        // the NIR path is blocked (deployment not ready, fault latched,
+        // rails not good, …). We still want to remember the operator's
+        // intent locally so the setpoint survives reconnect, but we skip
+        // the network round-trip in blocked states — it would only surface
+        // a firmware-rejected banner the operator already knows about.
+        session.rememberNirSetpoint(clamped)
+        guard blockedReason == .none else { return }
         pendingCommit = true
         Task {
             defer { pendingCommit = false }
-            _ = await session.sendCommand(
+            let result = await session.sendCommand(
                 "operate.set_output",
                 args: [
                     "enable": .bool(snap.bench.requestedNirEnabled),
                     "current_a": .double(clamped),
                 ]
             )
+            if case .success(let resp) = result, resp.ok {
+                session.rememberNirSetpoint(clamped)
+            }
         }
     }
 

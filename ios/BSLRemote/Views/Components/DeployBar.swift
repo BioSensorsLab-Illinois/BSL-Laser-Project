@@ -3,9 +3,15 @@ import UIKit
 import BSLProtocol
 
 /// Sticky bottom action bar.
-///   - Disarmed: "HOLD TO ARM LASER" (1 s hold triggers `deployment.enter`)
+///
+/// Modes (driven by `LaserMode` + the firmware deployment block):
+///   - Disarmed, checklist idle: "HOLD TO ARM LASER" (1 s hold issues
+///     `deployment.enter` + `deployment.run`)
+///   - Disarmed, checklist running: a disabled, greyed chip that shows the
+///     live checklist step so the operator sees progress instead of a
+///     stuck enabled button
 ///   - Armed:    STOP (left) + "ARMED" status chip (right)
-/// Mirrors `bsl-laser-system/project/BSL Laser Controller.html:1935-2025`.
+///   - Lasing:   STOP (left) + "LASING" status chip (right)
 ///
 /// The firmware is the safety authority: this view issues commands only;
 /// actual state flips when the firmware confirms via telemetry.
@@ -20,6 +26,29 @@ struct DeployBar: View {
     @State private var holdProgress: Double = 0
     @State private var holdTask: Task<Void, Never>? = nil
     @State private var sending: Bool = false
+
+    private var deployment: DeploymentSnapshot { session.snapshot.deployment }
+
+    /// True when the firmware is mid-checklist or transitioning through an
+    /// entry phase. Any of these states means "do not fire another
+    /// deployment.enter / deployment.run — we are already in the middle of
+    /// one". Note that `.failed` must NOT qualify as busy — the operator
+    /// needs a path back (retry or exit) when the checklist failed.
+    private var checklistBusy: Bool {
+        if deployment.phase == .failed { return false }
+        if deployment.running { return true }
+        if deployment.active && !deployment.ready { return true }
+        switch deployment.phase {
+        case .entry, .checklist: return true
+        case .readyIdle, .failed, .inactive, .unknown: return false
+        }
+    }
+
+    /// True when firmware has parked in the failed-deployment state.
+    /// Surfaces the RETRY / EXIT pair in place of HOLD TO ARM.
+    private var deploymentFailed: Bool {
+        deployment.phase == .failed
+    }
 
     var body: some View {
         VStack(spacing: 10) {
@@ -38,7 +67,13 @@ struct DeployBar: View {
     @ViewBuilder private var content: some View {
         switch mode {
         case .disarmed:
-            armButton
+            if deploymentFailed {
+                retryRow
+            } else if checklistBusy {
+                checklistBusyButton
+            } else {
+                armButton
+            }
         case .armed, .lasing:
             HStack(spacing: 8) {
                 stopButton
@@ -58,6 +93,7 @@ struct DeployBar: View {
                         .frame(width: geo.size.width * holdProgress)
                 }
                 .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                .animation(.linear(duration: 0.05), value: holdProgress)
             }
             HStack {
                 Spacer()
@@ -65,6 +101,7 @@ struct DeployBar: View {
                     .font(.system(size: 15, weight: .bold))
                     .tracking(0.5)
                     .foregroundStyle(armEnabled ? Color.white : t.dim)
+                    .contentTransition(.opacity)
                 Spacer()
             }
         }
@@ -72,6 +109,100 @@ struct DeployBar: View {
         .shadow(color: armEnabled ? BSL.orange.opacity(0.3) : .clear, radius: 12, x: 0, y: 6)
         .contentShape(Rectangle())
         .gesture(pressAndHold)
+        .animation(.easeInOut(duration: 0.2), value: armEnabled)
+    }
+
+    /// Shown in place of HOLD TO ARM when the firmware has parked in
+    /// `deployment.phase == .failed`. Left button (orange-filled) re-runs
+    /// the checklist; right button (outlined warn) drops the deployment
+    /// mode entirely so the operator is back to DISARMED baseline.
+    private var retryRow: some View {
+        HStack(spacing: 8) {
+            Button {
+                Task { await sendRetry() }
+            } label: {
+                HStack(spacing: 6) {
+                    if sending {
+                        ProgressView().tint(.white)
+                    } else {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.system(size: 14, weight: .semibold))
+                    }
+                    Text(sending ? "RETRYING…" : "RETRY CHECKLIST")
+                        .font(.system(size: 14, weight: .bold))
+                        .tracking(0.5)
+                }
+                .foregroundStyle(.white)
+                .frame(maxWidth: .infinity)
+                .frame(height: 56)
+                .background(BSL.orange)
+                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                .shadow(color: BSL.orange.opacity(0.30), radius: 12, x: 0, y: 6)
+            }
+            .buttonStyle(.plain)
+            .disabled(sending || !connected)
+
+            Button {
+                Task { await sendExit() }
+            } label: {
+                Text("EXIT")
+                    .font(.system(size: 12, weight: .heavy))
+                    .tracking(1)
+                    .foregroundStyle(BSL.warn)
+                    .frame(width: 66, height: 56)
+                    .background(t.surface)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .strokeBorder(BSL.warn, lineWidth: 1.5)
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            }
+            .buttonStyle(.plain)
+            .disabled(sending)
+        }
+    }
+
+    /// Disabled arm-button replacement that shows the live checklist step
+    /// and a progress strip, so the operator has confirmation that the
+    /// controller is actively working. Rendered whenever
+    /// `checklistBusy == true`.
+    private var checklistBusyButton: some View {
+        ZStack(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(t.trackFill)
+            indeterminateSweep
+                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            VStack(alignment: .center, spacing: 2) {
+                Text(busyHeadline)
+                    .font(.system(size: 13, weight: .heavy))
+                    .tracking(0.8)
+                    .foregroundStyle(t.ink)
+                Text(busyDetail)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(t.muted)
+                    .lineLimit(1)
+            }
+            .frame(maxWidth: .infinity)
+        }
+        .frame(height: 56)
+        .accessibilityLabel("Deployment checklist running, \(busyDetail)")
+    }
+
+    /// Soft left-to-right sweep highlight. Gives a "working" feel without
+    /// breaking the Uncodixfy ban on glass/gradient-heavy chrome; only a
+    /// single semi-transparent bar pans back and forth.
+    private var indeterminateSweep: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: false)) { timeline in
+            let t0 = timeline.date.timeIntervalSinceReferenceDate
+            let phase = (t0.truncatingRemainder(dividingBy: 1.6)) / 1.6
+            GeometryReader { geo in
+                let w = geo.size.width
+                Rectangle()
+                    .fill(BSL.orange.opacity(0.18))
+                    .frame(width: max(40, w * 0.30))
+                    .offset(x: CGFloat(phase) * (w + 60) - 60, y: 0)
+            }
+        }
     }
 
     private var stopButton: some View {
@@ -135,14 +266,46 @@ struct DeployBar: View {
         )
     }
 
-    private var armEnabled: Bool { connected && !hasWarning && !sending }
+    /// Hard disable rule: the arm button only becomes active when the
+    /// controller is connected, no master-warning fault is latched, we are
+    /// not mid-send, and the firmware is NOT already running a deployment
+    /// entry / checklist. The UI reflects the firmware state; it does not
+    /// race around it.
+    private var armEnabled: Bool {
+        connected && !hasWarning && !sending && !checklistBusy
+    }
 
     private var armLabel: String {
         if sending { return "ENTERING DEPLOYMENT…" }
         if !connected { return "AWAITING LINK" }
         if hasWarning { return "CLEAR FAULT FIRST" }
+        if checklistBusy { return "DEPLOYMENT · WORKING" }
         if holdProgress > 0 { return "HOLD TO ARM · \(Int(holdProgress * 100))%" }
         return "HOLD TO ARM LASER"
+    }
+
+    /// Top line of the busy button. Prefers the deployment phase over the
+    /// raw flag bits because operators scanning quickly want the word, not
+    /// the state math.
+    private var busyHeadline: String {
+        switch deployment.phase {
+        case .entry:     return "ENTERING DEPLOYMENT"
+        case .checklist: return "RUNNING CHECKLIST"
+        case .readyIdle: return "FINALIZING"
+        case .failed:    return "DEPLOYMENT FAILED"
+        case .inactive, .unknown:
+            return deployment.running ? "DEPLOYMENT BUSY" : "DEPLOYMENT WORKING"
+        }
+    }
+
+    /// Second line — surfaces the current step / reason. Falls back to a
+    /// generic "please wait" if the firmware has not yet broadcast a step
+    /// string via status.
+    private var busyDetail: String {
+        if deployment.phase == .failed { return "Tap the fault banner for details." }
+        if deployment.running { return "please wait — firmware is stepping through checklist" }
+        if deployment.active && !deployment.ready { return "stabilizing rails and TEC before ready-idle" }
+        return "please wait"
     }
 
     private var pressAndHold: some Gesture {
@@ -174,17 +337,21 @@ struct DeployBar: View {
             }
     }
 
-    /// Hold-to-arm = enter deployment mode + start the deployment checklist.
-    /// The firmware runs the checklist asynchronously; when the controller
-    /// lands in ready-idle (`deployment.active && deployment.ready &&
-    /// deployment.readyIdle`), the mode recomputes to `.armed` and the bar
-    /// redraws automatically. If deployment drops out of ready (mode reverts
-    /// to `.disarmed`), the HOLD TO ARM button reappears by the same path.
-    /// The app cannot enable emission — that requires the physical main
-    /// button per the firmware contract.
+    /// Hold-to-arm = stage wavelength, enter deployment mode, start the
+    /// checklist.
+    ///
+    /// User directive 2026-04-19: the checklist MUST settle to the
+    /// operator's staged wavelength, not the firmware default of 25 °C.
+    /// We re-send `operate.set_target` right before `deployment.enter` so
+    /// the firmware's wavelength-LUT→TEC target is correct at the moment
+    /// the deployment snapshot captures it. Prefer the persisted value
+    /// (what the operator chose in WavelengthEditorSheet); fall back to
+    /// the live firmware target if we have one; otherwise skip and let
+    /// firmware use its prior staged target.
     private func sendArm() async {
         sending = true
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        await stageWavelengthIfNeeded()
         let enterResult = await session.sendCommand("deployment.enter")
         if case .success(let resp) = enterResult, !resp.ok {
             // Firmware already reported the reason via lastFirmwareError;
@@ -194,6 +361,51 @@ struct DeployBar: View {
         }
         _ = await session.sendCommand("deployment.run")
         sending = false
+    }
+
+    /// Retry after a failed checklist. We re-stage the wavelength (in case
+    /// firmware dropped the prior target during failure handling) and then
+    /// call `deployment.run` without re-entering — the firmware is still
+    /// in deployment mode on a failed checklist. If firmware already
+    /// reset back to inactive, a fresh enter+run fires as well.
+    private func sendRetry() async {
+        sending = true
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        await stageWavelengthIfNeeded()
+        let snap = session.snapshot
+        if snap.deployment.active {
+            _ = await session.sendCommand("deployment.run")
+        } else {
+            let enterResult = await session.sendCommand("deployment.enter")
+            if case .success(let resp) = enterResult, !resp.ok {
+                sending = false
+                return
+            }
+            _ = await session.sendCommand("deployment.run")
+        }
+        sending = false
+    }
+
+    /// Operator-chose exit from a failed state — drops deployment, bar
+    /// reverts to HOLD TO ARM.
+    private func sendExit() async {
+        sending = true
+        _ = await session.sendCommand("deployment.exit")
+        sending = false
+    }
+
+    private func stageWavelengthIfNeeded() async {
+        let persisted = session.persistedWavelengthNm ?? 0
+        let live = session.snapshot.tec.targetLambdaNm
+        let nm: Double = persisted > 0 ? persisted : live
+        guard nm > 0 else { return }
+        _ = await session.sendCommand(
+            "operate.set_target",
+            args: [
+                "mode": .string("lambda"),
+                "lambda_nm": .double(nm),
+            ]
+        )
     }
 
     private func sendStop() async {
@@ -207,3 +419,4 @@ struct DeployBar: View {
         sending = false
     }
 }
+

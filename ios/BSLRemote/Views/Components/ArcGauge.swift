@@ -49,10 +49,13 @@ struct ArcGauge<Center: View>: View {
             // Track
             ArcShape(start: startAngle, sweep: sweep)
                 .stroke(t.trackFill, style: StrokeStyle(lineWidth: stroke, lineCap: .round))
-            // Value
+            // Value — use an interpolating spring so discrete telemetry
+            // steps (integer % rounds, 0.1 A detents) animate as a
+            // continuous glide instead of a visible snap.
             ArcShape(start: startAngle, sweep: sweep * clamped)
                 .stroke(color, style: StrokeStyle(lineWidth: stroke, lineCap: .round))
-                .animation(.easeInOut(duration: 0.6), value: value)
+                .animation(.interpolatingSpring(stiffness: 90, damping: 16), value: value)
+                .animation(.easeInOut(duration: 0.35), value: maxValue)
             // Breathing preview (armed-but-not-lasing)
             if breathing, let sp = setpoint, sp > 0 {
                 BreathingArc(start: startAngle, sweep: sweep * clamp(sp / maxValue),

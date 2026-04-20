@@ -27,9 +27,12 @@ struct WavelengthMiniCard: View {
                     .tracking(1)
                     .foregroundStyle(t.muted)
                 HStack(alignment: .firstTextBaseline, spacing: 3) {
-                    Text(stale ? "—" : String(format: "%.1f", tec.targetLambdaNm))
+                    let value = stale ? "—" : String(format: "%.1f", tec.targetLambdaNm)
+                    Text(value)
                         .font(.system(size: 26, weight: .bold).monospacedDigit())
                         .foregroundStyle(t.ink)
+                        .contentTransition(.numericText())
+                        .animation(.easeInOut(duration: 0.35), value: value)
                     Text("nm")
                         .font(.system(size: 13, weight: .medium))
                         .foregroundStyle(t.muted)
