@@ -225,10 +225,22 @@ public struct DeploymentSnapshot: Codable, Sendable, Equatable {
     public var running: Bool
     public var ready: Bool
     public var readyIdle: Bool
+    public var failed: Bool
     public var phase: DeploymentPhase
     public var maxLaserCurrentA: Double
     public var targetLambdaNm: Double
     public var targetTempC: Double
+    /// Step identifiers emitted by firmware (`laser_controller_comms.c`
+    /// 2334-2351): `currentStepKey` / `lastCompletedStepKey` carry a
+    /// stable token like `RAIL_SEQUENCE` the UI can pattern-match.
+    /// `currentStepIndex` is 0-based (NONE=0) into the fixed sequence
+    /// defined in `laser_controller_deployment.h`.
+    public var currentStepKey: String
+    public var currentStepIndex: Int
+    public var lastCompletedStepKey: String
+    public var sequenceId: Int
+    public var primaryFailureCode: String
+    public var primaryFailureReason: String
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -236,10 +248,17 @@ public struct DeploymentSnapshot: Codable, Sendable, Equatable {
         running = try c.decodeIfPresent(Bool.self, forKey: .running) ?? false
         ready = try c.decodeIfPresent(Bool.self, forKey: .ready) ?? false
         readyIdle = try c.decodeIfPresent(Bool.self, forKey: .readyIdle) ?? false
+        failed = try c.decodeIfPresent(Bool.self, forKey: .failed) ?? false
         phase = try c.decodeIfPresent(DeploymentPhase.self, forKey: .phase) ?? .inactive
         maxLaserCurrentA = try c.decodeIfPresent(Double.self, forKey: .maxLaserCurrentA) ?? 5.0
         targetLambdaNm = try c.decodeIfPresent(Double.self, forKey: .targetLambdaNm) ?? 785
         targetTempC = try c.decodeIfPresent(Double.self, forKey: .targetTempC) ?? 25
+        currentStepKey = try c.decodeIfPresent(String.self, forKey: .currentStepKey) ?? "NONE"
+        currentStepIndex = try c.decodeIfPresent(Int.self, forKey: .currentStepIndex) ?? 0
+        lastCompletedStepKey = try c.decodeIfPresent(String.self, forKey: .lastCompletedStepKey) ?? "NONE"
+        sequenceId = try c.decodeIfPresent(Int.self, forKey: .sequenceId) ?? 0
+        primaryFailureCode = try c.decodeIfPresent(String.self, forKey: .primaryFailureCode) ?? "none"
+        primaryFailureReason = try c.decodeIfPresent(String.self, forKey: .primaryFailureReason) ?? ""
     }
 
     public init(
@@ -247,24 +266,85 @@ public struct DeploymentSnapshot: Codable, Sendable, Equatable {
         running: Bool = false,
         ready: Bool = false,
         readyIdle: Bool = false,
+        failed: Bool = false,
         phase: DeploymentPhase = .inactive,
         maxLaserCurrentA: Double = 5.0,
         targetLambdaNm: Double = 785,
-        targetTempC: Double = 25
+        targetTempC: Double = 25,
+        currentStepKey: String = "NONE",
+        currentStepIndex: Int = 0,
+        lastCompletedStepKey: String = "NONE",
+        sequenceId: Int = 0,
+        primaryFailureCode: String = "none",
+        primaryFailureReason: String = ""
     ) {
         self.active = active
         self.running = running
         self.ready = ready
         self.readyIdle = readyIdle
+        self.failed = failed
         self.phase = phase
         self.maxLaserCurrentA = maxLaserCurrentA
         self.targetLambdaNm = targetLambdaNm
         self.targetTempC = targetTempC
+        self.currentStepKey = currentStepKey
+        self.currentStepIndex = currentStepIndex
+        self.lastCompletedStepKey = lastCompletedStepKey
+        self.sequenceId = sequenceId
+        self.primaryFailureCode = primaryFailureCode
+        self.primaryFailureReason = primaryFailureReason
     }
 
     private enum CodingKeys: String, CodingKey {
-        case active, running, ready, readyIdle, phase
+        case active, running, ready, readyIdle, failed, phase
         case maxLaserCurrentA, targetLambdaNm, targetTempC
+        case currentStepKey, currentStepIndex, lastCompletedStepKey
+        case sequenceId, primaryFailureCode, primaryFailureReason
+    }
+}
+
+/// Human-readable labels for the firmware deployment steps. Keys mirror
+/// `laser_controller_deployment_step_name` token output in
+/// `laser_controller_deployment.c`. Displayed in the iOS DeployBar so the
+/// operator sees concrete progress (e.g. "Verifying peripherals",
+/// "Settling TEC") instead of a generic "running checklist" spinner.
+public enum DeploymentStepLabel {
+    public static let total = 11
+
+    public static func index(for key: String) -> Int {
+        switch key.uppercased() {
+        case "NONE": return 0
+        case "OWNERSHIP_RECLAIM": return 1
+        case "PD_INSPECT": return 2
+        case "POWER_CAP": return 3
+        case "OUTPUTS_OFF": return 4
+        case "STABILIZE_3V3": return 5
+        case "DAC_SAFE_ZERO": return 6
+        case "PERIPHERALS_VERIFY": return 7
+        case "RAIL_SEQUENCE": return 8
+        case "TEC_SETTLE": return 9
+        case "LP_GOOD_CHECK": return 10
+        case "READY_POSTURE": return 11
+        default: return 0
+        }
+    }
+
+    public static func label(for key: String) -> String {
+        switch key.uppercased() {
+        case "NONE": return "Idle"
+        case "OWNERSHIP_RECLAIM": return "Reclaiming bus ownership"
+        case "PD_INSPECT": return "Inspecting USB-PD contract"
+        case "POWER_CAP": return "Applying power cap"
+        case "OUTPUTS_OFF": return "Forcing outputs safe"
+        case "STABILIZE_3V3": return "Stabilizing 3.3 V rail"
+        case "DAC_SAFE_ZERO": return "Zeroing DAC channels"
+        case "PERIPHERALS_VERIFY": return "Verifying peripherals"
+        case "RAIL_SEQUENCE": return "Sequencing TEC → LD rails"
+        case "TEC_SETTLE": return "Settling TEC to target"
+        case "LP_GOOD_CHECK": return "Locking LD driver loop"
+        case "READY_POSTURE": return "Ready-posture qualification"
+        default: return key.capitalized.replacingOccurrences(of: "_", with: " ")
+        }
     }
 }
 

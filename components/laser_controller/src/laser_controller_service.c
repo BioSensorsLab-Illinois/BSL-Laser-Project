@@ -37,6 +37,12 @@
  * current. Range: 0..6000 mA. (2026-04-16 user feature.)
  */
 #define LASER_CONTROLLER_SERVICE_DEPLOY_CURRENT_NVS_KEY "deploy_iA_x1k"
+/*
+ * `config.service_flags` bitmap lives in its own NVS u32 key — standalone
+ * from the main service profile blob to avoid a version bump + migration
+ * of `laser_controller_service_persisted_profile_t`. Added 2026-04-20.
+ */
+#define LASER_CONTROLLER_SERVICE_FLAGS_NVS_KEY "svc_flags"
 #define LASER_CONTROLLER_SERVICE_DAC_MAX_V     2.5f
 #define LASER_CONTROLLER_SERVICE_DEFAULT_TEC_CHANNEL_V 0.821104f
 #define LASER_CONTROLLER_SERVICE_TOF_ILLUMINATION_PWM_HZ 20000U
@@ -2409,6 +2415,51 @@ void laser_controller_service_set_runtime_safety_policy(
         "Runtime safety policy staged for profile persistence.",
         now_ms);
     portEXIT_CRITICAL(&s_service_lock);
+}
+
+void laser_controller_service_set_service_flags(uint32_t service_flags)
+{
+    /*
+     * Persist to NVS immediately so the next boot picks the flags up.
+     * Uses a standalone u32 key rather than the profile blob so the
+     * v5→v6 migration chain stays untouched. Save failures are logged
+     * by the nvs layer; the in-memory `s_context.config.service_flags`
+     * already holds the new value so runtime behavior for this session
+     * (including telemetry emission) continues regardless.
+     */
+    nvs_handle_t handle = 0;
+    const esp_err_t err = nvs_open(
+        LASER_CONTROLLER_SERVICE_NVS_NAMESPACE,
+        NVS_READWRITE,
+        &handle);
+    if (err == ESP_OK) {
+        (void)nvs_set_u32(
+            handle,
+            LASER_CONTROLLER_SERVICE_FLAGS_NVS_KEY,
+            service_flags);
+        (void)nvs_commit(handle);
+        nvs_close(handle);
+    }
+}
+
+uint32_t laser_controller_service_load_service_flags(void)
+{
+    nvs_handle_t handle = 0;
+    uint32_t flags = 0U;
+
+    const esp_err_t err = nvs_open(
+        LASER_CONTROLLER_SERVICE_NVS_NAMESPACE,
+        NVS_READONLY,
+        &handle);
+    if (err != ESP_OK) {
+        return 0U;
+    }
+    (void)nvs_get_u32(
+        handle,
+        LASER_CONTROLLER_SERVICE_FLAGS_NVS_KEY,
+        &flags);
+    nvs_close(handle);
+    return flags;
 }
 
 void laser_controller_service_set_runtime_target(

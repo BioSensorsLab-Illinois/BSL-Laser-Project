@@ -323,6 +323,26 @@ uint32_t laser_controller_board_get_tof_led_max_duty_pct(void);
 esp_err_t laser_controller_board_tof_apply_calibration(
     const laser_controller_tof_calibration_t *cal);
 esp_err_t laser_controller_board_fire_haptic_test(void);
+
+/*
+ * Reverse lookup of the bench-measured TEC temperature calibration: given a
+ * target temperature in °C, return the DAC setpoint voltage that will
+ * actually settle the TEC at that temperature. The LUT
+ * (`kTecTempCalibration` in `laser_controller_board.c:272`) was measured on
+ * the live bench and is the canonical mapping between the TEC driver's
+ * thermistor-voltage and true TEC-plate temperature. Linear interp between
+ * LUT anchors; clamps to the calibrated range.
+ *
+ * Added 2026-04-20 to replace the previous linear `target_temp_c *
+ * tec_command_volts_per_c` approximation that was producing a persistent
+ * 2-4 °C offset at the TEC plate (user report: "actual never reaches
+ * target, stabilizes somewhere else"). The linear path is retained as a
+ * fallback when `config->analog.tec_command_volts_per_c` is explicitly
+ * non-zero, for per-unit calibration overrides.
+ */
+laser_controller_volts_t laser_controller_board_tec_target_voltage_from_temp_c(
+    laser_controller_celsius_t target_temp_c);
+
 void laser_controller_board_apply_actuator_targets(
     const laser_controller_config_t *config,
     laser_controller_amps_t high_state_current_a,

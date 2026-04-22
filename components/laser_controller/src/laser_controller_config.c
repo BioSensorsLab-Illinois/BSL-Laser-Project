@@ -142,7 +142,16 @@ void laser_controller_config_load_defaults(laser_controller_config_t *config)
         sizeof(kDefaultWavelengthsNm));
 
     config->analog.ld_command_volts_per_amp = 0.41667f;
-    config->analog.tec_command_volts_per_c = 0.03846f;
+    /*
+     * 2026-04-20 (issue 3): zero the default TEC volts-per-°C slope so
+     * the runtime paths fall through to the bench-calibrated LUT reverse
+     * lookup (`laser_controller_board_tec_target_voltage_from_temp_c`).
+     * The old 0.03846 V/°C linear approximation disagreed with the
+     * measured thermistor voltage-temp curve and produced a 2-4 °C
+     * settle offset at the plate. A non-zero value from per-unit
+     * calibration still takes precedence.
+     */
+    config->analog.tec_command_volts_per_c = 0.0f;
     config->analog.lio_amps_per_volt = 1.0f;
     config->analog.ld_tmo_c_per_volt = 1.0f;
 

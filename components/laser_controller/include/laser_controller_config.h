@@ -183,9 +183,27 @@ typedef struct {
     laser_controller_analog_scaling_t analog;
     bool alignment_obeys_interlocks;
     bool require_tec_for_nir;
+    /*
+     * `service_flags` is a bitmap of opt-in behavior switches. Using a
+     * bitmap keeps the struct NVS-layout stable across versions — new
+     * bits simply default to 0 on any older blob without a migration
+     * step. Named bits below; preserve ordering so saved configs on
+     * upgrade still decode correctly.
+     *
+     *   bit 0 = LASER_CONTROLLER_SERVICE_FLAG_AUTO_DEPLOY_ON_BOOT
+     *           when set, `app.c` triggers enter_deployment_mode()
+     *           + run_deployment_sequence() as soon as `boot_complete`
+     *           latches, so the device walks itself to ready-idle with
+     *           no host gesture. Intended for kiosk-style deployments
+     *           where the operator just turns the unit on and expects
+     *           an armed-ready state. User directive 2026-04-20.
+     */
     uint32_t service_flags;
     uint32_t crc32;
 } laser_controller_config_t;
+
+/* Service-flag bit definitions (see service_flags field above). */
+#define LASER_CONTROLLER_SERVICE_FLAG_AUTO_DEPLOY_ON_BOOT (1U << 0)
 
 void laser_controller_config_load_defaults(laser_controller_config_t *config);
 bool laser_controller_config_validate(const laser_controller_config_t *config);

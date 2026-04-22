@@ -235,11 +235,69 @@ extension DeploymentSnapshot {
         if let v = patch["running"]          as? Bool   { c.running          = v }
         if let v = patch["ready"]            as? Bool   { c.ready            = v }
         if let v = patch["readyIdle"]        as? Bool   { c.readyIdle        = v }
+        if let v = patch["failed"]           as? Bool   { c.failed           = v }
         if let raw = patch["phase"] as? String,
            let p = DeploymentPhase(rawValue: raw) { c.phase = p }
         if let v = patch["maxLaserCurrentA"] as? Double { c.maxLaserCurrentA = v }
         if let v = patch["targetLambdaNm"]   as? Double { c.targetLambdaNm   = v }
         if let v = patch["targetTempC"]      as? Double { c.targetTempC      = v }
+        // 2026-04-20: step-progress fields for the iOS DeployBar.
+        if let v = patch["currentStepKey"]        as? String { c.currentStepKey = v }
+        if let v = patch["currentStepIndex"]      as? Int    { c.currentStepIndex = v }
+        if let v = patch["lastCompletedStepKey"]  as? String { c.lastCompletedStepKey = v }
+        if let v = patch["sequenceId"]            as? Int    { c.sequenceId = v }
+        if let v = patch["primaryFailureCode"]    as? String { c.primaryFailureCode = v }
+        if let v = patch["primaryFailureReason"]  as? String { c.primaryFailureReason = v }
+        return c
+    }
+}
+
+// MARK: - Fast-telemetry overlay
+//
+// Applies a compact FastTelemetryPatch to a live snapshot. Only the fields
+// actually carried by the fast frame are replaced; everything else (deployment
+// status, bench setpoints, PD contract, fault details, safety thresholds, etc)
+// is left alone so the prior 1 s live_telemetry / 5 s status_snapshot values
+// continue to drive the rest of the UI. Added 2026-04-20 so the iOS app can
+// refresh NIR current / TEC temp / beam posture / ToF distance at the 4-5 Hz
+// firmware cadence instead of the 1 Hz live_telemetry cadence.
+
+extension DeviceSnapshot {
+    public func applying(fastTelemetry patch: FastTelemetryPatch) -> DeviceSnapshot {
+        var c = self
+
+        // IMU — only the pressed flags and angles are in the fast frame.
+        c.imu.valid = patch.imuValid
+        c.imu.fresh = patch.imuFresh
+
+        // ToF
+        c.tof.valid = patch.tofValid
+        c.tof.fresh = patch.tofFresh
+        c.tof.distanceM = patch.tofDistanceM
+
+        // Laser — live emission flags + measured current + driver temp.
+        c.laser.alignmentEnabled = patch.alignmentEnabled
+        c.laser.nirEnabled = patch.nirEnabled
+        c.laser.driverStandby = patch.driverStandby
+        c.laser.loopGood = patch.loopGood
+        c.laser.measuredCurrentA = patch.measuredCurrentA
+        c.laser.driverTempC = patch.driverTempC
+
+        // TEC — live readouts only. targetTempC / targetLambdaNm stay from
+        // live_telemetry (they're bench setpoints, not fast-frame fields).
+        c.tec.tempGood = patch.tecTempGood
+        c.tec.tempC = patch.tecTempC
+        c.tec.currentA = patch.tecCurrentA
+        c.tec.voltageV = patch.tecVoltageV
+
+        // Safety decision
+        c.safety.allowAlignment = patch.allowAlignment
+        c.safety.allowNir = patch.allowNir
+        c.safety.horizonBlocked = patch.horizonBlocked
+        c.safety.distanceBlocked = patch.distanceBlocked
+        c.safety.lambdaDriftBlocked = patch.lambdaDriftBlocked
+        c.safety.tecTempAdcBlocked = patch.tecTempAdcBlocked
+
         return c
     }
 }

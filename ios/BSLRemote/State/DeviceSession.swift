@@ -302,6 +302,15 @@ final class DeviceSession: TransportObserver {
                 rawPayload: rawPayload
             )
             self.lastFrameAt = Date()
+        case .fastTelemetry(let patch):
+            // 2026-04-20: compact 4-5 Hz patch. Overlay the live readouts
+            // only (IMU / ToF / laser measured / TEC measured / safety
+            // decision / button press), leaving everything else from the
+            // last full frame intact. Fixes user report "telemetry refresh
+            // still very slow" — the UI now reflects the firmware's
+            // fast-telemetry cadence.
+            self.snapshot = self.snapshot.applying(fastTelemetry: patch)
+            self.lastFrameAt = Date()
         case .commandResponse:
             // Handled by the transport's in-flight continuation map.
             self.lastFrameAt = Date()
@@ -359,7 +368,10 @@ final class DeviceSession: TransportObserver {
             _ = await self.sendCommand(
                 "operate.set_target",
                 args: [
-                    "mode": .string("lambda"),
+                    // 2026-04-20: firmware keys on `target_mode`; see
+                    // DeployBar.stageWavelengthIfNeeded for the same
+                    // fix. Prior `mode` key was silently ignored.
+                    "target_mode": .string("lambda"),
                     "lambda_nm": .double(nm),
                 ]
             )
@@ -420,6 +432,12 @@ final class DeviceSession: TransportObserver {
         let runtimeCommands: Set<String> = [
             "operate.set_output",
             "operate.set_led",
+            // 2026-04-20: `operate.set_target` is issued pre-arm by the
+            // DeployBar to lock in the operator's staged wavelength before
+            // `deployment.enter`. Firmware currently gates it behind the
+            // runtime-control check; the rejection is expected and should
+            // not pop a red banner during the normal arm gesture.
+            "operate.set_target",
         ]
         guard runtimeCommands.contains(cmd) else { return false }
         let lower = message.lowercased()

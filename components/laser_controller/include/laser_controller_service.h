@@ -292,6 +292,15 @@ void laser_controller_service_set_runtime_safety_policy(
     const laser_controller_safety_thresholds_t *thresholds,
     const laser_controller_timeout_policy_t *timeouts,
     laser_controller_time_ms_t now_ms);
+/*
+ * Persist the `config.service_flags` bitmap to its own NVS u32 key
+ * (standalone from the versioned profile blob). Called by
+ * `laser_controller_app_set_service_flags`. On next boot,
+ * `laser_controller_service_load_service_flags` returns the saved
+ * value so the flag survives a power cycle.
+ */
+void laser_controller_service_set_service_flags(uint32_t service_flags);
+uint32_t laser_controller_service_load_service_flags(void);
 void laser_controller_service_set_runtime_target(
     laser_controller_bench_target_mode_t target_mode,
     laser_controller_celsius_t target_temp_c,

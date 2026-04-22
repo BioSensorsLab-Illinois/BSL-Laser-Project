@@ -5,14 +5,15 @@ import BSLProtocol
 ///
 /// USB-PD "draw" in firmware telemetry is typically 0 when the USB-PD PHY is
 /// not polled — the iOS app mirrored that and showed 0.0 W indefinitely. We
-/// now compute the *estimated* input power using the same model the desktop
+/// now compute the *estimated* consumption using the same model the desktop
 /// web console uses (`host-console/src/lib/bench-model.ts`) and add a 1 W
 /// idle floor per the 2026-04-19 operator directive.
 ///
 /// Two bars:
 ///   1. PD draw — total estimated draw against the negotiated contract
-///   2. TEC input — the TEC-alone portion of the draw, which the operator
+///   2. TEC consumption — the TEC-alone portion of the draw, which the operator
 ///      monitors separately when tuning wavelength / settling behavior.
+/// (Label wording "input" → "consumption" per 2026-04-20 user directive.)
 struct PowerRailCard: View {
     @Environment(DeviceSession.self) private var session
     @Environment(\.bslTheme) private var t
@@ -73,7 +74,7 @@ struct PowerRailCard: View {
 
     private var ldBar: some View {
         PowerBar(
-            label: "LD input",
+            label: "LD consumption",
             valueText: stale ? "—" : String(format: "%.1f W", estimate.laserInputPowerW),
             ratio: ldRatio,
             tint: BSL.orange
@@ -82,7 +83,7 @@ struct PowerRailCard: View {
 
     private var tecBar: some View {
         PowerBar(
-            label: "TEC input",
+            label: "TEC consumption",
             valueText: stale ? "—" : String(format: "%.1f W", estimate.tecInputPowerW),
             ratio: tecRatio,
             tint: BSL.nir

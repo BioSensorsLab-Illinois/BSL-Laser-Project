@@ -1914,17 +1914,41 @@ static bool laser_controller_comms_wait_for_supply_state(
 
 static bool laser_controller_comms_is_runtime_control_command(const char *command)
 {
+    /*
+     * 2026-04-20: `operate.set_target`, `set_target_temp`, and
+     * `set_target_lambda` are NO LONGER in this set. They stage the TEC
+     * target and have no laser-fire semantics — the DeployBar in the iOS
+     * app (and the host console Operate workspace) issues
+     * `operate.set_target` BEFORE `deployment.enter` to lock the
+     * operator's wavelength into the deployment snapshot. Blocking it
+     * until ready-idle would break that arm gesture. Target staging while
+     * `deployment.running` is still guarded below as a separate check
+     * because mutating the target mid-checklist would drift the
+     * TEC_SETTLE step.
+     */
     return command != NULL &&
            (strcmp(command, "set_laser_power") == 0 ||
             strcmp(command, "set_max_current") == 0 ||
-            strcmp(command, "set_target_temp") == 0 ||
-            strcmp(command, "set_target_lambda") == 0 ||
-            strcmp(command, "operate.set_target") == 0 ||
             strcmp(command, "operate.set_output") == 0 ||
             strcmp(command, "operate.set_modulation") == 0 ||
             strcmp(command, "laser_output_enable") == 0 ||
             strcmp(command, "laser_output_disable") == 0 ||
             strcmp(command, "configure_modulation") == 0);
+}
+
+/*
+ * Target-staging commands. These only mutate bench TEC target (temp or
+ * wavelength) — no laser fire. They are allowed pre-deployment so the host
+ * / iOS app can lock the operator's staged wavelength before arming. They
+ * are still rejected while `deployment.running` because mid-checklist
+ * target drift would starve the TEC_SETTLE step.
+ */
+static bool laser_controller_comms_is_target_stage_command(const char *command)
+{
+    return command != NULL &&
+           (strcmp(command, "set_target_temp") == 0 ||
+            strcmp(command, "set_target_lambda") == 0 ||
+            strcmp(command, "operate.set_target") == 0);
 }
 
 /*
@@ -2554,7 +2578,7 @@ static void laser_controller_comms_write_snapshot_json(
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        "\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"horizonThresholdDeg\":%.2f,\"horizonHysteresisDeg\":%.2f,\"tofMinRangeM\":%.3f,\"tofMaxRangeM\":%.3f,\"tofHysteresisM\":%.3f,\"imuStaleMs\":%lu,\"tofStaleMs\":%lu,\"railGoodTimeoutMs\":%lu,\"lambdaDriftLimitNm\":%.2f,\"lambdaDriftHysteresisNm\":%.2f,\"lambdaDriftHoldMs\":%lu,\"ldOvertempLimitC\":%.2f,\"tecTempAdcTripV\":%.3f,\"tecTempAdcHysteresisV\":%.3f,\"tecTempAdcHoldMs\":%lu,\"tecMinCommandC\":%.2f,\"tecMaxCommandC\":%.2f,\"tecReadyToleranceC\":%.2f,\"maxLaserCurrentA\":%.2f,\"offCurrentThresholdA\":%.2f,\"maxTofLedDutyCyclePct\":%u,\"lioVoltageOffsetV\":%.4f,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f,\"interlocks\":{\"horizonEnabled\":%s,\"distanceEnabled\":%s,\"lambdaDriftEnabled\":%s,\"tecTempAdcEnabled\":%s,\"imuInvalidEnabled\":%s,\"imuStaleEnabled\":%s,\"tofInvalidEnabled\":%s,\"tofStaleEnabled\":%s,\"ldOvertempEnabled\":%s,\"ldLoopBadEnabled\":%s,\"tofLowBoundOnly\":%s}},",
+        "\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"horizonThresholdDeg\":%.2f,\"horizonHysteresisDeg\":%.2f,\"tofMinRangeM\":%.3f,\"tofMaxRangeM\":%.3f,\"tofHysteresisM\":%.3f,\"imuStaleMs\":%lu,\"tofStaleMs\":%lu,\"railGoodTimeoutMs\":%lu,\"lambdaDriftLimitNm\":%.2f,\"lambdaDriftHysteresisNm\":%.2f,\"lambdaDriftHoldMs\":%lu,\"ldOvertempLimitC\":%.2f,\"tecTempAdcTripV\":%.3f,\"tecTempAdcHysteresisV\":%.3f,\"tecTempAdcHoldMs\":%lu,\"tecMinCommandC\":%.2f,\"tecMaxCommandC\":%.2f,\"tecReadyToleranceC\":%.2f,\"maxLaserCurrentA\":%.2f,\"offCurrentThresholdA\":%.2f,\"maxTofLedDutyCyclePct\":%u,\"lioVoltageOffsetV\":%.4f,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f,\"interlocks\":{\"horizonEnabled\":%s,\"distanceEnabled\":%s,\"lambdaDriftEnabled\":%s,\"tecTempAdcEnabled\":%s,\"imuInvalidEnabled\":%s,\"imuStaleEnabled\":%s,\"tofInvalidEnabled\":%s,\"tofStaleEnabled\":%s,\"ldOvertempEnabled\":%s,\"ldLoopBadEnabled\":%s,\"tofLowBoundOnly\":%s},\"autoDeployOnBoot\":%s},",
         status->decision.allow_alignment ? "true" : "false",
         status->decision.allow_nir ? "true" : "false",
         status->decision.horizon_blocked ? "true" : "false",
@@ -2597,7 +2621,10 @@ static void laser_controller_comms_write_snapshot_json(
         status->config.thresholds.interlocks.tof_stale_enabled ? "true" : "false",
         status->config.thresholds.interlocks.ld_overtemp_enabled ? "true" : "false",
         status->config.thresholds.interlocks.ld_loop_bad_enabled ? "true" : "false",
-        status->config.thresholds.interlocks.tof_low_bound_only ? "true" : "false");
+        status->config.thresholds.interlocks.tof_low_bound_only ? "true" : "false",
+        (status->config.service_flags &
+         LASER_CONTROLLER_SERVICE_FLAG_AUTO_DEPLOY_ON_BOOT) != 0U ?
+            "true" : "false");
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
@@ -2918,7 +2945,7 @@ static void laser_controller_comms_write_command_snapshot_json(
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        "\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"horizonThresholdDeg\":%.2f,\"horizonHysteresisDeg\":%.2f,\"tofMinRangeM\":%.3f,\"tofMaxRangeM\":%.3f,\"tofHysteresisM\":%.3f,\"imuStaleMs\":%lu,\"tofStaleMs\":%lu,\"railGoodTimeoutMs\":%lu,\"lambdaDriftLimitNm\":%.2f,\"lambdaDriftHysteresisNm\":%.2f,\"lambdaDriftHoldMs\":%lu,\"ldOvertempLimitC\":%.2f,\"tecTempAdcTripV\":%.3f,\"tecTempAdcHysteresisV\":%.3f,\"tecTempAdcHoldMs\":%lu,\"tecMinCommandC\":%.2f,\"tecMaxCommandC\":%.2f,\"tecReadyToleranceC\":%.2f,\"maxLaserCurrentA\":%.2f,\"offCurrentThresholdA\":%.2f,\"maxTofLedDutyCyclePct\":%u,\"lioVoltageOffsetV\":%.4f,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f,\"interlocks\":{\"horizonEnabled\":%s,\"distanceEnabled\":%s,\"lambdaDriftEnabled\":%s,\"tecTempAdcEnabled\":%s,\"imuInvalidEnabled\":%s,\"imuStaleEnabled\":%s,\"tofInvalidEnabled\":%s,\"tofStaleEnabled\":%s,\"ldOvertempEnabled\":%s,\"ldLoopBadEnabled\":%s,\"tofLowBoundOnly\":%s}},",
+        "\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"horizonThresholdDeg\":%.2f,\"horizonHysteresisDeg\":%.2f,\"tofMinRangeM\":%.3f,\"tofMaxRangeM\":%.3f,\"tofHysteresisM\":%.3f,\"imuStaleMs\":%lu,\"tofStaleMs\":%lu,\"railGoodTimeoutMs\":%lu,\"lambdaDriftLimitNm\":%.2f,\"lambdaDriftHysteresisNm\":%.2f,\"lambdaDriftHoldMs\":%lu,\"ldOvertempLimitC\":%.2f,\"tecTempAdcTripV\":%.3f,\"tecTempAdcHysteresisV\":%.3f,\"tecTempAdcHoldMs\":%lu,\"tecMinCommandC\":%.2f,\"tecMaxCommandC\":%.2f,\"tecReadyToleranceC\":%.2f,\"maxLaserCurrentA\":%.2f,\"offCurrentThresholdA\":%.2f,\"maxTofLedDutyCyclePct\":%u,\"lioVoltageOffsetV\":%.4f,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f,\"interlocks\":{\"horizonEnabled\":%s,\"distanceEnabled\":%s,\"lambdaDriftEnabled\":%s,\"tecTempAdcEnabled\":%s,\"imuInvalidEnabled\":%s,\"imuStaleEnabled\":%s,\"tofInvalidEnabled\":%s,\"tofStaleEnabled\":%s,\"ldOvertempEnabled\":%s,\"ldLoopBadEnabled\":%s,\"tofLowBoundOnly\":%s},\"autoDeployOnBoot\":%s},",
         status->decision.allow_alignment ? "true" : "false",
         status->decision.allow_nir ? "true" : "false",
         status->decision.horizon_blocked ? "true" : "false",
@@ -2961,7 +2988,10 @@ static void laser_controller_comms_write_command_snapshot_json(
         status->config.thresholds.interlocks.tof_stale_enabled ? "true" : "false",
         status->config.thresholds.interlocks.ld_overtemp_enabled ? "true" : "false",
         status->config.thresholds.interlocks.ld_loop_bad_enabled ? "true" : "false",
-        status->config.thresholds.interlocks.tof_low_bound_only ? "true" : "false");
+        status->config.thresholds.interlocks.tof_low_bound_only ? "true" : "false",
+        (status->config.service_flags &
+         LASER_CONTROLLER_SERVICE_FLAG_AUTO_DEPLOY_ON_BOOT) != 0U ?
+            "true" : "false");
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
@@ -3135,7 +3165,7 @@ static void laser_controller_comms_write_live_telemetry_json(
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        "\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f,\"interlocks\":{\"horizonEnabled\":%s,\"distanceEnabled\":%s,\"lambdaDriftEnabled\":%s,\"tecTempAdcEnabled\":%s,\"imuInvalidEnabled\":%s,\"imuStaleEnabled\":%s,\"tofInvalidEnabled\":%s,\"tofStaleEnabled\":%s,\"ldOvertempEnabled\":%s,\"ldLoopBadEnabled\":%s,\"tofLowBoundOnly\":%s}},",
+        "\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f,\"interlocks\":{\"horizonEnabled\":%s,\"distanceEnabled\":%s,\"lambdaDriftEnabled\":%s,\"tecTempAdcEnabled\":%s,\"imuInvalidEnabled\":%s,\"imuStaleEnabled\":%s,\"tofInvalidEnabled\":%s,\"tofStaleEnabled\":%s,\"ldOvertempEnabled\":%s,\"ldLoopBadEnabled\":%s,\"tofLowBoundOnly\":%s},\"autoDeployOnBoot\":%s},",
         status->decision.allow_alignment ? "true" : "false",
         status->decision.allow_nir ? "true" : "false",
         status->decision.horizon_blocked ? "true" : "false",
@@ -3156,7 +3186,10 @@ static void laser_controller_comms_write_live_telemetry_json(
         status->config.thresholds.interlocks.tof_stale_enabled ? "true" : "false",
         status->config.thresholds.interlocks.ld_overtemp_enabled ? "true" : "false",
         status->config.thresholds.interlocks.ld_loop_bad_enabled ? "true" : "false",
-        status->config.thresholds.interlocks.tof_low_bound_only ? "true" : "false");
+        status->config.thresholds.interlocks.tof_low_bound_only ? "true" : "false",
+        (status->config.service_flags &
+         LASER_CONTROLLER_SERVICE_FLAG_AUTO_DEPLOY_ON_BOOT) != 0U ?
+            "true" : "false");
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
@@ -3369,7 +3402,7 @@ static void laser_controller_comms_write_live_snapshot_json(
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
-        "\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f,\"interlocks\":{\"horizonEnabled\":%s,\"distanceEnabled\":%s,\"lambdaDriftEnabled\":%s,\"tecTempAdcEnabled\":%s,\"imuInvalidEnabled\":%s,\"imuStaleEnabled\":%s,\"tofInvalidEnabled\":%s,\"tofStaleEnabled\":%s,\"ldOvertempEnabled\":%s,\"ldLoopBadEnabled\":%s,\"tofLowBoundOnly\":%s}},",
+        "\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f,\"interlocks\":{\"horizonEnabled\":%s,\"distanceEnabled\":%s,\"lambdaDriftEnabled\":%s,\"tecTempAdcEnabled\":%s,\"imuInvalidEnabled\":%s,\"imuStaleEnabled\":%s,\"tofInvalidEnabled\":%s,\"tofStaleEnabled\":%s,\"ldOvertempEnabled\":%s,\"ldLoopBadEnabled\":%s,\"tofLowBoundOnly\":%s},\"autoDeployOnBoot\":%s},",
         status->decision.allow_alignment ? "true" : "false",
         status->decision.allow_nir ? "true" : "false",
         status->decision.horizon_blocked ? "true" : "false",
@@ -3390,7 +3423,10 @@ static void laser_controller_comms_write_live_snapshot_json(
         status->config.thresholds.interlocks.tof_stale_enabled ? "true" : "false",
         status->config.thresholds.interlocks.ld_overtemp_enabled ? "true" : "false",
         status->config.thresholds.interlocks.ld_loop_bad_enabled ? "true" : "false",
-        status->config.thresholds.interlocks.tof_low_bound_only ? "true" : "false");
+        status->config.thresholds.interlocks.tof_low_bound_only ? "true" : "false",
+        (status->config.service_flags &
+         LASER_CONTROLLER_SERVICE_FLAG_AUTO_DEPLOY_ON_BOOT) != 0U ?
+            "true" : "false");
 
     laser_controller_comms_buffer_append_fmt(
         buffer,
@@ -4018,7 +4054,7 @@ static void laser_controller_comms_emit_bench_status_response(
     if (include_safety) {
         laser_controller_comms_buffer_append_fmt(
             &buffer,
-            ",\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"horizonThresholdDeg\":%.2f,\"horizonHysteresisDeg\":%.2f,\"tofMinRangeM\":%.3f,\"tofMaxRangeM\":%.3f,\"tofHysteresisM\":%.3f,\"imuStaleMs\":%lu,\"tofStaleMs\":%lu,\"railGoodTimeoutMs\":%lu,\"lambdaDriftLimitNm\":%.2f,\"lambdaDriftHysteresisNm\":%.2f,\"lambdaDriftHoldMs\":%lu,\"ldOvertempLimitC\":%.2f,\"tecTempAdcTripV\":%.3f,\"tecTempAdcHysteresisV\":%.3f,\"tecTempAdcHoldMs\":%lu,\"tecMinCommandC\":%.2f,\"tecMaxCommandC\":%.2f,\"tecReadyToleranceC\":%.2f,\"maxLaserCurrentA\":%.2f,\"offCurrentThresholdA\":%.2f,\"maxTofLedDutyCyclePct\":%u,\"lioVoltageOffsetV\":%.4f,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f,\"interlocks\":{\"horizonEnabled\":%s,\"distanceEnabled\":%s,\"lambdaDriftEnabled\":%s,\"tecTempAdcEnabled\":%s,\"imuInvalidEnabled\":%s,\"imuStaleEnabled\":%s,\"tofInvalidEnabled\":%s,\"tofStaleEnabled\":%s,\"ldOvertempEnabled\":%s,\"ldLoopBadEnabled\":%s,\"tofLowBoundOnly\":%s}}",
+            ",\"safety\":{\"allowAlignment\":%s,\"allowNir\":%s,\"horizonBlocked\":%s,\"distanceBlocked\":%s,\"lambdaDriftBlocked\":%s,\"tecTempAdcBlocked\":%s,\"horizonThresholdDeg\":%.2f,\"horizonHysteresisDeg\":%.2f,\"tofMinRangeM\":%.3f,\"tofMaxRangeM\":%.3f,\"tofHysteresisM\":%.3f,\"imuStaleMs\":%lu,\"tofStaleMs\":%lu,\"railGoodTimeoutMs\":%lu,\"lambdaDriftLimitNm\":%.2f,\"lambdaDriftHysteresisNm\":%.2f,\"lambdaDriftHoldMs\":%lu,\"ldOvertempLimitC\":%.2f,\"tecTempAdcTripV\":%.3f,\"tecTempAdcHysteresisV\":%.3f,\"tecTempAdcHoldMs\":%lu,\"tecMinCommandC\":%.2f,\"tecMaxCommandC\":%.2f,\"tecReadyToleranceC\":%.2f,\"maxLaserCurrentA\":%.2f,\"offCurrentThresholdA\":%.2f,\"maxTofLedDutyCyclePct\":%u,\"lioVoltageOffsetV\":%.4f,\"actualLambdaNm\":%.2f,\"targetLambdaNm\":%.2f,\"lambdaDriftNm\":%.2f,\"tempAdcVoltageV\":%.3f,\"interlocks\":{\"horizonEnabled\":%s,\"distanceEnabled\":%s,\"lambdaDriftEnabled\":%s,\"tecTempAdcEnabled\":%s,\"imuInvalidEnabled\":%s,\"imuStaleEnabled\":%s,\"tofInvalidEnabled\":%s,\"tofStaleEnabled\":%s,\"ldOvertempEnabled\":%s,\"ldLoopBadEnabled\":%s,\"tofLowBoundOnly\":%s},\"autoDeployOnBoot\":%s}",
             status->decision.allow_alignment ? "true" : "false",
             status->decision.allow_nir ? "true" : "false",
             status->decision.horizon_blocked ? "true" : "false",
@@ -4061,7 +4097,10 @@ static void laser_controller_comms_emit_bench_status_response(
             status->config.thresholds.interlocks.tof_stale_enabled ? "true" : "false",
             status->config.thresholds.interlocks.ld_overtemp_enabled ? "true" : "false",
             status->config.thresholds.interlocks.ld_loop_bad_enabled ? "true" : "false",
-            status->config.thresholds.interlocks.tof_low_bound_only ? "true" : "false");
+            status->config.thresholds.interlocks.tof_low_bound_only ? "true" : "false",
+            (status->config.service_flags &
+             LASER_CONTROLLER_SERVICE_FLAG_AUTO_DEPLOY_ON_BOOT) != 0U ?
+                "true" : "false");
     }
 
     laser_controller_comms_buffer_append_fmt(
@@ -4345,6 +4384,22 @@ static bool laser_controller_comms_extract_bool(
 
     if (match == NULL || value == NULL) {
         return false;
+    }
+
+    /*
+     * 2026-04-20: skip any whitespace between `:` and the value. The
+     * fast-path `strstr(line, key)` in `find_value_start` returns a pointer
+     * right after the literal key (including the colon), so pretty-printed
+     * JSON like `"key": true` would land `match` on a leading space and
+     * the strncmp below would silently fail — the bool field would
+     * appear to not be present. `extract_float` / `extract_uint` use
+     * `strtof`/`strtoul` which skip whitespace natively, so only the bool
+     * path needed the fix.
+     */
+    while (*match != '\0' &&
+           (*match == ' ' || *match == '\t' ||
+            *match == '\r' || *match == '\n')) {
+        ++match;
     }
 
     if (*match == '\"') {
@@ -5170,6 +5225,20 @@ static void laser_controller_comms_handle_command_line(const char *line)
         return;
     }
 
+    /*
+     * 2026-04-20: target-staging commands are allowed pre-deployment so
+     * the host can stage the operator's wavelength before arming. Still
+     * rejected while the checklist is actively running to protect
+     * TEC_SETTLE from a mid-tick target change.
+     */
+    if (laser_controller_comms_is_target_stage_command(command) &&
+        status.deployment.running) {
+        laser_controller_comms_emit_error_response(
+            id,
+            "Target staging is blocked while the deployment checklist is running.");
+        return;
+    }
+
     if (strcmp(command, "set_runtime_mode") == 0 ||
         strcmp(command, "operate.set_mode") == 0) {
         laser_controller_runtime_mode_t runtime_mode =
@@ -5832,6 +5901,32 @@ static void laser_controller_comms_handle_command_line(const char *line)
         if (laser_controller_comms_extract_float(
                 line, "\"lio_voltage_offset_v\":", &value_f)) {
             policy.thresholds.lio_voltage_offset_v = value_f;
+        }
+
+        /*
+         * Auto-deploy-on-boot service flag (2026-04-20 user directive).
+         * Stored in `config.service_flags` bitmap so the NVS blob stays
+         * layout-stable. Absent field leaves current setting; an explicit
+         * false clears the bit.
+         */
+        {
+            bool value_b = false;
+            if (laser_controller_comms_extract_bool(
+                    line, "\"auto_deploy_on_boot\":", &value_b)) {
+                /*
+                 * `policy` carries a snapshot of thresholds+timeouts only;
+                 * service_flags is applied via a separate setter path after
+                 * the main apply succeeds.
+                 */
+                if (value_b) {
+                    status.config.service_flags |=
+                        LASER_CONTROLLER_SERVICE_FLAG_AUTO_DEPLOY_ON_BOOT;
+                } else {
+                    status.config.service_flags &=
+                        ~LASER_CONTROLLER_SERVICE_FLAG_AUTO_DEPLOY_ON_BOOT;
+                }
+                laser_controller_app_set_service_flags(status.config.service_flags);
+            }
         }
 
         /*

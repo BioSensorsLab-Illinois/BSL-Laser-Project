@@ -1430,6 +1430,120 @@ Outstanding:
 - `python3 .claude/hooks/mark-audit-done.py firmware` — run after this write.
 - `python3 .claude/hooks/mark-audit-done.py gui` — run after this write.
 
+## 2026-04-20 — Arm-flow + BSLRemote telemetry + auto-deploy flag
+
+### User-reported issues addressed
+- **Firmware #3 / iOS #7 — interlock selection "unable to change nor save"**: root cause was an iOS UI race, not firmware. Every 1 s `live_telemetry` tick ran `onChange(of: safety.interlocks)` which clobbered the operator's mid-edit mask with the firmware's current (pre-apply) state. Now gated on `!applying && !dirty` in `ios/BSLRemote/Views/Settings/InterlockToggles.swift:55-67`. Same fix applied to `SafetyParametersForm.swift:53-58` (same pattern, same bug).
+- **iOS #1 — arming throws "complete the deployment checklist" error**: the BSLRemote DeployBar stages the operator's wavelength via `operate.set_target` BEFORE `deployment.enter`, but the firmware lumped `operate.set_target` with runtime-control commands that require `deployment.active && deployment.ready`. Firmware fix separates target-staging from runtime-control at `laser_controller_comms.c::is_target_stage_command`; target staging is now rejected ONLY while `deployment.running`. UI also treats the rejection as expected while the firmware hasn't flashed yet (`ios/BSLRemote/State/DeviceSession.swift::isExpectedGatingRejection` +1 command).
+- **iOS #2 — laser power adjust "stuck at same power"**: `NirHeroCard.commit()` gated on `blockedReason == .none`, which returns `not-modulated-host` in the default binary_trigger mode even when staging is actually accepted by firmware. Gate removed in `ios/BSLRemote/Views/Cards/NirHeroCard.swift:167-196` and `PowerCard.swift:56-90` (power slider now gated on `stale` only; direct host-enable button still gated on `blocked`).
+- **iOS #3 / #4 — telemetry refresh slow + power readback inaccurate during boot**: iOS transport was dropping `fast_telemetry` frames entirely (4-5 Hz compact numeric patches that the host console already decodes). Added `FastTelemetryPatch` parser at `ios/BSLProtocol/Sources/BSLProtocol/Models/Envelope.swift` mirroring `host-console/src/lib/controller-protocol.ts::decodeFastTelemetryPayload`, plus a sparse overlay `DeviceSnapshot.applying(fastTelemetry:)` at `ios/BSLProtocol/Sources/BSLProtocol/Models/SnapshotMerge.swift`, hooked in `ios/BSLRemote/State/DeviceSession.swift::ingest`. Key readouts (NIR measured current, TEC temp, beam posture, ToF distance, safety decision bits, button press) now refresh at the firmware's 4-5 Hz cadence.
+- **iOS #5 — rename Power section "input" → "Consumption"**: `ios/BSLRemote/Views/Cards/PowerRailCard.swift` — `LD input` → `LD consumption`, `TEC input` → `TEC consumption`, + docstring update.
+- **iOS #6 — lock safety page when armed**: added `safetyLocked` computed property in `ios/BSLRemote/Views/Settings/SettingsView.swift::firmwarePolicyGroup`; rows disable + show "Locked while laser is armed — disarm to edit" when `snapshot.laserMode != .disarmed`. Firmware already rejected the corresponding writes but the operator now sees the lock at the UI level.
+- **Firmware #2 — auto-enter deployment on boot**: added `LASER_CONTROLLER_SERVICE_FLAG_AUTO_DEPLOY_ON_BOOT` (bit 0 of `config.service_flags`, see `include/laser_controller_config.h`). When set, `start()` latches `auto_deploy_pending=true`; the next clean-idle control-task tick raises `auto_deploy_requested` which the existing end-of-tick handler consumes to call `enter_deployment_mode` + `run_deployment_sequence`. Persisted via a standalone NVS u32 key `svc_flags` (namespace `laser_ctrl`) — avoids touching the v5/v6 profile migration chain. Settable via `integrate.set_safety { "auto_deploy_on_boot": true }`. Emitted in all four safety-JSON writers as `safety.autoDeployOnBoot`. Deferred: a "skip-peripheral-checks" fast-deployment mode (user also asked for this but it needs powered-bench validation before shipping).
+- **Firmware #1 — RGB LED stuck blue + no NIR on stage2**: not independently fixed in this session. Hypothesis (unverified without bench): cascade from iOS #2 — if the operator adjusted current via iOS and the stage was silently dropped, `bench.high_state_current_a` could still read zero and a stage2 press would fire NIR at 0 A (invisible). Fixing iOS #2 removes this failure mode. If the LED-stuck-blue + no-NIR symptom persists after the iOS fix, next suspect is `last_inputs.ld_rail_pgood` failing to stay true through ready-idle while the LED priority check at `app.c:2693-2701` reads stale state. Needs bench scoping on GPIO18 + a control-task diagnostic emit.
+
+### Firmware changes (applied, build PASS, 2% app partition free)
+- `components/laser_controller/include/laser_controller_config.h` — added `LASER_CONTROLLER_SERVICE_FLAG_AUTO_DEPLOY_ON_BOOT (1U << 0)` macro + docstring on `service_flags`.
+- `components/laser_controller/include/laser_controller_app.h` — added `laser_controller_app_set_service_flags(uint32_t)` public setter.
+- `components/laser_controller/include/laser_controller_service.h` — added `laser_controller_service_set_service_flags` / `laser_controller_service_load_service_flags` pair.
+- `components/laser_controller/src/laser_controller_service.c` — added `LASER_CONTROLLER_SERVICE_FLAGS_NVS_KEY "svc_flags"`, save/load via `nvs_set_u32` / `nvs_get_u32` on the existing `laser_ctrl` namespace.
+- `components/laser_controller/src/laser_controller_app.c` — added context fields `auto_deploy_pending` / `auto_deploy_armed` / `auto_deploy_requested`; `start()` loads `service_flags` from NVS and latches the pending flag; `apply_button_board_policy` arms the request at first clean-idle tick; end-of-tick handler calls `enter_deployment_mode` + `run_deployment_sequence`; `laser_controller_app_set_service_flags` updates `s_context.config.service_flags` under `s_context_lock` and calls the service-layer NVS setter.
+- `components/laser_controller/src/laser_controller_comms.c` — separated `operate.set_target` / `set_target_temp` / `set_target_lambda` into new `is_target_stage_command` classifier; removed them from `is_runtime_control_command`; new gate rejects only while `deployment.running`. Accepted `auto_deploy_on_boot` in `integrate.set_safety` parser. Added `autoDeployOnBoot` field to all five safety-JSON emitters (full status + two status_snapshot writers + live_telemetry + live_snapshot broadcast).
+
+### Host-console changes
+- `host-console/src/lib/mock-transport.ts` — mock target-staging gate updated from `this.state.deployment.ready` to `!this.state.deployment.running` so the mock no longer diverges from firmware semantics. Three `case` blocks: `set_target_temp`, `operate.set_target`, `set_target_lambda`.
+
+### iOS changes (BSLRemote + BSLProtocol)
+- `ios/BSLProtocol/Sources/BSLProtocol/Models/Envelope.swift` — added `FastTelemetryPatch` struct + `parse(payload:)`; added `.fastTelemetry(patch:)` case to `InboundFrame`; extended `FrameParser.parse` to dispatch `event == "fast_telemetry"` frames.
+- `ios/BSLProtocol/Sources/BSLProtocol/Models/SnapshotMerge.swift` — added `DeviceSnapshot.applying(fastTelemetry:)` helper that overlays only the fields the compact frame carries.
+- `ios/BSLRemote/State/DeviceSession.swift` — `ingest(frame:)` now handles `.fastTelemetry`; `isExpectedGatingRejection` now also filters `operate.set_target` pre-deploy rejections.
+- `ios/BSLRemote/Views/Cards/PowerRailCard.swift` — `LD input` → `LD consumption`, `TEC input` → `TEC consumption` + doc.
+- `ios/BSLRemote/Views/Cards/NirHeroCard.swift` — removed `guard blockedReason == .none else { return }` from `commit()`.
+- `ios/BSLRemote/Views/Cards/PowerCard.swift` — slider disabled only on `stale`, not `blocked`; direct host-enable button still gated on `blocked`.
+- `ios/BSLRemote/Views/Settings/InterlockToggles.swift` — `onChange` now requires `!applying && !dirty` before adopting firmware state.
+- `ios/BSLRemote/Views/Settings/SafetyParametersForm.swift` — same fix, same rationale.
+- `ios/BSLRemote/Views/Settings/SettingsView.swift` — `safetyLocked` computed property blocks navigation to Safety parameters / Active interlocks rows when the laser is not `.disarmed`.
+
+### Builds
+- `. /Users/zz4/esp/esp-idf/export.sh && idf.py build` — **PASS**. Binary 0xfaaa0 bytes, 2% free (tight; flag for future tracking).
+- `cd host-console && npm run build` — **PASS**. 803.81 kB bundle.
+- `cd ios/BSLProtocol && swift build` — **PASS**.
+- iOS BSLRemote app full build: NOT RUN — no Xcode on this host (Command Line Tools only). Parse-check via `swiftc -parse` on all modified iOS files returned zero errors / warnings. User will need to build + run the app in Xcode to exercise the fixes on-device.
+
+### Cross-module audit evidence — 2026-04-20
+- **B1 (firmware logic, `bsl-firmware-auditor`)** — **PASS**. All five invariants hold: threading (auto-deploy fields written only by main-task `start()` before control task creation + control-task `apply_button_board_policy`/`run_fast_cycle`; `service_flags` write is under `s_context_lock`), state machine (arming guard excludes `BOOT_INIT` + `SERVICE_MODE`; reuses existing `enter_deployment_mode` path), GPIO6 unchanged (no diff against `board.c`), deployment + faults (new `is_target_stage_command` correctly blocks only `deployment.running`; auto-deploy enter/run is already idempotent), command gating (target staging reachable pre-deployment is safe — no rail drive from target fields until checklist completes). Non-blocking notes: arming guard could also exclude `decision.alignment_output_enable == true` for full symmetry with the button-deploy path; consider deferring `set_service_flags` write until AFTER policy validation in the `integrate.set_safety` handler so a split-persistence window does not exist. Neither is load-bearing for safety.
+- **B3 (protocol, `bsl-protocol-auditor`)** — **FAIL → REMEDIATED**. Eight findings; this session addressed #1 (firmware emitter for `autoDeployOnBoot` in all four safety JSON writers — **done**), #4 (mock-transport gate drift for target-staging — **done**), #6 (`operate.set_target` row in `docs/protocol-spec.md` — **done**), #7 (`auto_deploy_on_boot` + `autoDeployOnBoot` doc in `docs/protocol-spec.md` — **done**). Remaining for next session: #2 (host `types.ts` add `autoDeployOnBoot: boolean`), #3 (mock-transport `integrate.set_safety` handler for `auto_deploy_on_boot`), #5 (validation-harness scenario for pre-deploy target staging + mid-running rejection), #8 (iOS `SafetyStatus.swift` add `autoDeployOnBoot` + UI toggle). #9 fast-telemetry decoder parity with host-console decoder — **VERIFIED in audit, no drift, intentionally omits `beamPitchLimitDeg` / `beamYawRelative` (static topology, read from snapshot)**.
+- **B2 (GPIO ownership, `bsl-gpio-auditor`)** — not spawned; diff contains no GPIO / ADC / PWM / I2C / SPI / sideband writes.
+- **A1 / A2 / A3 (GUI reviewers)** — not spawned; host-console changes are mock-transport internals only (no rendered-page surface touched). iOS changes are the primary UI surface but no Uncodixfy reviewer exists for SwiftUI; manual review by the operator on-device is the current validation path.
+- **C1 (powered bench, `bsl-bench-validator`)** — **BLOCKED**. No powered TEC + LD bench attached this session. The three mandatory passes (`aux-control-pass`, `ready-runtime-pass`, `fault-edge-pass`) and a new-scenario candidate `target-staging-gate-pass` have NOT been run on this image.
+
+### Milestone verdict — 2026-04-20
+**NOT READY.** Powered Phase 2 has not been run on this image. Current evidence: firmware build PASS (0xfaaa0 bytes, 2% free), host build PASS, BSLProtocol build PASS, B1 audit PASS, B3 audit FAIL→partially-remediated (host types.ts + ios SafetyStatus.swift + mock-transport set_safety handler + validation harness scenario all outstanding), B2/A1/A2/A3 not triggered, C1 BLOCKED on bench.
+
+### Outstanding
+- Flash the rebuilt firmware onto the Wi-Fi-connected board once serial is available; run `/validate-powered` three mandatory scenarios + exercise `operate.set_target` pre-deploy and pre-running to confirm the new gate behavior.
+- Finish B3 remediation: add `autoDeployOnBoot` to `host-console/src/types.ts SafetyStatus`, mirror in `ios/BSLProtocol/Sources/BSLProtocol/Models/SafetyStatus.swift`, extend `host-console/src/lib/mock-transport.ts integrate.set_safety` handler, add `target-staging-gate-pass` scenario to `host-console/scripts/live_controller_validation.py`.
+- On-device bench verification that firmware #1 (stuck-blue RGB + no NIR) is resolved by the iOS #2 power-staging fix. If the symptom persists, next suspect is `last_inputs.ld_rail_pgood` transient drops through ready-idle — will need scope on GPIO18 + a diagnostic emit.
+- The fast-deployment ("skip peripheral checks") half of firmware #2 is deferred; current auto-deploy still runs the full checklist. User reported the checklist-speed goal separately. Addressing that requires either shortening `TEC_SETTLE` tolerance (safety-adjacent) or making peripheral-verify instantly pass when `config.thresholds.interlocks.imu_*_enabled` and `tof_*_enabled` are all false. Needs design review + bench validation.
+
+### Sentinel hygiene
+- `python3 .claude/hooks/mark-audit-done.py firmware` — run after this write.
+- `python3 .claude/hooks/mark-audit-done.py gui` — run after this write.
+
+## 2026-04-20 (afternoon) — TEC LUT fix + checklist-progress UI + NIR-setpoint rearm restore
+
+### User-reported issues addressed
+
+- **iOS #2 — checklist progress indication**: `DeployBar` now shows concrete step labels (e.g. `Settling TEC to target`, `Sequencing TEC → LD rails`, `Locking LD driver loop`) with an `N / 11` counter and a determinate progress fill derived from `deployment.currentStepIndex`. New `DeploymentStepLabel` helper in `ios/BSLProtocol/Sources/BSLProtocol/Models/DeviceSnapshot.swift` maps firmware step keys (`OWNERSHIP_RECLAIM` … `READY_POSTURE`) to operator-facing labels. `DeploymentSnapshot` gained `currentStepKey / currentStepIndex / lastCompletedStepKey / sequenceId / failed / primaryFailureCode / primaryFailureReason`; `SnapshotMerge.swift` passes them through in the overlay.
+- **iOS #4 — NIR setpoint not remembered across disarm/rearm**: `NirHeroCard` now observes `snapshot.deployment.readyIdle` transitions. On a fresh ready-idle tick, if the firmware's `bench.requestedCurrentA` is ~0 but `DeviceSession.persistedNirSetpointA` is populated, the slider restores the remembered value and fires `operate.set_output { enable:false, current_a:remembered }` to stage the setpoint. Prevents the cascade where the operator's remembered current was silently lost across rearm.
+- **Firmware / iOS #3 — TEC actual settles at wrong °C**: root cause is firmware, not the GUI — `laser_controller_deployment_target_temp_to_voltage_v` and `laser_controller_board_apply_actuator_targets` commanded `voltage_v = target_temp_c * 0.03846` (linear). But the bench-calibrated `kTecTempCalibration` LUT in `laser_controller_board.c:272-287` is non-linear: at target=25 °C the linear path commands 0.96 V, which the TEC driver's thermistor loop regulates to the 0.96 V anchor — which the same LUT maps back to ≈28 °C. Persistent 2–4 °C plate-temp offset. Added public `laser_controller_board_tec_target_voltage_from_temp_c` (reverse LUT lookup) in `laser_controller_board.c` + `laser_controller_board.h`. Both command paths now default to LUT-reverse; an explicit non-zero `config.analog.tec_command_volts_per_c` still wins as a per-unit calibration override. `config_load_defaults` changed the default from `0.03846f` → `0.0f` so the LUT wins by default.
+- **Firmware / iOS #1 — stuck-blue RGB + no NIR right after checklist pass, self-resolves**: diagnosed (not fixed) as a cascade. `safety.c::decision->request_nir` sets `driver_operate_expected = (sbdn_state == ON && !select_driver_low_current)`. When stage2 is pressed, PCN goes high (full-current), `driver_operate_expected=true`, and if the commanded current is 0 A the TEC/LD driver cannot lock its loop → `driver_loop_good=false` → `FAULT_LD_LOOP_BAD` auto-clear fault → NIR blocked for that tick. "After a while it's fine" = the operator has since set a non-zero current. Fixing iOS #4 (NIR setpoint restore) closes the observable symptom. The LED-stuck-blue half matches the same root: `app.c:2693-2701` armed-green priority requires `tec_temp_good`, which can bounce false briefly as the TEC's TEMPGD pin hunts around setpoint after ready-idle. No grace window added in firmware this pass — LED cosmetic, and the NIR-blocking part is resolved by iOS #4.
+
+### Defensive hardening (partial revert)
+
+- `laser_controller_comms.c::extract_bool` now skips whitespace between `:` and the value before attempting to match `true` / `false`. Other `extract_*` helpers use `strtof` / `strtoul` which skip whitespace natively; this plugs a silent-failure path if any future client emits pretty-printed JSON.
+- `laser_controller_wireless.c::LASER_CONTROLLER_WIRELESS_MAX_FRAME_LEN` temporarily bumped 2048 → 4096 during triage, then **reverted to 2048** on the B1 audit finding. The httpd task uses `HTTPD_DEFAULT_CONFIG` with a 4096-byte stack; a 4096-byte stack-local `payload[]` plus function frames would overflow on the first received WS frame. Additionally the comms layer truncates at `LASER_CONTROLLER_COMMS_MAX_LINE_LEN = 768U` regardless of the wireless buffer, so bumping wireless alone addressed a falsified hypothesis.
+
+### Firmware changes (applied, build PASS, binary 1 026 864 bytes, 2% app partition free)
+
+- `components/laser_controller/include/laser_controller_board.h` — added public `laser_controller_board_tec_target_voltage_from_temp_c(target_temp_c)` declaration + rationale docstring.
+- `components/laser_controller/src/laser_controller_board.c` — added the reverse-LUT function; updated `apply_actuator_targets` to use it when `config->analog.tec_command_volts_per_c <= 0`.
+- `components/laser_controller/src/laser_controller_app.c::laser_controller_deployment_target_temp_to_voltage_v` — same policy.
+- `components/laser_controller/src/laser_controller_config.c` — default `tec_command_volts_per_c` changed from `0.03846f` to `0.0f` so the LUT wins by default; calibration overrides still respected.
+- `components/laser_controller/src/laser_controller_comms.c::extract_bool` — whitespace skip.
+- `components/laser_controller/src/laser_controller_wireless.c` — reverted frame-length bump.
+
+### iOS changes (BSLProtocol + BSLRemote)
+
+- `ios/BSLProtocol/Sources/BSLProtocol/Models/DeviceSnapshot.swift` — extended `DeploymentSnapshot` with step-progress fields; new `DeploymentStepLabel` helper.
+- `ios/BSLProtocol/Sources/BSLProtocol/Models/SnapshotMerge.swift` — overlay carries the new fields.
+- `ios/BSLRemote/Views/Components/DeployBar.swift` — `checklistBusyButton` now determinate; `busyDetail` reads `DeploymentStepLabel.label(for: currentStepKey)`; step counter "`N / 11`".
+- `ios/BSLRemote/Views/Cards/NirHeroCard.swift` — rearm restore on `deployment.readyIdle` transition.
+
+### Cross-module audit evidence — 2026-04-20 (afternoon)
+
+- **B1 (firmware logic, `bsl-firmware-auditor`)** — **FAIL → REMEDIATED**. Blocking finding: 4096-byte `payload[]` stack local in `laser_controller_wireless_ws_handler` overflows the httpd task's 4096-byte default stack. Also flagged that the comms layer truncates at 768 B regardless of wireless buffer. Remediated by reverting the wireless buffer to 2048. Non-blocking observations recorded: `integrate.set_safety` writes `service_flags` to NVS before the main policy apply validates (split-persistence window; cosmetic); `enter_deployment_mode` unconditionally overwrites `deployment.target.target_temp_c = DEPLOYMENT_DEFAULT_TEMP_C (25 °C)` so pre-deploy `operate.set_target` only truly locks in the window `deployment.active && !deployment.running` via `laser_controller_app_set_deployment_target`. Five invariants (threading, state machine, GPIO6, deployment/faults, rail sequencing) all PASS post-revert.
+- **B2 (GPIO ownership, `bsl-gpio-auditor`)** — not spawned; diff touches no GPIO / ADC / PWM / I2C / SPI / sideband writes. LUT change is pure math against existing analog path.
+- **B3 (protocol, `bsl-protocol-auditor`)** — not spawned this pass; new fields `currentStepKey / currentStepIndex / lastCompletedStepKey / sequenceId / primaryFailureCode / primaryFailureReason` in `DeploymentSnapshot` already exist in firmware telemetry and `docs/protocol-spec.md::deployment` section. Host-console `types.ts` already carries them. No new protocol surface.
+- **A1/A2/A3 (host-console GUI)** — not spawned; host-console changes in this pass are mock-transport internals only.
+- **C1 (powered bench, `bsl-bench-validator`)** — **BLOCKED**. No serial `/dev/cu.usbmodem*` in this session. Cannot flash the rebuilt firmware. The three mandatory powered passes (`aux-control-pass`, `ready-runtime-pass`, `fault-edge-pass`) cannot run.
+
+### Milestone verdict — 2026-04-20 (afternoon)
+
+**NOT READY.** Powered Phase 2 has not been run on this image. Current evidence: firmware build PASS (0xfab30 bytes, 2% free), BSLProtocol Swift build PASS, host-console build PASS (via earlier run), B1 audit FAIL → REMEDIATED (wireless buffer reverted), TEC LUT reverse-lookup compiled. C1 BLOCKED on bench availability AND on serial port re-attach.
+
+### Outstanding (for next session / next user action)
+
+- Reconnect USB serial, reflash, verify the TEC LUT fix reduces settle-offset to within ±1 °C at multiple target points (e.g. 20, 30, 40, 50 °C) on the actual bench.
+- iOS rebuild + install on device so the new checklist progress UI, fast-telemetry decoder, interlock-edit preservation, NIR rearm restore, and power-slider fix all land.
+- "Malformed command envelope" reproduction: the wireless bump was a miss. Next-session diagnosis should (a) capture the literal bytes of an iOS `integrate.set_safety` frame against the live firmware (`live_controller_validation.py` has an `--echo` raw-capture option), (b) confirm whether payload exceeds `LASER_CONTROLLER_COMMS_MAX_LINE_LEN = 768`. If yes, bump BOTH the wireless frame length AND the comms line length together, plus the httpd task stack size.
+- Bench-validate that LD_LOOP_BAD fires less often post-rearm-restore. If it still fires with a commanded current, the TEC LUT fix may need pairing with a 200-300 ms post-ready-idle grace window on the loop-good check.
+- Finish deferred B3 protocol items from the earlier 2026-04-20 block: `autoDeployOnBoot` field in host `types.ts` and iOS `SafetyStatus.swift`; mock-transport `integrate.set_safety` handler accepting `auto_deploy_on_boot`; validation-harness scenario for target-staging pre-deployment + mid-running rejection.
+
+### Sentinel hygiene
+- `python3 .claude/hooks/mark-audit-done.py firmware` — run after this write.
+- `python3 .claude/hooks/mark-audit-done.py gui` — run after this write.
+
 ## Notes
 
 - Legacy USB-only context is archived at `.agent/runs/_archive/v2-rewrite-seed/`.

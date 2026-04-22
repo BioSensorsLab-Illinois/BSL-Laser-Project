@@ -3475,13 +3475,34 @@ static void laser_controller_adc_filter_reset(
 
 static float laser_controller_board_lookup_tec_temp_c(float voltage_v)
 {
-    if (voltage_v <= kTecTempCalibration[0].voltage_v) {
-        return kTecTempCalibration[0].temp_c;
+    const size_t count =
+        sizeof(kTecTempCalibration) / sizeof(kTecTempCalibration[0]);
+    if (count < 2U) {
+        return count > 0U ? kTecTempCalibration[0].temp_c : 0.0f;
     }
 
-    for (size_t index = 1U;
-         index < sizeof(kTecTempCalibration) / sizeof(kTecTempCalibration[0]);
-         ++index) {
+    /*
+     * Extrapolate below the first LUT anchor using the slope of the
+     * first two anchors (2026-04-20 user report: "TEC readback not
+     * showing anything below 6 °C"). The previous clamp at 6 °C hid
+     * cold-start conditions the operator cares about. Extrapolation
+     * remains bounded by `tec_min_command_c` and sensor physics — a
+     * runaway LUT result below the sane range would already trigger
+     * TEC_TEMPGD=0, which the operator sees as not-settled.
+     */
+    if (voltage_v <= kTecTempCalibration[0].voltage_v) {
+        const float v0 = kTecTempCalibration[0].voltage_v;
+        const float v1 = kTecTempCalibration[1].voltage_v;
+        const float t0 = kTecTempCalibration[0].temp_c;
+        const float t1 = kTecTempCalibration[1].temp_c;
+        if (v1 > v0) {
+            const float slope_c_per_v = (t1 - t0) / (v1 - v0);
+            return t0 + ((voltage_v - v0) * slope_c_per_v);
+        }
+        return t0;
+    }
+
+    for (size_t index = 1U; index < count; ++index) {
         const float low_v = kTecTempCalibration[index - 1U].voltage_v;
         const float high_v = kTecTempCalibration[index].voltage_v;
 
@@ -3494,9 +3515,55 @@ static float laser_controller_board_lookup_tec_temp_c(float voltage_v)
         }
     }
 
-    return kTecTempCalibration[
-               (sizeof(kTecTempCalibration) / sizeof(kTecTempCalibration[0])) - 1U]
-        .temp_c;
+    /*
+     * Symmetric upper-bound extrapolation — above the last anchor,
+     * continue with the slope of the last two anchors so a very hot
+     * plate still reads above 65 °C instead of pinning.
+     */
+    const float vN_1 = kTecTempCalibration[count - 2U].voltage_v;
+    const float vN = kTecTempCalibration[count - 1U].voltage_v;
+    const float tN_1 = kTecTempCalibration[count - 2U].temp_c;
+    const float tN = kTecTempCalibration[count - 1U].temp_c;
+    if (vN > vN_1) {
+        const float slope_c_per_v = (tN - tN_1) / (vN - vN_1);
+        return tN + ((voltage_v - vN) * slope_c_per_v);
+    }
+    return tN;
+}
+
+/*
+ * Reverse of `laser_controller_board_lookup_tec_temp_c`. Given a target
+ * °C, return the TEC-driver setpoint voltage that maps to that temperature
+ * per the bench-calibrated LUT. Used by the deployment / runtime target
+ * path in `laser_controller_app.c` to replace the previously-linear
+ * approximation that was producing a 2-4 °C settle offset. Public via
+ * `laser_controller_board.h`. 2026-04-20.
+ */
+laser_controller_volts_t laser_controller_board_tec_target_voltage_from_temp_c(
+    laser_controller_celsius_t target_temp_c)
+{
+    const size_t count =
+        sizeof(kTecTempCalibration) / sizeof(kTecTempCalibration[0]);
+    if (count == 0U) {
+        return 0.0f;
+    }
+    if (target_temp_c <= kTecTempCalibration[0].temp_c) {
+        return kTecTempCalibration[0].voltage_v;
+    }
+    for (size_t index = 1U; index < count; ++index) {
+        const float low_t = kTecTempCalibration[index - 1U].temp_c;
+        const float high_t = kTecTempCalibration[index].temp_c;
+        if (target_temp_c <= high_t) {
+            const float low_v = kTecTempCalibration[index - 1U].voltage_v;
+            const float high_v = kTecTempCalibration[index].voltage_v;
+            const float ratio =
+                high_t > low_t ?
+                    (target_temp_c - low_t) / (high_t - low_t) : 0.0f;
+            return (laser_controller_volts_t)
+                (low_v + ((high_v - low_v) * ratio));
+        }
+    }
+    return kTecTempCalibration[count - 1U].voltage_v;
 }
 
 static float laser_controller_board_decode_cc_current_a(uint8_t cc_status)
@@ -5453,10 +5520,14 @@ void laser_controller_board_apply_actuator_targets(
             config != NULL && config->analog.ld_command_volts_per_amp > 0.0f ?
             config->analog.ld_command_volts_per_amp :
             (LASER_CONTROLLER_DAC_FULL_SCALE_V / 6.0f);
-    const float tec_volts_per_c =
-        config != NULL && config->analog.tec_command_volts_per_c > 0.0f ?
-            config->analog.tec_command_volts_per_c :
-            (2.5f / 65.0f);
+    /*
+     * TEC target voltage: 2026-04-20 fix (issue 3) — the previous linear
+     * `temp * tec_volts_per_c` approximation disagreed with the bench-
+     * measured `kTecTempCalibration` LUT, producing a persistent 2-4 °C
+     * offset at the TEC plate. Now we reverse-lookup the LUT by default
+     * and let the per-unit analog override win only when it is
+     * explicitly calibrated (`tec_command_volts_per_c > 0`).
+     */
     float ld_voltage_v;
     float tec_voltage_v;
 
@@ -5475,10 +5546,19 @@ void laser_controller_board_apply_actuator_targets(
             high_state_current_a * ld_volts_per_amp,
             0.0f,
             LASER_CONTROLLER_DAC_FULL_SCALE_V);
+        float tec_command_v;
+        if (config != NULL && config->analog.tec_command_volts_per_c > 0.0f) {
+            /* Explicit per-unit calibration: keep linear behavior. */
+            tec_command_v =
+                target_temp_c * config->analog.tec_command_volts_per_c;
+        } else {
+            /* Default: use the bench-measured non-linear LUT. */
+            tec_command_v =
+                laser_controller_board_tec_target_voltage_from_temp_c(
+                    target_temp_c);
+        }
         tec_voltage_v = laser_controller_board_clamp_float(
-            target_temp_c * tec_volts_per_c,
-            0.0f,
-            2.5f);
+            tec_command_v, 0.0f, 2.5f);
     }
 
     if (laser_controller_service_module_expected(LASER_CONTROLLER_MODULE_DAC) &&

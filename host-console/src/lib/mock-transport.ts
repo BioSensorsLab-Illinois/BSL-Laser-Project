@@ -831,8 +831,17 @@ export class MockTransport implements DeviceTransport {
           }
         }
         break
+      // 2026-04-20: target-staging commands now accept pre-deployment and
+      // post-ready-idle payloads to mirror the firmware gate change at
+      // laser_controller_comms.c::is_target_stage_command. Only block
+      // while `deployment.running` (checklist mid-walk, TEC_SETTLE would
+      // drift). Fixes mock divergence where the iOS / web UI could stage
+      // a wavelength pre-arm but the mock silently ignored it.
       case 'set_target_temp':
-        if (typeof command.args?.temp_c === 'number' && this.state.deployment.ready) {
+        if (
+          typeof command.args?.temp_c === 'number' &&
+          !this.state.deployment.running
+        ) {
           this.state.targetTempC = clampTecTempC(command.args.temp_c)
           this.state.targetLambdaNm = estimateWavelengthFromTempC(this.state.targetTempC)
           this.state.targetMode = 'temp'
@@ -840,16 +849,13 @@ export class MockTransport implements DeviceTransport {
           this.state.deployment.targetTempC = this.state.targetTempC
           this.state.deployment.targetLambdaNm = this.state.targetLambdaNm
           this.state.tecSettlingTicks = 8
-        }
-        if (
-          typeof command.args?.temp_c === 'number' &&
-          this.state.deployment.ready
-        ) {
-          break
         }
         break
       case 'operate.set_target':
-        if (typeof command.args?.temp_c === 'number' && this.state.deployment.ready) {
+        if (
+          typeof command.args?.temp_c === 'number' &&
+          !this.state.deployment.running
+        ) {
           this.state.targetTempC = clampTecTempC(command.args.temp_c)
           this.state.targetLambdaNm = estimateWavelengthFromTempC(this.state.targetTempC)
           this.state.targetMode = 'temp'
@@ -857,7 +863,10 @@ export class MockTransport implements DeviceTransport {
           this.state.deployment.targetTempC = this.state.targetTempC
           this.state.deployment.targetLambdaNm = this.state.targetLambdaNm
           this.state.tecSettlingTicks = 8
-        } else if (typeof command.args?.lambda_nm === 'number' && this.state.deployment.ready) {
+        } else if (
+          typeof command.args?.lambda_nm === 'number' &&
+          !this.state.deployment.running
+        ) {
           this.state.targetLambdaNm = clampTecWavelengthNm(command.args.lambda_nm)
           this.state.targetTempC = estimateTempFromWavelengthNm(this.state.targetLambdaNm)
           this.state.targetMode = 'lambda'
@@ -868,7 +877,10 @@ export class MockTransport implements DeviceTransport {
         }
         break
       case 'set_target_lambda':
-        if (typeof command.args?.lambda_nm === 'number' && this.state.deployment.ready) {
+        if (
+          typeof command.args?.lambda_nm === 'number' &&
+          !this.state.deployment.running
+        ) {
           this.state.targetLambdaNm = clampTecWavelengthNm(command.args.lambda_nm)
           this.state.targetTempC = estimateTempFromWavelengthNm(this.state.targetLambdaNm)
           this.state.targetMode = 'lambda'

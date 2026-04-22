@@ -163,29 +163,66 @@ struct DeployBar: View {
     }
 
     /// Disabled arm-button replacement that shows the live checklist step
-    /// and a progress strip, so the operator has confirmation that the
-    /// controller is actively working. Rendered whenever
-    /// `checklistBusy == true`.
+    /// and a DETERMINATE progress strip driven by the firmware-reported
+    /// `currentStepIndex`, so the operator has concrete feedback that the
+    /// controller is progressing through the 11-step checklist. Rendered
+    /// whenever `checklistBusy == true`. 2026-04-20 (issue 2): replaces
+    /// the old indeterminate sweep that left the operator guessing
+    /// whether anything was happening.
     private var checklistBusyButton: some View {
         ZStack(alignment: .leading) {
             RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .fill(t.trackFill)
-            indeterminateSweep
+            determinateProgressFill
                 .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-            VStack(alignment: .center, spacing: 2) {
-                Text(busyHeadline)
-                    .font(.system(size: 13, weight: .heavy))
-                    .tracking(0.8)
-                    .foregroundStyle(t.ink)
-                Text(busyDetail)
-                    .font(.system(size: 10, weight: .medium))
+            HStack(spacing: 10) {
+                ProgressView()
+                    .progressViewStyle(.circular)
+                    .tint(BSL.orange)
+                    .scaleEffect(0.7)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(busyHeadline)
+                        .font(.system(size: 12, weight: .heavy))
+                        .tracking(0.8)
+                        .foregroundStyle(t.ink)
+                    Text(busyDetail)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(t.muted)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                Spacer(minLength: 0)
+                Text(stepCountLine)
+                    .font(.system(size: 11, weight: .bold).monospacedDigit())
                     .foregroundStyle(t.muted)
-                    .lineLimit(1)
             }
+            .padding(.horizontal, 14)
             .frame(maxWidth: .infinity)
         }
         .frame(height: 56)
-        .accessibilityLabel("Deployment checklist running, \(busyDetail)")
+        .accessibilityLabel("Deployment checklist running, \(busyDetail), \(stepCountLine)")
+    }
+
+    /// Determinate-progress fill scaled to `currentStepIndex / total`.
+    /// Hides when the step index is 0 / NONE so the bar doesn't flash
+    /// full-orange at the very start of deployment entry.
+    private var determinateProgressFill: some View {
+        let total = max(1, DeploymentStepLabel.total)
+        let idx = deployment.currentStepIndex
+        let ratio = min(1.0, max(0.0, Double(idx) / Double(total)))
+        return GeometryReader { geo in
+            Rectangle()
+                .fill(BSL.orange.opacity(0.20))
+                .frame(width: geo.size.width * ratio)
+                .animation(.easeInOut(duration: 0.3), value: ratio)
+        }
+    }
+
+    private var stepCountLine: String {
+        let total = DeploymentStepLabel.total
+        let idx = deployment.currentStepIndex
+        guard idx > 0 else { return "— / \(total)" }
+        return "\(idx) / \(total)"
     }
 
     /// Soft left-to-right sweep highlight. Gives a "working" feel without
@@ -298,14 +335,26 @@ struct DeployBar: View {
         }
     }
 
-    /// Second line — surfaces the current step / reason. Falls back to a
-    /// generic "please wait" if the firmware has not yet broadcast a step
-    /// string via status.
+    /// Second line — surfaces the current step label from firmware's
+    /// `deployment.currentStepKey` (e.g. RAIL_SEQUENCE → "Sequencing TEC
+    /// → LD rails"). 2026-04-20 (issue 2): was previously a generic
+    /// "please wait" — operators asked for concrete step names so they
+    /// can correlate with the actual hardware sequence.
     private var busyDetail: String {
-        if deployment.phase == .failed { return "Tap the fault banner for details." }
-        if deployment.running { return "please wait — firmware is stepping through checklist" }
-        if deployment.active && !deployment.ready { return "stabilizing rails and TEC before ready-idle" }
-        return "please wait"
+        if deployment.phase == .failed {
+            if !deployment.primaryFailureReason.isEmpty {
+                return "Failed: \(deployment.primaryFailureReason)"
+            }
+            return "Tap the fault banner for details."
+        }
+        let stepKey = deployment.currentStepKey
+        if !stepKey.isEmpty && stepKey.uppercased() != "NONE" {
+            return DeploymentStepLabel.label(for: stepKey)
+        }
+        if deployment.active && !deployment.ready {
+            return "Stabilizing rails and TEC before ready-idle"
+        }
+        return "Please wait"
     }
 
     private var pressAndHold: some Gesture {
@@ -399,10 +448,16 @@ struct DeployBar: View {
         let live = session.snapshot.tec.targetLambdaNm
         let nm: Double = persisted > 0 ? persisted : live
         guard nm > 0 else { return }
+        // 2026-04-20 (issue diagnosis): firmware's `operate.set_target`
+        // parser keys on `target_mode`, not `mode`. The old `mode` key
+        // was silently ignored — the command still worked because
+        // `lambda_nm` presence triggers the lambda branch as a
+        // fallback, but the intent was ambiguous. Sending `target_mode`
+        // here to match firmware (`laser_controller_comms.c:5938-5945`).
         _ = await session.sendCommand(
             "operate.set_target",
             args: [
-                "mode": .string("lambda"),
+                "target_mode": .string("lambda"),
                 "lambda_nm": .double(nm),
             ]
         )
@@ -411,11 +466,22 @@ struct DeployBar: View {
     private func sendStop() async {
         sending = true
         UINotificationFeedbackGenerator().notificationOccurred(.warning)
+        // 2026-04-20 (issue diagnosis: "stop button fails, reverts to
+        // armed"): swap command order so `deployment.exit` lands FIRST.
+        // Exit is the authoritative off-switch — it synchronously sets
+        // `deployment.active=false`, drives all outputs to safe, and
+        // clears the bench request block. Firing `operate.set_output`
+        // first was purely a belt-and-braces safety zero of the
+        // commanded current, but it also meant a 7 s transport timeout
+        // on `operate.set_output` would delay the actual exit, leaving
+        // the operator with an armed device longer than necessary.
+        // Exit-first guarantees the hardware drops regardless of what
+        // happens on the next command.
+        _ = await session.sendCommand("deployment.exit")
         _ = await session.sendCommand(
             "operate.set_output",
             args: ["enable": .bool(false), "current_a": .double(0)]
         )
-        _ = await session.sendCommand("deployment.exit")
         sending = false
     }
 }

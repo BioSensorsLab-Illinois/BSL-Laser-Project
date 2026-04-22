@@ -62,7 +62,13 @@ struct PowerCard: View {
                         if !editing { commit() }
                     }
                 )
-                .disabled(blocked || stale)
+                // 2026-04-20: slider is allowed whenever the snapshot is
+                // fresh. `operate.set_output` staging is accepted by firmware
+                // in both binary_trigger and modulated_host modes; the
+                // `nirBlockedReason != .none` check was too strict and
+                // prevented value staging (user report: "stuck at same
+                // power").
+                .disabled(stale)
 
                 HStack {
                     Button {
@@ -71,7 +77,7 @@ struct PowerCard: View {
                         Label("Off", systemImage: "power")
                     }
                     .buttonStyle(.bordered)
-                    .disabled(blocked || stale)
+                    .disabled(stale)
 
                     Spacer()
 
@@ -82,6 +88,7 @@ struct PowerCard: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(.red)
+                    // Direct host-enable still needs the NIR path unblocked.
                     .disabled(blocked || stale)
                 }
             }

@@ -78,25 +78,40 @@ struct SettingsView: View {
         }
     }
 
+    /// 2026-04-20: safety-policy pages are locked off entirely when the
+    /// laser is armed or lasing. The firmware already rejects writes in
+    /// those states; the user reported wanting the page itself blocked so
+    /// accidental taps cannot surface a firmware-rejection banner mid-use.
+    /// Falls back to inactive state when the laser is disarmed.
+    private var safetyLocked: Bool {
+        session.snapshot.laserMode != .disarmed
+    }
+
+    private var safetyLockSublabel: String {
+        "Locked while laser is " + (session.snapshot.laserMode == .lasing ? "lasing" : "armed") + " · disarm to edit"
+    }
+
     private var firmwarePolicyGroup: some View {
         BSLListGroup(
             label: "Firmware policy",
-            footer: "Writes go to integrate.set_safety. Firmware rejects any edit while the beam is active. Persisted to NVS automatically."
+            footer: safetyLocked
+                ? "Safety and interlock edits are disabled while the laser is armed or lasing. Disarm to edit."
+                : "Writes go to integrate.set_safety. Firmware rejects any edit while the beam is active. Persisted to NVS automatically."
         ) {
             BSLListRow(
                 icon: Image(systemName: "slider.horizontal.3"),
-                iconTone: .navy,
+                iconTone: safetyLocked ? .subtle : .navy,
                 label: "Safety parameters",
-                sublabel: "Horizon · ToF · TEC · currents · drift",
-                action: { withAnimation(.easeOut(duration: 0.18)) { page = .safety } }
+                sublabel: safetyLocked ? safetyLockSublabel : "Horizon · ToF · TEC · currents · drift",
+                action: safetyLocked ? nil : { withAnimation(.easeOut(duration: 0.18)) { page = .safety } }
             )
             BSLListRow(
                 icon: Image(systemName: "checklist"),
-                iconTone: .navy,
+                iconTone: safetyLocked ? .subtle : .navy,
                 label: "Active interlocks",
-                sublabel: "Ten safety gates · ToF low-bound",
+                sublabel: safetyLocked ? safetyLockSublabel : "Ten safety gates · ToF low-bound",
                 isLast: true,
-                action: { withAnimation(.easeOut(duration: 0.18)) { page = .interlocks } }
+                action: safetyLocked ? nil : { withAnimation(.easeOut(duration: 0.18)) { page = .interlocks } }
             )
         }
     }

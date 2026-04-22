@@ -332,6 +332,20 @@ typedef struct {
     bool button_deploy_armed;
     bool button_deploy_requested;
     /*
+     * Auto-deploy-on-boot (2026-04-20 user directive). When
+     * `config.service_flags & LASER_CONTROLLER_SERVICE_FLAG_AUTO_DEPLOY_ON_BOOT`
+     * is set, `auto_deploy_pending` latches true at start(). A short
+     * settle window later (first tick with `boot_complete && config_valid &&
+     * !fault_latched && !deployment.active && !service_mode`) raises
+     * `auto_deploy_requested` as a one-shot; the existing end-of-tick
+     * handler consumes it and calls `enter_deployment_mode` +
+     * `run_deployment_sequence`. `auto_deploy_armed` latches the
+     * transition so the path only fires once per power-cycle.
+     */
+    bool auto_deploy_pending;
+    bool auto_deploy_armed;
+    bool auto_deploy_requested;
+    /*
      * Last whole-second boundary logged during a recovery hold. Used
      * to de-duplicate the "hold X s elapsed" diagnostic so one entry
      * per second goes to the event log, not one per 5 ms tick. Reset
@@ -676,11 +690,24 @@ static laser_controller_volts_t laser_controller_deployment_target_temp_to_volta
     const laser_controller_config_t *config,
     laser_controller_celsius_t target_temp_c)
 {
-    const float tec_volts_per_c =
-        config != NULL && config->analog.tec_command_volts_per_c > 0.0f ?
-            config->analog.tec_command_volts_per_c :
-            (LASER_CONTROLLER_DEPLOYMENT_DAC_FULL_SCALE_V / 65.0f);
-    float voltage_v = target_temp_c * tec_volts_per_c;
+    /*
+     * 2026-04-20 (issue 3): prefer the bench-measured non-linear LUT from
+     * `laser_controller_board.c::kTecTempCalibration` so the commanded
+     * TEC setpoint voltage matches the voltage the thermistor will
+     * actually read at the target temperature. The old path multiplied
+     * target_temp_c * tec_command_volts_per_c (linear 0.03846 V/°C),
+     * which disagreed with the LUT and produced a persistent 2-4 °C
+     * offset at the TEC plate. An explicit non-zero
+     * `tec_command_volts_per_c` still wins so per-unit calibration can
+     * override.
+     */
+    float voltage_v;
+    if (config != NULL && config->analog.tec_command_volts_per_c > 0.0f) {
+        voltage_v = target_temp_c * config->analog.tec_command_volts_per_c;
+    } else {
+        voltage_v = laser_controller_board_tec_target_voltage_from_temp_c(
+            target_temp_c);
+    }
 
     if (voltage_v < 0.0f) {
         voltage_v = 0.0f;
@@ -2846,6 +2873,39 @@ static void laser_controller_apply_button_board_policy(
     }
 
     /*
+     * Auto-deploy-on-boot (2026-04-20 user directive). Fires the same
+     * `enter_deployment_mode` + `run_deployment_sequence` path as the
+     * headless button gesture, but from the AUTO_DEPLOY_ON_BOOT
+     * service flag rather than a physical hold. Preconditions mirror
+     * the button path (boot complete, config valid, no fault, not
+     * already deploying, not in service mode) so operator overrides
+     * (service mode entry, an active fault) always win. Armed exactly
+     * once per power cycle — after that, `auto_deploy_armed` stays
+     * true and the operator drives deployment with the normal
+     * `deployment.enter` / `deployment.exit` commands.
+     */
+    if (context->auto_deploy_pending &&
+        !context->auto_deploy_armed &&
+        context->boot_complete &&
+        context->config_valid &&
+        !service_mode_active_now &&
+        !context->fault_latched &&
+        !context->deployment.active &&
+        !context->deployment.failed &&
+        context->state_machine.current !=
+            LASER_CONTROLLER_STATE_BOOT_INIT &&
+        context->state_machine.current !=
+            LASER_CONTROLLER_STATE_SERVICE_MODE) {
+        context->auto_deploy_armed = true;
+        context->auto_deploy_requested = true;
+        laser_controller_logger_log(
+            now_ms,
+            "deploy",
+            "auto deploy: AUTO_DEPLOY_ON_BOOT service flag set; "
+            "queuing enter + checklist");
+    }
+
+    /*
      * Diagnostic: WHY is button-driven NIR currently blocked? Computed
      * here in priority order (most-fundamental block first). Mirrored
      * to the host via runtime_status.button_runtime.nir_block_reason.
@@ -3656,6 +3716,47 @@ static void laser_controller_run_fast_cycle(laser_controller_context_t *context)
                 "headless deploy: checklist started via 1 s button hold");
         }
     }
+
+    /*
+     * Auto-deploy-on-boot (2026-04-20 user directive). Same enter+run
+     * sequence as the headless button path, but triggered by the
+     * AUTO_DEPLOY_ON_BOOT service flag instead of a physical gesture.
+     * `auto_deploy_requested` is raised at end-of-tick when the device
+     * reaches a clean idle posture for the first time after boot;
+     * `auto_deploy_armed` latches so the path fires exactly once per
+     * power cycle (manual exit + re-entry remains operator-driven).
+     */
+    if (context->auto_deploy_requested) {
+        context->auto_deploy_requested = false;
+
+        if (!context->deployment.active) {
+            const esp_err_t enter_rc =
+                laser_controller_app_enter_deployment_mode();
+            if (enter_rc != ESP_OK) {
+                laser_controller_logger_logf(
+                    now_ms,
+                    "deploy",
+                    "auto deploy: enter_deployment rejected (%d)",
+                    (int)enter_rc);
+                return;
+            }
+        }
+
+        const esp_err_t run_rc =
+            laser_controller_app_run_deployment_sequence();
+        if (run_rc != ESP_OK) {
+            laser_controller_logger_logf(
+                now_ms,
+                "deploy",
+                "auto deploy: run_deployment rejected (%d)",
+                (int)run_rc);
+        } else {
+            laser_controller_logger_log(
+                now_ms,
+                "deploy",
+                "auto deploy: checklist started (AUTO_DEPLOY_ON_BOOT service flag)");
+        }
+    }
 }
 
 static void laser_controller_run_slow_cycle(laser_controller_context_t *context)
@@ -3752,6 +3853,13 @@ esp_err_t laser_controller_app_start(void)
     laser_controller_service_get_runtime_safety_policy(
         &s_context.config.thresholds,
         &s_context.config.timeouts);
+    /*
+     * Restore the `service_flags` bitmap from its standalone NVS key.
+     * Missing or fresh-flash devices return 0, matching the safe default
+     * (no auto-behavior enabled).
+     */
+    s_context.config.service_flags =
+        laser_controller_service_load_service_flags();
     s_context.config_valid = laser_controller_config_validate(&s_context.config);
 
     const laser_controller_time_ms_t now_ms = laser_controller_board_uptime_ms();
@@ -3812,6 +3920,20 @@ esp_err_t laser_controller_app_start(void)
         s_context.deployment.max_laser_current_a;
 
     s_context.boot_complete = true;
+    /*
+     * If the persisted config has the AUTO_DEPLOY_ON_BOOT service flag
+     * set, arm the pending-request latch. The control task will
+     * actually fire the deployment from the fast-cycle end-of-tick
+     * handler once it sees a clean-idle state. Not done directly here
+     * because `laser_controller_app_start` runs on the main task and
+     * deployment_enter / run expect to be called from (or synchronized
+     * with) the control task's view of `s_context`.
+     */
+    s_context.auto_deploy_pending =
+        (s_context.config.service_flags &
+         LASER_CONTROLLER_SERVICE_FLAG_AUTO_DEPLOY_ON_BOOT) != 0U;
+    s_context.auto_deploy_armed = false;
+    s_context.auto_deploy_requested = false;
     s_context.power_tier = LASER_CONTROLLER_POWER_TIER_UNKNOWN;
     s_context.active_fault_code = LASER_CONTROLLER_FAULT_NONE;
     s_context.active_fault_class = LASER_CONTROLLER_FAULT_CLASS_NONE;
@@ -3963,6 +4085,32 @@ esp_err_t laser_controller_app_clear_fault_latch(void)
 
     laser_controller_logger_log(now_ms, "fault", "fault latch clear requested (drain next tick)");
     laser_controller_publish_runtime_status(&s_context, now_ms);
+    return ESP_OK;
+}
+
+esp_err_t laser_controller_app_set_service_flags(uint32_t service_flags)
+{
+    if (!s_context.started) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    portENTER_CRITICAL(&s_context_lock);
+    s_context.config.service_flags = service_flags;
+    portEXIT_CRITICAL(&s_context_lock);
+
+    /*
+     * Push the new flags into the service layer so the next NVS save
+     * picks them up. The service layer owns the actual write; we just
+     * hand it the new value and let its existing touch_profile path
+     * schedule the persist.
+     */
+    laser_controller_service_set_service_flags(service_flags);
+
+    laser_controller_logger_logf(
+        laser_controller_board_uptime_ms(),
+        "bench",
+        "service_flags updated to 0x%08lX",
+        (unsigned long)service_flags);
     return ESP_OK;
 }
 

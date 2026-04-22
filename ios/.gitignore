@@ -7,6 +7,9 @@ BSLProtocol/Package.resolved
 BSLRemote.xcodeproj/
 BSLRemote.xcworkspace/
 
+# xcodebuild CLI output (build + install flow via devicectl)
+build-ios/
+
 # Xcode user data
 *.xcuserdatad/
 xcuserdata/

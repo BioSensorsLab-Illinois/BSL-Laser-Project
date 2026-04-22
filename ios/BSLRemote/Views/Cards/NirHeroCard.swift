@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import BSLProtocol
 
 /// The NIR-dominant hero card. Big arc gauge on the left, three metric rows
@@ -20,6 +21,13 @@ struct NirHeroCard: View {
 
     @State private var localSet: Double = 0
     @State private var pendingCommit: Bool = false
+
+    /// 10-detent index (0…10) matching the DetentSlider's `steps: 10`.
+    /// Used by `onChange` to fire a selection-haptic on each tick.
+    private var detentIndex: Int {
+        guard maxA > 0 else { return 0 }
+        return Int((localSet / maxA * 10).rounded())
+    }
 
     private var snap: DeviceSnapshot { session.snapshot }
     private var mode: LaserMode { snap.laserMode }
@@ -71,9 +79,27 @@ struct NirHeroCard: View {
                     dimmed: mode != .lasing,
                     onCommit: { commit() }
                 )
+                // 2026-04-20 (user feature): haptic tick on each detent
+                // crossing while the operator drags. Uses a selection
+                // generator so the buzz is subtle, not alarming.
+                .onChange(of: detentIndex) { _, _ in
+                    UISelectionFeedbackGenerator().selectionChanged()
+                }
                 TriggerStrip(mode: mode)
             }
         }
+        // Full-panel red wash while NIR is lasing — operator feedback
+        // that the output is live without having to read the gauge
+        // (user directive 2026-04-20). Uses the same warning hue as
+        // the ArcGauge and LASING pill so the three indicators stay
+        // consistent. The background is on the card itself, under the
+        // existing 18-pt padding, so inner copy stays legible.
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(mode == .lasing ? BSL.warn.opacity(0.12) : .clear)
+                .allowsHitTesting(false)
+                .animation(.easeInOut(duration: 0.25), value: mode == .lasing)
+        )
         .onAppear {
             // Prefer the firmware-reported setpoint. If the firmware hasn't
             // had time to publish yet (fresh reconnect, snapshot empty) and
@@ -88,6 +114,37 @@ struct NirHeroCard: View {
         }
         .onChange(of: setA) { _, new in
             if !pendingCommit { localSet = new }
+        }
+        // 2026-04-20 (issue 4): when deployment re-arms (transitions
+        // from disarmed → armed / ready_idle), firmware resets
+        // `bench.requestedCurrentA` to 0. The app remembers the
+        // operator's last slider value in `persistedNirSetpointA`;
+        // re-apply it here so the slider comes back populated and the
+        // next stage2 press fires at the commanded current instead of
+        // 0 A (which also cascades to the "LED stuck blue + no NIR"
+        // symptom in issue 1 — the driver cannot lock its loop at 0 A,
+        // so LD_LOOP_BAD fires the instant PCN goes high).
+        .onChange(of: snap.deployment.readyIdle) { _, nowReady in
+            guard nowReady else { return }
+            guard let remembered = session.persistedNirSetpointA,
+                  remembered > 0.01 else { return }
+            // Only restore if firmware's current setpoint is effectively
+            // zero — don't override an operator who already set a fresh
+            // current on this ready cycle.
+            guard snap.bench.requestedCurrentA < 0.01 else { return }
+            let clamped = min(remembered, maxA)
+            localSet = clamped
+            pendingCommit = true
+            Task {
+                defer { pendingCommit = false }
+                _ = await session.sendCommand(
+                    "operate.set_output",
+                    args: [
+                        "enable": .bool(false),
+                        "current_a": .double(clamped),
+                    ]
+                )
+            }
         }
     }
 
@@ -166,14 +223,17 @@ struct NirHeroCard: View {
 
     private func commit() {
         let clamped = min(max(localSet, 0), maxA)
-        // Firmware will reject any `operate.set_output` that arrives while
-        // the NIR path is blocked (deployment not ready, fault latched,
-        // rails not good, …). We still want to remember the operator's
-        // intent locally so the setpoint survives reconnect, but we skip
-        // the network round-trip in blocked states — it would only surface
-        // a firmware-rejected banner the operator already knows about.
+        // Always remember the operator's intent locally so the setpoint
+        // survives a reconnect or post-deploy re-apply.
         session.rememberNirSetpoint(clamped)
-        guard blockedReason == .none else { return }
+        // 2026-04-20: always attempt the staging send — `operate.set_output`
+        // updates `bench.requested_current_a` in firmware, which both the
+        // binary-trigger button path AND the modulated-host path consume.
+        // Firmware's `nir_blocked_reason` returns `not-modulated-host` in
+        // binary-trigger mode, but `operate.set_output` itself is accepted
+        // in both modes (see firmware comment at laser_controller_comms.c
+        // around the runtime-control gate). Pre-ready-idle rejections are
+        // filtered by `isExpectedGatingRejection` in DeviceSession.
         pendingCommit = true
         Task {
             defer { pendingCommit = false }

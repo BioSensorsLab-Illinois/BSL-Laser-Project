@@ -53,6 +53,17 @@
  * command the host currently issues, while still rejecting pathological
  * > 2 KB commands to bound the per-session stack allocation at 731.
  */
+/*
+ * 2026-04-20: briefly bumped to 4096 on a false-positive hypothesis;
+ * reverted after B1 audit flagged that the httpd task's default 4096-byte
+ * stack cannot hold a 4096-byte local `payload` buffer + function frames
+ * (would overflow on the first received WS frame), and that the comms
+ * layer separately truncates at `LASER_CONTROLLER_COMMS_MAX_LINE_LEN` (see
+ * `laser_controller_comms.c`) regardless of the wireless buffer size.
+ * Keeping the 2048-byte limit from the 2026-04-17 interlock-apply fix.
+ * If a future payload needs more, both constants AND the httpd task
+ * stack must be bumped together.
+ */
 #define LASER_CONTROLLER_WIRELESS_MAX_FRAME_LEN    2048U
 #define LASER_CONTROLLER_WIRELESS_NVS_NAMESPACE    "laser_wifi"
 #define LASER_CONTROLLER_WIRELESS_NVS_KEY          "config"

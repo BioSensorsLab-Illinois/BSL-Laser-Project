@@ -54,7 +54,16 @@ struct InterlockToggles: View {
             }
             .onAppear { mask = safety.interlocks }
             .onChange(of: safety.interlocks) { _, new in
-                if !applying { mask = new }
+                // 2026-04-20: only adopt the incoming firmware state when
+                // the local draft is not dirty. Otherwise every 1 s live
+                // telemetry tick would revert the operator's mid-edit
+                // toggles before they could tap Apply (user report:
+                // "unable to change nor save interlock selection").
+                //
+                // Once Apply succeeds, firmware echoes the new mask back,
+                // `dirty` flips to false, and the next telemetry tick
+                // harmlessly re-adopts the same values.
+                if !applying && !dirty { mask = new }
             }
         }
     }

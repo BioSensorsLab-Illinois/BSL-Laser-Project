@@ -52,7 +52,10 @@ struct SafetyParametersForm: View {
             }
             .onAppear { form.load(from: safety) }
             .onChange(of: safety) { _, new in
-                if !applying { form.load(from: new) }
+                // 2026-04-20: do not clobber operator edits while dirty.
+                // Live telemetry arrives every 1 s; adopting the firmware
+                // state mid-edit would revert every typed character.
+                if !applying && !dirty { form.load(from: new) }
             }
         }
     }

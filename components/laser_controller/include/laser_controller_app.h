@@ -103,6 +103,16 @@ esp_err_t laser_controller_app_set_runtime_power_policy(
     const laser_controller_power_policy_t *policy);
 
 /*
+ * Update the opt-in service-flags bitmap (see
+ * laser_controller_config.h for bit definitions). Called by the
+ * `integrate.set_safety` path when the host supplies e.g.
+ * `auto_deploy_on_boot=true`. Persisted by the service layer on the
+ * next NVS write. Takes effect on NEXT power cycle — the current
+ * session's `auto_deploy_pending` latch was captured at start().
+ */
+esp_err_t laser_controller_app_set_service_flags(uint32_t service_flags);
+
+/*
  * Integrate-test RGB override for the button-board status LED. Engages a
  * watchdog-bounded direct color/blink override that survives until either
  * the watchdog expires or `laser_controller_app_clear_rgb_test` is called.
